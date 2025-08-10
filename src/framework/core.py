@@ -1,4 +1,5 @@
 import abc
+from collections import defaultdict
 from dataclasses import dataclass
 import functools
 import hashlib
@@ -89,7 +90,14 @@ class Pipeline:
         self, processors: List["AbstractProcessor"], debug=False, workspace=None
     ):
         self.queue = Queue()
-        self.processors = processors
+        self.processors = defaultdict(set)
+        for processor in processors:
+            if len(processor.interests) == 0:
+                self.processors[(None,)].add(processor)
+            for interest in processor.interests:
+                logger.debug(f"registering interest for {processor}: {interest}")
+                self.processors[interest].add(processor)
+
         self.jobs = 0
         self.lock = threading.Lock()
         self.cond = threading.Condition()
@@ -98,7 +106,6 @@ class Pipeline:
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
-
 
     def run(self):
         with ThreadPoolExecutor(1) as executor:
@@ -118,7 +125,12 @@ class Pipeline:
 
     def process_events(self):
         while event := self.queue.get():
-            for processor in self.processors:
+            recipients = set(self.processors[(None,)])
+            for processor in self.processors.get(
+                (event.__class__.__name__, event.name), tuple()
+            ):
+                recipients.add(processor)
+            for processor in recipients:
                 try:
                     self.increment()
                     ctx = Context(self)
@@ -147,8 +159,44 @@ class Pipeline:
                     self.cond.notify_all()
 
 
+def find_interests(func):
+    import ast
+    import inspect
+    import textwrap
+
+    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    match tree:
+        case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as m])]):
+            for c in m.cases:
+                match c:
+                    case ast.match_case(
+                        pattern=ast.MatchClass(
+                            cls=ast.Name(id=event_class),
+                            kwd_attrs=["name", *_],
+                            kwd_patterns=[
+                                ast.MatchValue(value=ast.Constant(value=event_name)),
+                                *_,
+                            ],
+                        )
+                    ):
+                        yield event_class, event_name
+                    case ast.match_case(
+                        pattern=ast.MatchClass(
+                            cls=ast.Name(id=event_class),
+                        )
+                    ):
+                        yield event_class, None
+                    case _:
+                        pass
+        case _:
+            logger.warning(
+                f"the processor {func} does not seem to have declared any interest to events..."
+            )
+
+
 class AbstractProcessor(abc.ABC):
     def __init__(self):
+        self.interests = frozenset(find_interests(self.process))
         self.executor = ThreadPoolExecutor(1)
 
     @abc.abstractmethod
@@ -161,40 +209,19 @@ class AbstractProcessor(abc.ABC):
             return klepto.archives.null_archive()
         else:
             return klepto.archives.sql_archive(
-                name=f'sqlite:///{workspace.joinpath(self.__class__.__name__)}.sqlite',
+                name=f"sqlite:///{workspace.joinpath(self.__class__.__name__)}.sqlite",
                 cached=False,
+                serialized=True,
             )
 
 
 def caching(
+    func=None,
+    *,
     topic_names: Collection[str] = tuple(),
     independent: bool = True,
     debug: bool = False,
 ):
-    """
-    Caching decorator factory.
-
-    Use parentheses when applying the decorator, even if you rely on defaults:
-      @caching()
-      def process(...): ...
-
-    Semantics:
-    - if `independent` is True, caching evaluates each incoming event independently
-      (stateless caching).
-    - if `independent` is False, the sequence of past events contributes to the cache key.
-
-    Parameters:
-    - topic_names: names of events to cache; empty tuple means cache all events
-    - independent: whether cache keys are independent of prior events
-    - debug: enable simple debug prints for cache key and hits
-    """
-    # Enforce usage with parentheses (prevent accidental @caching without parentheses)
-    if callable(topic_names):
-        raise TypeError(
-            "caching must be used as a decorator factory: use @caching(...). "
-            "Using @caching without parentheses is not supported."
-        )
-
     def decorator(func):
         last_digest = hashlib.sha256(func.__qualname__.encode()).hexdigest()
 
@@ -234,11 +261,10 @@ def caching(
 
         return wrapper
 
-    return decorator
+    return decorator if func is None else decorator(func)
 
 
 class AbstractBuilder(AbstractProcessor):
-
     def __init__(
         self, provides: Collection[str], requires: Collection[str], cache: bool
     ):
@@ -442,7 +468,7 @@ class JsonLLoader(AbstractProcessor):
                 )
             case context.pipeline.POISON:
                 self.file.close()
-        
+
 
 class JsonLWriter(AbstractProcessor):
     def __init__(
