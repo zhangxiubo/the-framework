@@ -80,26 +80,34 @@ class Context:
             print(e)
             raise e
 
-    def done_callback(self, future: Future):
-        self.pipeline.decrement()
+    def done_callback(self, future: Future, processor: 'AbstractProcessor', context: 'Context', event: Event):
+        try:
+            exc = future.exception()
+            if exc is not None:
+                logger.error(
+                    f"processor failed: {processor} on event {event}", exc_info=exc
+                )
+        finally:
+            self.pipeline.decrement()
 
 
 class Pipeline:
     def __init__(
-        self, processors: List["AbstractProcessor"], debug=False, workspace=None
+        self, processors: List["AbstractProcessor"], strict_interest_inference=False, workspace=None
     ):
         self.queue = Queue()
         self.processors = defaultdict(set)
         for processor in processors:
             for interest in processor.interests:
                 logger.info(f"registering interest for {processor}: {interest}")
+                print(f"registering interest for {processor}: {interest}")
                 self.processors[interest].add(processor)
 
         self.jobs = 0
         self.lock = threading.Lock()
         self.cond = threading.Condition()
-        self.POISON = Event(name="__POISON_PILL__")
-        self.debug = debug
+        self.POISON = Event(name="__POISON__")
+        self.strict_interest_inference = strict_interest_inference
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
@@ -122,31 +130,26 @@ class Pipeline:
 
     def dispatch_events(self):
         while event := self.queue.get():
-            recipients = set(self.processors[(None, None)])
-            for processor in self.processors.get(
-                (event.__class__.__name__, None), tuple()
-            ):
-                recipients.add(processor)
-            for processor in self.processors.get(
-                (event.__class__.__name__, event.name), tuple()
-            ):
-                recipients.add(processor)
-            for processor in recipients:
-                try:
-                    self.increment()
-                    ctx = Context(self)
+            try:
+                recipients = set() if self.strict_interest_inference else set(self.processors[(None, None)])
+                recipients |= self.processors.get((event.__class__.__name__, None), set())
+                recipients |= self.processors.get((event.__class__.__name__, event.name), set())
+                for processor in recipients:
+                    context = Context(self)
                     future = processor.executor.submit(
                         wrap(processor.process),
-                        ctx,
+                        context,
                         event,
                     )
-                    future.add_done_callback(ctx.done_callback)
-                except Exception as e:
-                    logger.error(e, exc_info=True)
-                    raise e
-            self.decrement()
-            if event is self.POISON:
-                break
+                    self.increment()
+                    future.add_done_callback(functools.partial(context.done_callback, processor=processor, context=context, event=event))
+                if event is self.POISON:
+                    break
+            except Exception as e:
+                logger.error(e, exc_info=True)
+            finally:
+                self.decrement()
+
 
     def increment(self):
         with self.lock:
@@ -160,8 +163,33 @@ class Pipeline:
                     self.cond.notify_all()
 
 
-def find_interests(func):
+def parse_pattern(p):
+    import ast
 
+    match p:
+        case ast.MatchClass(
+            cls=ast.Name(id=event_class),
+            kwd_attrs=[
+                "name",
+                *_,
+            ],  # we will only be able to register concrete interests (i.e. Event with a specific name; so we will only find such match patterns)
+            kwd_patterns=[
+                ast.MatchValue(value=ast.Constant(value=event_name)),
+                *_,
+            ],
+        ):
+            return event_class, event_name
+        case ast.MatchClass(
+            cls=ast.Name(id=event_class),
+        ):
+            return event_class, None
+        case ast.pattern(pattern=pp):
+            return parse_pattern(pp)
+        case _:
+            return None, None
+
+
+def find_interests(func):
     # note that it is expected that processors will use a match-case clause as THE way to indicate interest.
 
     import ast
@@ -172,33 +200,17 @@ def find_interests(func):
     match tree:
         case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as m])]):
             for c in m.cases:
-                match c:
-                    case ast.match_case(
-                        pattern=ast.MatchClass(
-                            cls=ast.Name(id=event_class),
-                            kwd_attrs=["name", *_],  # we will only be able to register concrete interests (i.e. Event with a specific name; so we will only find such match patterns)
-                            kwd_patterns=[
-                                ast.MatchValue(value=ast.Constant(value=event_name)),
-                                *_,
-                            ],
-                        )
-                    ):
-                        yield event_class, event_name
-                    case ast.match_case(
-                        pattern=ast.MatchClass(
-                            cls=ast.Name(id=event_class),
-                        )
-                    ):
-                        yield event_class, None
-                    case _:
+                match interest := parse_pattern(c.pattern):
+                    case (None, None):
                         logger.warning(
-                            f"failed to identify interests in processor {func}; the processor will be omitted."
+                            f"failed to identify interests in processor {func}: there is a match-case clause but we couldn't identify a valid event-name combination."
                         )
-                        # note that this is a generator so not yielding anything will cause the caller to omit this processor
-
+                    case _:
+                        pass
+                yield interest
         case _:
             logger.warning(
-                f"the processor {func} does not seem to have declared any interest to events; the processor will receive all events."
+                f"the processor {func} does not seem to have declared any interest to events;"
             )
             yield None, None
 
@@ -407,7 +419,10 @@ def builder(provides: str, requires: List[str], cache=False):
     def decorator(cls):
         assert issubclass(cls, AbstractBuilder)
         cls.__init__ = functools.partialmethod(
-            cls.__init__, provides=[provides], requires=list(requires), cache=cache  # TODO: cache is not used
+            cls.__init__,
+            provides=[provides],
+            requires=list(requires),
+            cache=cache,  # TODO: cache is not used
         )
         return cls
 
@@ -443,7 +458,7 @@ class JsonLLoader(AbstractProcessor):
             case self.LoadJsonL(name=self.name) as e:
                 this_logger = logger.getChild(f"{self.__class__.__name__}.{event.name}")
                 this_logger.debug(
-                    f"loading {self.item_type} form jsonl file: {self.filepath}; limit: {e.limit}, sample: {e.sample}"
+                    f"loading {self.item_type} from jsonl file: {self.filepath}; limit: {e.limit}, sample: {e.sample}"
                 )
                 r = random.Random()
                 line_count = 0
@@ -475,12 +490,11 @@ class JsonLLoader(AbstractProcessor):
                         name=self.name + "$",
                     )
                 )
-            case context.pipeline.POISON:
+            case Event(name='__POISON__'):
                 self.file.close()
 
 
 class JsonLWriter(AbstractProcessor):
-
     def __init__(
         self,
         name,
@@ -506,5 +520,5 @@ class JsonLWriter(AbstractProcessor):
                 payload = getattr(e, self.attribute)
                 self.file.writelines((payload.model_dump_json(), "\n"))
                 self.file.flush()
-            case context.pipeline.POISON:
+            case Event(name='__POISON__'):
                 self.file.close()
