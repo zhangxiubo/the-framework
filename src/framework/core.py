@@ -1,6 +1,5 @@
 import abc
 from collections import defaultdict
-from dataclasses import dataclass
 import functools
 import hashlib
 import inspect
@@ -106,10 +105,11 @@ class Pipeline:
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
+        
 
     def run(self):
         with ThreadPoolExecutor(1) as executor:
-            executor.submit(self.process_events)
+            executor.submit(self.dispatch_events)
             with self.cond:
                 while self.jobs > 0:
                     self.cond.wait()
@@ -123,10 +123,9 @@ class Pipeline:
         self.increment()
         self.queue.put(event)
 
-    def process_events(self):
+    def dispatch_events(self):
         while event := self.queue.get():
-            # recipients = set(self.processors[(None, None)])
-            recipients = set()
+            recipients = set(self.processors[(None, None)])
             for processor in self.processors.get(
                 (event.__class__.__name__, None), tuple()
             ):
@@ -151,6 +150,7 @@ class Pipeline:
             self.decrement()
             if event is self.POISON:
                 break
+
 
     def increment(self):
         with self.lock:
@@ -192,11 +192,11 @@ def find_interests(func):
                     ):
                         yield event_class, None
                     case _:
-                        logger.warning(f'failed to recognise interests in processor {func}...')
-                        yield None, None
+                        logger.warning(f'failed to identify interests in processor {func}; the processor will be omitted.')
+                        
         case _:
             logger.warning(
-                f"the processor {func} does not seem to have declared any interest to events..."
+                f"the processor {func} does not seem to have declared any interest to events; the processor will receive all events."
             )
             yield None, None
 
