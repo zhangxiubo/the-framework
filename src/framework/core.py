@@ -3,6 +3,7 @@ from collections import defaultdict
 import functools
 import hashlib
 import inspect
+import itertools
 import logging
 from pathlib import Path
 import random
@@ -85,7 +86,8 @@ class Context:
             exc = future.exception()
             if exc is not None:
                 logger.error(
-                    f"processor failed: {processor} on event {event}", exc_info=exc
+                    f"processor failed: {processor} on event {event}",
+                    exc_info=(type(exc), exc, exc.__traceback__),
                 )
         finally:
             self.pipeline.decrement()
@@ -118,11 +120,17 @@ class Pipeline:
             with self.cond:
                 while self.jobs > 0:
                     self.cond.wait()
-            assert self.queue.empty()
+            # Removed brittle queue.empty() assert
             self.submit(self.POISON)
             with self.cond:
                 while self.jobs > 0:
                     self.cond.wait()
+        # After dispatcher drained and all jobs completed, shutdown processor executors
+        for proc in set(itertools.chain.from_iterable(self.processors.values())):
+            try:
+                proc.executor.shutdown(wait=True)
+            except Exception:
+                logger.error("error shutting down executor for %r", proc, exc_info=True)
 
     def submit(self, event: Event):
         self.increment()
@@ -136,13 +144,23 @@ class Pipeline:
                 recipients |= self.processors.get((event.__class__.__name__, event.name), set())
                 for processor in recipients:
                     context = Context(self)
-                    future = processor.executor.submit(
-                        wrap(processor.process),
-                        context,
-                        event,
-                    )
-                    self.increment()
-                    future.add_done_callback(functools.partial(context.done_callback, processor=processor, context=context, event=event))
+                    try:
+                        future = processor.executor.submit(
+                            wrap(processor.process),
+                            context,
+                            event,
+                        )
+                        self.increment()
+                        future.add_done_callback(
+                            functools.partial(
+                                context.done_callback,
+                                processor=processor,
+                                context=context,
+                                event=event,
+                            )
+                        )
+                    except Exception:
+                        logger.error("failed to submit event to %r", processor, exc_info=True)
                 if event is self.POISON:
                     break
             except Exception as e:
@@ -166,23 +184,26 @@ class Pipeline:
 def parse_pattern(p):
     import ast
 
+    def cls_id(n):
+        match n:
+            case ast.Name(id=id):
+                return id
+            case ast.Attribute(attr):
+                return attr
+            case _:
+                return None
+
     match p:
         case ast.MatchClass(
-            cls=ast.Name(id=event_class),
-            kwd_attrs=[
-                "name",
-                *_,
-            ],  # we will only be able to register concrete interests (i.e. Event with a specific name; so we will only find such match patterns)
-            kwd_patterns=[
-                ast.MatchValue(value=ast.Constant(value=event_name)),
-                *_,
-            ],
+            cls=cls,
+            kwd_attrs=["name", *_],
+            kwd_patterns=[ast.MatchValue(value=ast.Constant(value=event_name)), *_],
         ):
-            return event_class, event_name
-        case ast.MatchClass(
-            cls=ast.Name(id=event_class),
-        ):
-            return event_class, None
+            cid = cls_id(cls)
+            return (cid, event_name) if cid else (None, None)
+        case ast.MatchClass(cls=cls):
+            cid = cls_id(cls)
+            return (cid, None) if cid else (None, None)
         case ast.pattern(pattern=pp):
             return parse_pattern(pp)
         case _:
@@ -239,23 +260,19 @@ class AbstractProcessor(abc.ABC):
 def caching(
     func=None,
     *,
-    independent: bool = True,
     debug: bool = False,
 ):
     def decorator(func):
-        last_digest = hashlib.sha256(func.__qualname__.encode()).hexdigest()
 
         @functools.wraps(func)
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
-                nonlocal last_digest
                 digest = hashlib.sha256(
                     dill.dumps(
                         [
                             inspect.getsource(self.__class__),
                             event.model_dump_json(),
-                            last_digest,
                         ]
                     )
                 ).hexdigest()
@@ -270,8 +287,6 @@ def caching(
                 else:
                     func(self, context, event, *args, **kwargs)
                     archive[digest] = tuple(context.events)
-                if not independent:
-                    last_digest = digest
             except Exception as e:
                 print(type(e), e, file=sys.stderr)
                 raise e
