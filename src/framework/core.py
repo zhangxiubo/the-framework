@@ -91,8 +91,6 @@ class Pipeline:
         self.queue = Queue()
         self.processors = defaultdict(set)
         for processor in processors:
-            if len(processor.interests) == 0:
-                self.processors[(None, None)].add(processor)
             for interest in processor.interests:
                 logger.info(f"registering interest for {processor}: {interest}")
                 self.processors[interest].add(processor)
@@ -105,7 +103,6 @@ class Pipeline:
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
-        
 
     def run(self):
         with ThreadPoolExecutor(1) as executor:
@@ -151,7 +148,6 @@ class Pipeline:
             if event is self.POISON:
                 break
 
-
     def increment(self):
         with self.lock:
             self.jobs += 1
@@ -165,6 +161,9 @@ class Pipeline:
 
 
 def find_interests(func):
+
+    # note that it is expected that processors will use a match-case clause as THE way to indicate interest.
+
     import ast
     import inspect
     import textwrap
@@ -177,7 +176,7 @@ def find_interests(func):
                     case ast.match_case(
                         pattern=ast.MatchClass(
                             cls=ast.Name(id=event_class),
-                            kwd_attrs=["name", *_],
+                            kwd_attrs=["name", *_],  # we will only be able to register concrete interests (i.e. Event with a specific name; so we will only find such match patterns)
                             kwd_patterns=[
                                 ast.MatchValue(value=ast.Constant(value=event_name)),
                                 *_,
@@ -192,8 +191,11 @@ def find_interests(func):
                     ):
                         yield event_class, None
                     case _:
-                        logger.warning(f'failed to identify interests in processor {func}; the processor will be omitted.')
-                        
+                        logger.warning(
+                            f"failed to identify interests in processor {func}; the processor will be omitted."
+                        )
+                        # note that this is a generator so not yielding anything will cause the caller to omit this processor
+
         case _:
             logger.warning(
                 f"the processor {func} does not seem to have declared any interest to events; the processor will receive all events."
@@ -261,8 +263,6 @@ def caching(
             except Exception as e:
                 print(type(e), e, file=sys.stderr)
                 raise e
-            else:
-                func(self, context, event, *args, **kwargs)
 
         return wrapper
 
@@ -316,7 +316,11 @@ class AbstractBuilder(AbstractProcessor):
                 # we now have the artifact ready to hand back to anyone who is asking for it
                 context.submit(
                     Event(
-                        name="built", sender=self, to=reply_to, artifact=self.artifact
+                        name="built",
+                        target=target,
+                        sender=self,
+                        to=reply_to,
+                        artifact=self.artifact,
                     )
                 )
 
@@ -325,7 +329,7 @@ class AbstractBuilder(AbstractProcessor):
             case Event(name="resolve", target=target) if (
                 target in self.provides
             ):  # monitor for resolve requests that we know how to build
-                with self.check_prequisites(context):
+                with self.check_prerequisites(context):
                     self.current_states -= {self.new}
                     self.current_states |= {self.collecting}
                     for target in self.requires:
@@ -338,7 +342,7 @@ class AbstractBuilder(AbstractProcessor):
             case Event(name="built", target=target, artifact=artifact, to=to) if (
                 to is self and target in self.requires
             ):
-                with self.check_prequisites(context):
+                with self.check_prerequisites(context):
                     self.prerequisites[target] = artifact
 
     def building(self, context: Context, event):
@@ -377,7 +381,7 @@ class AbstractBuilder(AbstractProcessor):
         pass
 
     @contextmanager
-    def check_prequisites(self, context: Context):
+    def check_prerequisites(self, context: Context):
         yield
         if len(set(self.requires) - set(self.prerequisites)) <= 0:
             self.current_states -= {self.new, self.collecting}
@@ -395,7 +399,7 @@ class AbstractBuilder(AbstractProcessor):
                 )
 
     def process(self, context, event):
-        for state in self.current_states:
+        for state in list(self.current_states):
             state(context, event)
 
 
@@ -403,7 +407,7 @@ def builder(provides: str, requires: List[str], cache=False):
     def decorator(cls):
         assert issubclass(cls, AbstractBuilder)
         cls.__init__ = functools.partialmethod(
-            cls.__init__, provides=[provides], requires=list(requires), cache=cache
+            cls.__init__, provides=[provides], requires=list(requires), cache=cache  # TODO: cache is not used
         )
         return cls
 
@@ -464,7 +468,7 @@ class JsonLLoader(AbstractProcessor):
                     except Exception as e:
                         raise e
                 this_logger.debug(
-                    f"finished loading jsonl... lines loaded {loaded_count} / {line_count} (ratio: {loaded_count * 100 / line_count:.2f}%)"
+                    f"finished loading jsonl... lines loaded {loaded_count} / {line_count} (ratio: {(loaded_count * 100 / line_count) if line_count > 0 else 0:.2f}%)"
                 )
                 context.submit(
                     Event(
@@ -476,6 +480,7 @@ class JsonLLoader(AbstractProcessor):
 
 
 class JsonLWriter(AbstractProcessor):
+
     def __init__(
         self,
         name,
@@ -486,17 +491,10 @@ class JsonLWriter(AbstractProcessor):
         super().__init__()
         self.name = name
         self.filepath = filepath
+        assert issubclass(item_type, BaseModel)
         self.item_type = item_type
         self.attribute = name if attribute is None else attribute
         self.file = open(self.filepath, "wt")
-
-    class WriteJsonL(Event):
-        def __init__(self, name, payload, **kwargs):
-            super().__init__(
-                name=name,
-                payload=payload,
-                **kwargs,
-            )
 
     def process(self, context, event):
         match event:
