@@ -93,9 +93,9 @@ class Pipeline:
         self.processors = defaultdict(set)
         for processor in processors:
             if len(processor.interests) == 0:
-                self.processors[(None,)].add(processor)
+                self.processors[(None, None)].add(processor)
             for interest in processor.interests:
-                logger.debug(f"registering interest for {processor}: {interest}")
+                logger.info(f"registering interest for {processor}: {interest}")
                 self.processors[interest].add(processor)
 
         self.jobs = 0
@@ -125,7 +125,12 @@ class Pipeline:
 
     def process_events(self):
         while event := self.queue.get():
-            recipients = set(self.processors[(None,)])
+            # recipients = set(self.processors[(None, None)])
+            recipients = set()
+            for processor in self.processors.get(
+                (event.__class__.__name__, None), tuple()
+            ):
+                recipients.add(processor)
             for processor in self.processors.get(
                 (event.__class__.__name__, event.name), tuple()
             ):
@@ -187,11 +192,13 @@ def find_interests(func):
                     ):
                         yield event_class, None
                     case _:
-                        pass
+                        logger.warning(f'failed to recognise interests in processor {func}...')
+                        yield None, None
         case _:
             logger.warning(
                 f"the processor {func} does not seem to have declared any interest to events..."
             )
+            yield None, None
 
 
 class AbstractProcessor(abc.ABC):
@@ -218,7 +225,6 @@ class AbstractProcessor(abc.ABC):
 def caching(
     func=None,
     *,
-    topic_names: Collection[str] = tuple(),
     independent: bool = True,
     debug: bool = False,
 ):
@@ -227,35 +233,34 @@ def caching(
 
         @functools.wraps(func)
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
-            if len(topic_names) == 0 or event.name in topic_names:
-                try:
-                    assert isinstance(self, AbstractProcessor)
-                    nonlocal last_digest
-                    digest = hashlib.sha256(
-                        dill.dumps(
-                            [
-                                inspect.getsource(self.__class__),
-                                event.model_dump_json(),
-                                last_digest,
-                            ]
-                        )
-                    ).hexdigest()
+            try:
+                assert isinstance(self, AbstractProcessor)
+                nonlocal last_digest
+                digest = hashlib.sha256(
+                    dill.dumps(
+                        [
+                            inspect.getsource(self.__class__),
+                            event.model_dump_json(),
+                            last_digest,
+                        ]
+                    )
+                ).hexdigest()
+                if debug:
+                    print("digest", digest)
+                archive = self.archive(context.pipeline.workspace)
+                if digest in archive:
                     if debug:
-                        print("digest", digest)
-                    archive = self.archive(context.pipeline.workspace)
-                    if digest in archive:
-                        if debug:
-                            print("cache hit:", digest)
-                        for e in archive[digest]:
-                            context.submit(e)
-                    else:
-                        func(self, context, event, *args, **kwargs)
-                        archive[digest] = tuple(context.events)
-                    if not independent:
-                        last_digest = digest
-                except Exception as e:
-                    print(type(e), e, file=sys.stderr)
-                    raise e
+                        print("cache hit:", digest)
+                    for e in archive[digest]:
+                        context.submit(e)
+                else:
+                    func(self, context, event, *args, **kwargs)
+                    archive[digest] = tuple(context.events)
+                if not independent:
+                    last_digest = digest
+            except Exception as e:
+                print(type(e), e, file=sys.stderr)
+                raise e
             else:
                 func(self, context, event, *args, **kwargs)
 
