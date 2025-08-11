@@ -29,6 +29,7 @@ Notes:
 - Resources (open files) are closed when a "__POISON__" Event is received.
 
 """
+
 import logging
 import random
 from os import PathLike
@@ -64,7 +65,9 @@ class JsonLLoader(AbstractProcessor):
     - The open file handle is closed when a "__POISON__" Event is processed.
     """
 
-    def __init__(self, name: str, filepath: str, item_type, attribute: Optional[str] = None):
+    def __init__(
+        self, name: str, filepath: str, item_type, attribute: Optional[str] = None
+    ):
         """Initialize the loader and open the JSONL file.
 
         Parameters:
@@ -149,7 +152,9 @@ class JsonLLoader(AbstractProcessor):
                                 Event(
                                     name=self.name,
                                     **{
-                                        self.attribute: self.item_type.model_validate_json(line)
+                                        self.attribute: self.item_type.model_validate_json(
+                                            line
+                                        )
                                     },
                                 )
                             )
@@ -193,7 +198,13 @@ class JsonLWriter(AbstractProcessor):
     - Opens the file in text mode for writing ('wt') immediately.
     """
 
-    def __init__(self, name, filepath: Union[PathLike, str], item_type, attribute: Optional[str] = None):
+    def __init__(
+        self,
+        name,
+        filepath: Union[PathLike, str],
+        item_type,
+        attribute: Optional[str] = None,
+    ):
         """Initialize the writer and open the destination JSONL file.
 
         Parameters:
@@ -236,7 +247,9 @@ class JsonLWriter(AbstractProcessor):
         """
         match event:
             # Guard: only write when the configured attribute exists and matches the expected Pydantic type.
-            case (Event(name=self.name) as e) if isinstance(getattr(e, self.attribute, None), self.item_type):
+            case Event(name=self.name) as e if isinstance(
+                getattr(e, self.attribute, None), self.item_type
+            ):
                 payload = getattr(e, self.attribute)
                 self.file.writelines((payload.model_dump_json(), "\n"))
                 # Flush after each write for durability; this can reduce throughput for large streams.

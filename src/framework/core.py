@@ -73,6 +73,7 @@ class Event(BaseModel):
         - model_config uses frozen=True so instances are immutable and hashable by value.
         - extra="allow" lets events carry additional dynamic fields as needed.
     """
+
     model_config = ConfigDict(frozen=True, extra="allow")
     name: str
 
@@ -96,6 +97,7 @@ def wrap(func):
     Error handling:
         - Exceptions are logged with traceback and re-raised unchanged.
     """
+
     @functools.wraps(func)
     def middleware(*args, **kwargs):
         try:
@@ -125,6 +127,7 @@ def retry(retry):
     Error handling:
         - Logs warnings for intermediate failures and an error on final failure, then re-raises.
     """
+
     def decorator_retry(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -165,6 +168,7 @@ class Context:
     Error handling:
         - Exceptions in submit() are surfaced; done_callback logs processor failures.
     """
+
     def __init__(self, pipeline):
         self.pipeline: Pipeline = pipeline
         self.events = []
@@ -172,13 +176,21 @@ class Context:
     def submit(self, event: Event):
         """Emit a new event back into the pipeline and record it for caching."""
         try:
-            self.events.append(event)  # Maintain emission order for deterministic replay.
+            self.events.append(
+                event
+            )  # Maintain emission order for deterministic replay.
             self.pipeline.submit(event)
         except Exception as e:
             print(e)
             raise e
 
-    def done_callback(self, future: Future, processor: "AbstractProcessor", context: "Context", event: Event):
+    def done_callback(
+        self,
+        future: Future,
+        processor: "AbstractProcessor",
+        context: "Context",
+        event: Event,
+    ):
         """Callback attached to processor futures to handle completion.
 
         - Logs any exception raised by the processor.
@@ -217,7 +229,13 @@ class Pipeline:
     Shutdown:
         - A special POISON event is enqueued to terminate the dispatcher after all work drains.
     """
-    def __init__(self, processors: List["AbstractProcessor"], strict_interest_inference=False, workspace=None):
+
+    def __init__(
+        self,
+        processors: List["AbstractProcessor"],
+        strict_interest_inference=False,
+        workspace=None,
+    ):
         self.queue = Queue()
         self.processors = defaultdict(set)
         for processor in processors:
@@ -231,7 +249,9 @@ class Pipeline:
         self.jobs = 0
         self.lock = threading.Lock()
         self.cond = threading.Condition(self.lock)
-        self.POISON = Event(name="__POISON__")  # Poison-pill sentinel used to stop the dispatcher.
+        self.POISON = Event(
+            name="__POISON__"
+        )  # Poison-pill sentinel used to stop the dispatcher.
         self.strict_interest_inference = strict_interest_inference
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
@@ -293,11 +313,19 @@ class Pipeline:
             try:
                 recipients = set()
                 # Wildcard delivery is disabled when strict interest inference is requested.
-                recipients |= self.processors[(None, None)] if not self.strict_interest_inference else set()
+                recipients |= (
+                    self.processors[(None, None)]
+                    if not self.strict_interest_inference
+                    else set()
+                )
                 # Deliver to handlers that match on Event class irrespective of name.
-                recipients |= self.processors.get((event.__class__.__name__, None), set())
+                recipients |= self.processors.get(
+                    (event.__class__.__name__, None), set()
+                )
                 # Deliver to the most specific class+name handlers.
-                recipients |= self.processors.get((event.__class__.__name__, event.name), set())
+                recipients |= self.processors.get(
+                    (event.__class__.__name__, event.name), set()
+                )
                 for processor in recipients:
                     context = Context(self)
                     try:
@@ -320,7 +348,9 @@ class Pipeline:
                             )
                         )
                     except Exception:
-                        logger.error("failed to submit event to %r", processor, exc_info=True)
+                        logger.error(
+                            "failed to submit event to %r", processor, exc_info=True
+                        )
                 if event is self.POISON:
                     # Poison-pill terminates the dispatcher loop once drained.
                     break
@@ -448,6 +478,7 @@ class AbstractProcessor(abc.ABC):
     Notes:
         - interests is a frozen set of interest tuples inferred by infer_interests().
     """
+
     def __init__(self):
         self.interests = frozenset(infer_interests(self.process))
         self.executor = ThreadPoolExecutor(1)
@@ -521,6 +552,7 @@ def caching(
         - Obtained via AbstractProcessor.archive(workspace) which uses a klepto sql_archive
           when a workspace directory is configured, keyed per processor class.
     """
+
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
