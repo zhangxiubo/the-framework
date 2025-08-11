@@ -1,19 +1,16 @@
 import abc
-from collections import defaultdict
 import functools
 import hashlib
 import inspect
 import itertools
 import logging
-from pathlib import Path
-import random
 import sys
 import threading
+from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
-from contextlib import contextmanager
-from os import PathLike
+from pathlib import Path
 from queue import Queue
-from typing import Any, Collection, Dict, List, Set, Optional, Union
+from typing import List
 
 import dill
 import klepto
@@ -71,7 +68,7 @@ def retry(retry):
 class Context:
     def __init__(self, pipeline):
         self.pipeline: Pipeline = pipeline
-        self.events = list()
+        self.events = []
 
     def submit(self, event: Event):
         try:
@@ -81,7 +78,7 @@ class Context:
             print(e)
             raise e
 
-    def done_callback(self, future: Future, processor: 'AbstractProcessor', context: 'Context', event: Event):
+    def done_callback(self, future: Future, processor: "AbstractProcessor", context: "Context", event: Event):
         try:
             exc = future.exception()
             if exc is not None:
@@ -94,9 +91,7 @@ class Context:
 
 
 class Pipeline:
-    def __init__(
-        self, processors: List["AbstractProcessor"], strict_interest_inference=False, workspace=None
-    ):
+    def __init__(self, processors: List["AbstractProcessor"], strict_interest_inference=False, workspace=None):
         self.queue = Queue()
         self.processors = defaultdict(set)
         for processor in processors:
@@ -120,7 +115,6 @@ class Pipeline:
             with self.cond:
                 while self.jobs > 0:
                     self.cond.wait()
-            # Removed brittle queue.empty() assert
             self.submit(self.POISON)
             with self.cond:
                 while self.jobs > 0:
@@ -168,7 +162,6 @@ class Pipeline:
                 logger.error(e, exc_info=True)
             finally:
                 self.decrement()
-
 
     def increment(self):
         with self.cond:
@@ -263,7 +256,6 @@ def caching(
     debug: bool = False,
 ):
     def decorator(func):
-
         @functools.wraps(func)
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
@@ -296,240 +288,3 @@ def caching(
     return decorator if func is None else decorator(func)
 
 
-class AbstractBuilder(AbstractProcessor):
-    def __init__(
-        self, provides: Collection[str], requires: Collection[str], cache: bool
-    ):
-        super().__init__()
-        self.current_states: Set = {self.new, self.waiting}
-        self.provides = list(provides)
-        self.requires = list(requires)
-        self.prerequisites: Dict[str, Any] = dict()
-        self.rsvp = []
-
-    def waiting(self, context, event):
-        match event:
-            case Event(name="resolve", target=target, sender=reply_to) if (
-                target in self.provides
-            ):
-                # we know how to build this, however we don't have the artifact ready yet
-                # store the incoming request so that we can respond to it later
-                self.rsvp.append((reply_to, target))
-            case Event(name="ready", sender=sender, to=to, artifact=artifact) if (
-                sender is self and to is self
-            ):
-                # the artifact has been built and we are ready to deliver them to whoever requested them.
-                # transit from self.waiting to self.ready
-                self.current_states -= {self.waiting}
-                self.current_states |= {self.ready}
-                self.artifact = artifact
-                while self.rsvp:
-                    reply_to, target = self.rsvp.pop()
-                    context.submit(
-                        Event(
-                            name="built",
-                            target=target,
-                            sender=self,
-                            to=reply_to,
-                            artifact=self.artifact,
-                        )
-                    )
-
-    def ready(self, context, event):
-        match event:
-            case Event(name="resolve", target=target, sender=reply_to) if (
-                target in self.provides
-            ):
-                # we now have the artifact ready to hand back to anyone who is asking for it
-                context.submit(
-                    Event(
-                        name="built",
-                        target=target,
-                        sender=self,
-                        to=reply_to,
-                        artifact=self.artifact,
-                    )
-                )
-
-    def new(self, context, event):
-        match event:
-            case Event(name="resolve", target=target) if (
-                target in self.provides
-            ):  # monitor for resolve requests that we know how to build
-                with self.check_prerequisites(context):
-                    self.current_states -= {self.new}
-                    self.current_states |= {self.collecting}
-                    for target in self.requires:
-                        context.submit(
-                            Event(name="resolve", target=target, sender=self)
-                        )  # kick off resolution of pre-requisites to other builders
-
-    def collecting(self, context, event):
-        match event:
-            case Event(name="built", target=target, artifact=artifact, to=to) if (
-                to is self and target in self.requires
-            ):
-                with self.check_prerequisites(context):
-                    self.prerequisites[target] = artifact
-
-    def building(self, context: Context, event):
-        match event:
-            case Event(
-                name="build",
-                sender=sender,
-                to=to,
-                target=target,
-                prerequisites=prerequisites,
-            ) if sender is self and to is self:
-                # we have everything we need to build the artifact
-                try:
-                    artifact = self.build(
-                        context, target, *[prerequisites[r] for r in self.requires]
-                    )
-                    for provide in self.provides:
-                        context.submit(
-                            Event(
-                                name="ready",
-                                sender=self,
-                                to=self,
-                                target=provide,
-                                artifact=artifact,
-                            )
-                        )
-                except Exception as e:
-                    print(e)
-                    raise e
-
-    @abc.abstractmethod
-    def build(self, context, target, *args, **kwargs):
-        """
-        Override to implement build logic
-        """
-        pass
-
-    @contextmanager
-    def check_prerequisites(self, context: Context):
-        yield
-        if len(set(self.requires) - set(self.prerequisites)) <= 0:
-            self.current_states -= {self.new, self.collecting}
-            self.current_states |= {self.building}
-            for target in self.provides:
-                # now that we have everything, initialise the build
-                context.submit(
-                    Event(
-                        name="build",
-                        sender=self,
-                        to=self,
-                        target=target,
-                        prerequisites=self.prerequisites,
-                    )
-                )
-
-    def process(self, context, event):
-        for state in list(self.current_states):
-            state(context, event)
-
-
-def builder(provides: str, requires: List[str], cache=False):
-    def decorator(cls):
-        assert issubclass(cls, AbstractBuilder)
-        cls.__init__ = functools.partialmethod(
-            cls.__init__,
-            provides=[provides],
-            requires=list(requires),
-            cache=cache,  # TODO: cache is not used
-        )
-        return cls
-
-    return decorator
-
-
-class JsonLLoader(AbstractProcessor):
-    def __init__(
-        self, name: str, filepath: str, item_type, attribute: Optional[str] = None
-    ):
-        super().__init__()
-        self.name = name
-        self.filepath = filepath
-        self.file = open(self.filepath, "rt")
-        from pydantic import BaseModel
-
-        assert issubclass(item_type, BaseModel)
-        self.item_type = item_type
-        self.attribute = name if attribute is None else attribute
-
-    class LoadJsonL:
-        def __init__(self, name, limit=None, sample=1.0):
-            self.name=name
-            self.limit=float("inf") if limit is None else int(limit)
-            self.sample=sample
-
-    def process(self, context, event):
-        match event:
-            case self.LoadJsonL(name=self.name) as e:
-                this_logger = logger.getChild(f"{self.__class__.__name__}.{event.name}")
-                this_logger.debug(
-                    f"loading {self.item_type} from jsonl file: {self.filepath}; limit: {e.limit}, sample: {e.sample}"
-                )
-                r = random.Random()
-                line_count = 0
-                loaded_count = 0
-                for line in self.file:
-                    line_count += 1
-                    try:
-                        if r.random() < e.sample:
-                            context.submit(
-                                Event(
-                                    name=self.name,
-                                    **{
-                                        self.attribute: self.item_type.model_validate_json(
-                                            line
-                                        )
-                                    },
-                                )
-                            )
-                            loaded_count += 1
-                            if loaded_count >= e.limit:
-                                break
-                    except Exception as e:
-                        raise e
-                this_logger.debug(
-                    f"finished loading jsonl... lines loaded {loaded_count} / {line_count} (ratio: {(loaded_count * 100 / line_count) if line_count > 0 else 0:.2f}%)"
-                )
-                context.submit(
-                    Event(
-                        name=self.name + "$",
-                    )
-                )
-            case Event(name='__POISON__'):
-                self.file.close()
-
-
-class JsonLWriter(AbstractProcessor):
-    def __init__(
-        self,
-        name,
-        filepath: Union[PathLike, str],
-        item_type,
-        attribute: Optional[str] = None,
-    ):
-        super().__init__()
-        self.name = name
-        self.filepath = filepath
-        assert issubclass(item_type, BaseModel)
-        self.item_type = item_type
-        self.attribute = name if attribute is None else attribute
-        self.file = open(self.filepath, "wt")
-
-    def process(self, context, event):
-        match event:
-            case (
-                Event(
-                    name=self.name,
-                ) as e
-            ) if isinstance(getattr(e, self.attribute, None), self.item_type):
-                payload = getattr(e, self.attribute)
-                self.file.writelines((payload.model_dump_json(), "\n"))
-                self.file.flush()
-            case Event(name='__POISON__'):
-                self.file.close()
