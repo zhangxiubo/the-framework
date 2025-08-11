@@ -159,14 +159,13 @@ class Context:
     Responsibilities:
         - Provide submit() API to emit follow-up events back into the pipeline.
         - Collect emitted events in-order for possible caching/replay.
-        - Provide a done_callback used by the pipeline to handle accounting and errors.
 
     Concurrency:
-        - Instances are created per dispatch; used within a processor's executor thread.
+        - Instances are created per dispatch; used within a worker thread.
           Emissions are thread-safe via Pipeline.submit.
 
     Error handling:
-        - Exceptions in submit() are surfaced; done_callback logs processor failures.
+        - Exceptions in submit() are surfaced.
     """
 
     def __init__(self, pipeline):
@@ -184,27 +183,6 @@ class Context:
             print(e)
             raise e
 
-    def done_callback(
-        self,
-        future: Future,
-        processor: "AbstractProcessor",
-        context: "Context",
-        event: Event,
-    ):
-        """Callback attached to processor futures to handle completion.
-
-        - Logs any exception raised by the processor.
-        - Always decrements the pipeline job counter.
-        """
-        try:
-            exc = future.exception()
-            if exc is not None:
-                logger.error(
-                    f"processor failed: {processor} on event {event}",
-                    exc_info=(type(exc), exc, exc.__traceback__),
-                )
-        finally:
-            self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
 
 
 class Pipeline:
@@ -218,11 +196,13 @@ class Pipeline:
         strict_interest_inference: When True, disable wildcard delivery. Only explicit matches
             from interest inference receive events.
         workspace: Optional directory path for caching archives.
+        num_workers: The number of worker threads in the pool.
 
     Concurrency and ordering:
         - A single dispatcher thread drains the queue in arrival order.
-        - Each processor has its own single-thread executor, guaranteeing per-processor ordering
-          and preventing reentrancy.
+        - A shared worker pool executes event processing for all processors.
+        - Per-processor ordering is guaranteed by queuing events for each processor
+          and using a lock to ensure only one thread processes a processor's queue at a time.
         - Global job accounting (jobs, cond) tracks all queued and executing tasks including
           nested emissions, enabling graceful shutdown.
 
@@ -235,6 +215,7 @@ class Pipeline:
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
         workspace=None,
+        num_workers=4,
     ):
         self.queue = Queue()
         self.processors = defaultdict(set)
@@ -243,6 +224,10 @@ class Pipeline:
             for interest in processor.interests:
                 logger.debug(f"registering interest for {processor}: {interest}")
                 self.processors[interest].add(processor)
+
+        self.executor = ThreadPoolExecutor(max_workers=num_workers)
+        self.processor_queues = defaultdict(Queue)
+        self.processor_locks = defaultdict(threading.Lock)
 
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
@@ -264,13 +249,13 @@ class Pipeline:
             - Wait until global jobs drop to zero (all work including nested emissions done).
             - Submit POISON to allow the dispatcher loop to observe termination.
             - Wait again for job counter to reach zero, ensuring POISON handling and final tasks complete.
-            - Finally, shut down all per-processor executors.
+            - Finally, shut down the shared executor.
 
         Notes:
             - POISON is used as a clean termination signal read by dispatch_events(), which breaks its loop.
         """
-        with ThreadPoolExecutor(1) as executor:
-            executor.submit(self.dispatch_events)
+        with ThreadPoolExecutor(1) as dispatcher_executor:
+            dispatcher_executor.submit(self.dispatch_events)
             # Wait for all outstanding jobs (including nested emissions) to complete.
             with self.cond:
                 while self.jobs > 0:
@@ -281,12 +266,9 @@ class Pipeline:
             with self.cond:
                 while self.jobs > 0:
                     self.cond.wait()
-        # After dispatcher drained and all jobs completed, shutdown processor executors
-        for proc in set(itertools.chain.from_iterable(self.processors.values())):
-            try:
-                proc.executor.shutdown(wait=True)
-            except Exception:
-                logger.error("error shutting down executor for %r", proc, exc_info=True)
+
+        # After dispatcher drained and all jobs completed, shutdown the shared executor.
+        self.executor.shutdown(wait=True)
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
@@ -310,6 +292,9 @@ class Pipeline:
         """
         while event := self.queue.get():
             try:
+                if event is self.POISON:
+                    # Poison-pill terminates the dispatcher loop once drained.
+                    break
                 recipients = set()
                 # Wildcard delivery is disabled when strict interest inference is requested.
                 recipients |= (
@@ -326,33 +311,16 @@ class Pipeline:
                     (event.__class__.__name__, event.name), set()
                 )
                 for processor in recipients:
-                    context = Context(self)
-                    try:
-                        # Each processor uses a single-thread executor to preserve per-processor ordering
-                        # and avoid reentrancy issues within processor state.
-                        future = processor.executor.submit(
-                            wrap(processor.process),
-                            context,
-                            event,
-                        )
-                        # Track processor task as a new job; a matching decrement occurs in done_callback.
-                        self.increment()
-                        # Ensure that exceptions surface in logs and job accounting is decremented.
-                        future.add_done_callback(
-                            functools.partial(
-                                context.done_callback,
-                                processor=processor,
-                                context=context,
-                                event=event,
-                            )
-                        )
-                    except Exception:
-                        logger.error(
-                            "failed to submit event to %r", processor, exc_info=True
-                        )
-                if event is self.POISON:
-                    # Poison-pill terminates the dispatcher loop once drained.
-                    break
+                    self.increment()
+                    self.processor_queues[processor].put(event)
+                    if self.processor_locks[processor].acquire(blocking=False):
+                        try:
+                            self.executor.submit(self._process_queue_for_processor, processor)
+                        except Exception:
+                            self.processor_locks[processor].release()
+                            self.decrement()
+                            logger.error("failed to submit task for %r", processor, exc_info=True)
+
             except Exception as e:
                 logger.error(e, exc_info=True)
             finally:
@@ -370,6 +338,28 @@ class Pipeline:
             self.jobs -= 1
             if self.jobs <= 0:
                 self.cond.notify_all()
+
+    def _process_queue_for_processor(self, processor: "AbstractProcessor"):
+        """Process all events in a processor's queue until it is empty."""
+        try:
+            while True:
+                try:
+                    event = self.processor_queues[processor].get_nowait()
+                except Queue.Empty:
+                    break  # Queue is empty, so we're done for now.
+
+                context = Context(self)
+                try:
+                    wrap(processor.process)(context, event)
+                except Exception as exc:
+                    logger.error(
+                        f"processor failed: {processor} on event {event}",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
+                finally:
+                    self.decrement()
+        finally:
+            self.processor_locks[processor].release()
 
 
 def parse_pattern(p):
@@ -471,12 +461,10 @@ class AbstractProcessor(abc.ABC):
 
     Responsibilities:
         - Declare interests (inferred at construction from process()).
-        - Execute work in a single-threaded executor to maintain per-processor ordering.
         - Provide an archive() utility to access the caching backend.
 
     Concurrency:
-        - Each instance owns a ThreadPoolExecutor(max_workers=1). This prevents concurrent
-          execution of process() within the same processor instance.
+        - The Pipeline serializes execution of process() for each processor instance.
 
     Notes:
         - interests is a frozen set of interest tuples inferred by infer_interests().
@@ -484,7 +472,6 @@ class AbstractProcessor(abc.ABC):
 
     def __init__(self):
         self.interests = frozenset(infer_interests(self.process))
-        self.executor = ThreadPoolExecutor(1)
 
     @abc.abstractmethod
     def process(self, context: Context, event: Event):
@@ -494,7 +481,7 @@ class AbstractProcessor(abc.ABC):
             - Invocations are serialized per processor instance.
 
         Error handling:
-            - Exceptions propagate to the future; the pipeline logs them in done_callback.
+            - Exceptions are logged by the pipeline.
         """
         pass
 
