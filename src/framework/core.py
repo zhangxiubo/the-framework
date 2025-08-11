@@ -107,7 +107,7 @@ class Pipeline:
 
         self.jobs = 0
         self.lock = threading.Lock()
-        self.cond = threading.Condition()
+        self.cond = threading.Condition(self.lock)
         self.POISON = Event(name="__POISON__")
         self.strict_interest_inference = strict_interest_inference
         self.workspace = None if workspace is None else Path(workspace)
@@ -170,15 +170,14 @@ class Pipeline:
 
 
     def increment(self):
-        with self.lock:
+        with self.cond:
             self.jobs += 1
 
     def decrement(self):
-        with self.lock:
+        with self.cond:
             self.jobs -= 1
             if self.jobs <= 0:
-                with self.cond:
-                    self.cond.notify_all()
+                self.cond.notify_all()
 
 
 def parse_pattern(p):
@@ -188,7 +187,7 @@ def parse_pattern(p):
         match n:
             case ast.Name(id=id):
                 return id
-            case ast.Attribute(attr):
+            case ast.Attribute(attr=attr):
                 return attr
             case _:
                 return None
@@ -204,7 +203,7 @@ def parse_pattern(p):
         case ast.MatchClass(cls=cls):
             cid = cls_id(cls)
             return (cid, None) if cid else (None, None)
-        case ast.pattern(pattern=pp):
+        case ast.AST(pattern=pp):
             return parse_pattern(pp)
         case _:
             return None, None
@@ -458,15 +457,11 @@ class JsonLLoader(AbstractProcessor):
         self.item_type = item_type
         self.attribute = name if attribute is None else attribute
 
-    class LoadJsonL(Event):
-        def __init__(self, name, limit=None, sample=1.0, **kwargs):
-            limit = float("inf") if limit is None else int(limit)
-            super().__init__(
-                name=name,
-                sample=sample,
-                limit=limit,
-                **kwargs,
-            )
+    class LoadJsonL:
+        def __init__(self, name, limit=None, sample=1.0):
+            self.name=name
+            self.limit=float("inf") if limit is None else int(limit)
+            self.sample=sample
 
     def process(self, context, event):
         match event:
@@ -481,7 +476,7 @@ class JsonLLoader(AbstractProcessor):
                 for line in self.file:
                     line_count += 1
                     try:
-                        if r.uniform(0, 1) > (1.0 - e.sample):
+                        if r.random() < e.sample:
                             context.submit(
                                 Event(
                                     name=self.name,
