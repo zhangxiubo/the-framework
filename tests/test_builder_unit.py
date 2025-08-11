@@ -1,5 +1,5 @@
 
-from framework.core import Event
+from framework.builder import BuilderEvent
 
 from .conftest import (
     RecordingSink,
@@ -37,7 +37,7 @@ def test_state_new_fanout(make_pipeline, run_to_quiescence):
     tap = RecordingSink("tap")  # global observer
 
     p = make_pipeline(la, lb, pb, client, tap)
-    p.submit(Event(name="resolve", target="x", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="x", sender=client))
     run_to_quiescence(p)
 
     # Check fan-out order from pb: resolve a then resolve b
@@ -75,8 +75,8 @@ def test_rsvp_fifo(make_pipeline, run_to_quiescence):
     p = make_pipeline(leaf, s1, s2, tap)
 
     # Two resolves before ready; they should be queued and answered FIFO
-    p.submit(Event(name="resolve", target="t", sender=s1))
-    p.submit(Event(name="resolve", target="t", sender=s2))
+    p.submit(BuilderEvent(name="resolve", target="t", sender=s1))
+    p.submit(BuilderEvent(name="resolve", target="t", sender=s2))
     run_to_quiescence(p)
 
     # Verify FIFO across the global tap
@@ -116,7 +116,7 @@ def test_ready_immediate_reply(make_pipeline, run_to_quiescence):
     p = make_pipeline(leaf, trigger, tap)
 
     # First resolve from trigger
-    p.submit(Event(name="resolve", target="t", sender=trigger))
+    p.submit(BuilderEvent(name="resolve", target="t", sender=trigger))
     run_to_quiescence(p)
 
     # Observe that the trigger submitted two resolves (original + after ready)
@@ -155,7 +155,7 @@ def test_prerequisite_collection_single_build(make_pipeline, run_to_quiescence):
     tap = RecordingSink("tap")
 
     p = make_pipeline(la, lb, pb, client, tap)
-    p.submit(Event(name="resolve", target="x", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="x", sender=client))
     run_to_quiescence(p)
 
     # Exactly one build invocation
@@ -188,7 +188,7 @@ def test_prerequisite_ordering_and_dedup(make_pipeline, run_to_quiescence):
     tap = RecordingSink("tap")
 
     p = make_pipeline(la, lb, pb, client, tap)
-    p.submit(Event(name="resolve", target="x", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="x", sender=client))
     run_to_quiescence(p)
 
     # Dedup implies args order [a, b]; artifact must equal "A|B"
@@ -217,7 +217,7 @@ def test_error_propagation_no_success(make_pipeline, run_to_quiescence, caplog):
     tap = RecordingSink("tap")
 
     p = make_pipeline(err, client, tap)
-    p.submit(Event(name="resolve", target="t", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="t", sender=client))
     with caplog.at_level("ERROR"):
         run_to_quiescence(p)
 
@@ -262,7 +262,7 @@ def test_decorator_behavior_end_to_end(make_pipeline, run_to_quiescence):
     assert db.requires == ["a", "b"]
 
     p = make_pipeline(la, lb, db, client, tap)
-    p.submit(Event(name="resolve", target="d", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="d", sender=client))
     run_to_quiescence(p)
 
     built_for_client = [e for e in tap.built_to(client) if getattr(e, "target", None) == "d"]
@@ -290,7 +290,7 @@ def test_idempotent_build_triggering(make_pipeline, run_to_quiescence):
     tap = RecordingSink("tap")
 
     p = make_pipeline(la, lb, pb, client, tap)
-    p.submit(Event(name="resolve", target="x", sender=client))
+    p.submit(BuilderEvent(name="resolve", target="x", sender=client))
     run_to_quiescence(p)
 
     # Exactly one build invocation for a single resolve cycle

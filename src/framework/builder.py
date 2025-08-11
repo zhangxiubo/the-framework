@@ -53,7 +53,16 @@ from contextlib import contextmanager
 from collections import deque
 from typing import Any, Collection, Dict, List, Set
 
-from .core import AbstractProcessor, Context, Event
+from pydantic import BaseModel, ConfigDict
+
+from .core import AbstractProcessor, Context
+
+
+class BuilderEvent(BaseModel):
+    """Immutable event used by the builder system; virtually identical to core.Event"""
+
+    model_config = ConfigDict(frozen=True, extra="allow")
+    name: str
 
 
 class AbstractBuilder(AbstractProcessor):
@@ -110,16 +119,16 @@ class AbstractBuilder(AbstractProcessor):
         and to ensure they are answered once the artifact is produced.
         """
         match event:
-            case Event(name="resolve", target=target, sender=reply_to) if (
+            case BuilderEvent(name="resolve", target=target, sender=reply_to) if (
                 target == self.provides
             ):
                 # We know how to build the target, but the artifact is not ready yet.
                 # Queue the request so we can respond once the artifact is ready.
                 # This avoids blocking and allows multiple callers to be answered later.
                 self.rsvp.append((reply_to, target))
-            case Event(name="ready", sender=sender, to=to, artifact=artifact) if (
-                sender is self and to is self
-            ):
+            case BuilderEvent(
+                name="ready", sender=sender, to=to, artifact=artifact
+            ) if sender is self and to is self:
                 # Our own build has completed and signaled readiness.
                 # Transition the state machine: remove waiting and building, add ready.
                 # This mutation of current_states moves the instance to "ready" so future
@@ -132,7 +141,7 @@ class AbstractBuilder(AbstractProcessor):
                 while self.rsvp:
                     reply_to, target = self.rsvp.popleft()
                     context.submit(
-                        Event(
+                        BuilderEvent(
                             name="built",
                             target=target,
                             sender=self,
@@ -148,12 +157,12 @@ class AbstractBuilder(AbstractProcessor):
           the cached artifact produced previously.
         """
         match event:
-            case Event(name="resolve", target=target, sender=reply_to) if (
+            case BuilderEvent(name="resolve", target=target, sender=reply_to) if (
                 target == self.provides
             ):
                 # Artifact is already ready; reply immediately without queueing.
                 context.submit(
-                    Event(
+                    BuilderEvent(
                         name="built",
                         target=target,
                         sender=self,
@@ -169,7 +178,7 @@ class AbstractBuilder(AbstractProcessor):
           resolve for each required prerequisite.
         """
         match event:
-            case Event(name="resolve", target=target) if (
+            case BuilderEvent(name="resolve", target=target) if (
                 target == self.provides
             ):  # monitor for resolve requests that we know how to build
                 with self.check_prerequisites(context):
@@ -182,7 +191,7 @@ class AbstractBuilder(AbstractProcessor):
                     # "target" intentionally; we preserve the original behavior.
                     for target in self.requires:
                         context.submit(
-                            Event(name="resolve", target=target, sender=self)
+                            BuilderEvent(name="resolve", target=target, sender=self)
                         )  # kick off resolution of pre-requisites to other builders
 
     def collecting(self, context, event):
@@ -194,9 +203,9 @@ class AbstractBuilder(AbstractProcessor):
           when the final prerequisite arrives.
         """
         match event:
-            case Event(name="built", target=target, artifact=artifact, to=to) if (
-                to is self and target in self.requires
-            ):
+            case BuilderEvent(
+                name="built", target=target, artifact=artifact, to=to
+            ) if to is self and target in self.requires:
                 with self.check_prerequisites(context):
                     # Store the arrived prerequisite and then check if we have them all.
                     # When the last one lands, check_prerequisites transitions to building.
@@ -211,7 +220,7 @@ class AbstractBuilder(AbstractProcessor):
         - Errors during build are surfaced after logging.
         """
         match event:
-            case Event(
+            case BuilderEvent(
                 name="build",
                 sender=sender,
                 to=to,
@@ -227,7 +236,7 @@ class AbstractBuilder(AbstractProcessor):
                         artifact = list(artifact)
                     # Emit a single ready event addressed to self for the provided target.
                     context.submit(
-                        Event(
+                        BuilderEvent(
                             name="ready",
                             sender=self,
                             to=self,
@@ -275,7 +284,7 @@ class AbstractBuilder(AbstractProcessor):
             # Submit exactly one internal build event addressed to self using the provided target.
             if self.provides:
                 context.submit(
-                    Event(
+                    BuilderEvent(
                         name="build",
                         sender=self,
                         to=self,
@@ -287,12 +296,6 @@ class AbstractBuilder(AbstractProcessor):
                 # No provided target; nothing to build.
                 return
 
-    def _process(self, context, event):
-        for state in list(
-            self.current_states
-        ):  # snapshot to avoid mutation during iteration
-            state(context, event)
-
     def process(self, context, event):
         """Dispatch the incoming event to all currently active state handlers.
 
@@ -301,14 +304,16 @@ class AbstractBuilder(AbstractProcessor):
           the set mutates during handling (states may add/remove themselves).
         """
         match event:
-            case Event(name="resolve"):
-                self._process(context, event)
-            case Event(name="build"):
-                self._process(context, event)
-            case Event(name="built"):
-                self._process(context, event)
-            case Event(name="ready"):
-                self._process(context, event)
+            case (
+                BuilderEvent(name="resolve")
+                | BuilderEvent(name="build")
+                | BuilderEvent(name="built")
+                | BuilderEvent(name="ready")
+            ):
+                for state in list(
+                    self.current_states
+                ):  # snapshot to avoid mutation during iteration
+                    state(context, event)
 
 
 def builder(provides: str, requires: List[str], cache=False):

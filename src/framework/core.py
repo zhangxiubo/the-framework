@@ -241,8 +241,7 @@ class Pipeline:
         for processor in processors:
             # Register every declared interest for this processor.
             for interest in processor.interests:
-                logger.info(f"registering interest for {processor}: {interest}")
-                print(f"registering interest for {processor}: {interest}")
+                logger.debug(f"registering interest for {processor}: {interest}")
                 self.processors[interest].add(processor)
 
         # Global job accounting guarded by a condition variable.
@@ -408,15 +407,18 @@ def parse_pattern(p):
             kwd_patterns=[ast.MatchValue(value=ast.Constant(value=event_name)), *_],
         ):
             cid = cls_id(cls)
-            return (cid, event_name) if cid else (None, None)
+            yield (cid, event_name) if cid else (None, None)
         case ast.MatchClass(cls=cls):
             cid = cls_id(cls)
-            return (cid, None) if cid else (None, None)
+            yield (cid, None) if cid else (None, None)
+        case ast.MatchOr(patterns=pps):
+            for pp in pps:
+                yield from parse_pattern(pp)
         case ast.AST(pattern=pp):
             # Some wrappers carry the actual pattern in their `pattern` field.
-            return parse_pattern(pp)
+            yield parse_pattern(pp)
         case _:
-            return None, None
+            yield None, None
 
 
 def infer_interests(func):
@@ -448,14 +450,15 @@ def infer_interests(func):
     match tree:
         case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as m])]):
             for c in m.cases:
-                match interest := parse_pattern(c.pattern):
-                    case (None, None):
-                        logger.warning(
-                            f"failed to identify interests in processor {func}: there is a match-case clause but we couldn't identify a valid event-name combination."
-                        )
-                    case _:
-                        pass
-                yield interest
+                for interest in parse_pattern(c.pattern):
+                    match interest:
+                        case (None, None):
+                            logger.warning(
+                                f"failed to identify interests in processor {func}: there is a match-case clause but we couldn't identify a valid event-name combination."
+                            )
+                        case _:
+                            pass
+                    yield interest
         case _:
             logger.warning(
                 f"the processor {func} does not seem to have declared any interest to events;"
