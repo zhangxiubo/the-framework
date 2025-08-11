@@ -1,0 +1,1 @@
+# Make 'tests' a package so relative imports like 'from .conftest import ...' work under pytest.
