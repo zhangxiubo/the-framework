@@ -139,7 +139,8 @@ class Pipeline:
     def dispatch_events(self):
         while event := self.queue.get():
             try:
-                recipients = set() if self.strict_interest_inference else set(self.processors[(None, None)])
+                recipients = set()
+                recipients |= self.processors[(None, None)] if not self.strict_interest_inference else set()
                 recipients |= self.processors.get((event.__class__.__name__, None), set())
                 recipients |= self.processors.get((event.__class__.__name__, event.name), set())
                 for processor in recipients:
@@ -209,7 +210,7 @@ def parse_pattern(p):
             return None, None
 
 
-def find_interests(func):
+def infer_interests(func):
     # note that it is expected that processors will use a match-case clause as THE way to indicate interest.
 
     import ast
@@ -237,7 +238,7 @@ def find_interests(func):
 
 class AbstractProcessor(abc.ABC):
     def __init__(self):
-        self.interests = frozenset(find_interests(self.process))
+        self.interests = frozenset(infer_interests(self.process))
         self.executor = ThreadPoolExecutor(1)
 
     @abc.abstractmethod
