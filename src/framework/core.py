@@ -42,12 +42,13 @@ import hashlib
 import inspect
 import itertools
 import logging
+import queue
 import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Queue, SimpleQueue
 import time
 from typing import List
 
@@ -184,7 +185,7 @@ class Context:
         processor: "AbstractProcessor",
         context: "Context",
         event: Event,
-        semaphore: threading.Semaphore
+        inbox: 'Inbox'
     ):
         """Callback attached to processor futures to handle completion.
 
@@ -199,9 +200,44 @@ class Context:
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
         finally:
-            semaphore.release()
+            inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
 
+
+class Inbox:
+
+    def __init__(self, processor: 'AbstractProcessor', ready_queue: Queue, concurrency: int=1):
+        self.processor = processor
+        self.events: queue.SimpleQueue = queue.SimpleQueue()
+        self.jobs = 0
+        self.slots_left = concurrency
+        self.lock = threading.RLock()
+        self.ready_queue = ready_queue
+    
+    def put_event(self, event: Event):
+        with self.lock:
+            self.events.put(event)
+            self.jobs += 1
+            if self.slots_left > 0:  # we definitely has at least one job, check if we have any slots left
+                self.slots_left -= 1
+                self.ready_queue.put(self.processor)
+
+    def take_event(self):
+        try:
+            return self.events.get(block=False)
+        except Empty:
+            assert False, f'taking from empty inbox from {self.processor}; this should not have happened'
+        finally:
+            with self.lock:
+                self.jobs -= 1
+
+    def mark_task_done(self):
+        with self.lock:
+            self.slots_left += 1
+            if self.jobs > 0:  # we definitely has at least one slot, check if we have any jobs left
+                self.slots_left -= 1
+                self.ready_queue.put(self.processor)
+        
 
 class Pipeline:
     """Event dispatch pipeline.
@@ -234,23 +270,27 @@ class Pipeline:
     ):
         self.processors = defaultdict(set)
         for processor in processors:
-            # Register every declared interest for this processor.
-            for interest in processor.interests:
-                logger.debug(f"registering interest for {processor}: {interest}")
-                self.processors[interest].add(processor)
+            self.register_processor(processor)
 
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
-        self.lock = threading.Lock()
-        self.cond = threading.Condition(self.lock)
-        self.POISON = Event(
-            name="__POISON__"
-        )  # Poison-pill sentinel used to stop the dispatcher.
+        self.cond = threading.Condition()
+        self.ready_queue = Queue()
         self.strict_interest_inference = strict_interest_inference
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
-        self.inboxes = defaultdict(lambda: (Queue(), threading.Semaphore(1)))
+
+    @functools.cache
+    def get_inbox(self, processor: 'AbstractProcessor'):
+        return Inbox(processor, self.ready_queue, 1)
+
+
+    def register_processor(self, processor: 'AbstractProcessor'):
+        # Register every declared interest for this processor.
+        for interest in processor.interests:
+            logger.debug(f"registering interest for {processor}: {interest}")
+            self.processors[interest].add(processor)
 
     def run(self):
         """Run the dispatcher loop until the queue drains, then shut down executors.
@@ -266,21 +306,18 @@ class Pipeline:
             - POISON is used as a clean termination signal read by dispatch_events(), which breaks its loop.
         """
         with ThreadPoolExecutor(1) as executor:
-            # executor.submit(self.dispatch_events)
-            stop = threading.Event()
-            executor.submit(self.execute_events, stop)
+            q = SimpleQueue()
+            q.put(True)
+            executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
-            with self.cond:
-                while self.jobs > 0:
-                    self.cond.wait()
+            self.wait()
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-            self.submit(self.POISON)
-            print('queued poison')
-            stop.set()
+            self.register_processor(Terminator(q))
+            self.submit(Event(name='__POISON__'))
             # Wait until the poison event is processed and the dispatcher exits.
-            with self.cond:
-                while self.jobs > 0:
-                    self.cond.wait()
+            self.wait()
+            print('reached the end of main executor')
+
         print('exited main executor')
 
     def submit(self, event: Event):
@@ -300,36 +337,38 @@ class Pipeline:
         print('submitting', event)
         for processor in recipients:
             self.increment()
-            inbox, semaphore = self.inboxes[processor]
-            inbox.put(event)
+            inbox: Inbox = self.get_inbox(processor)
+            inbox.put_event(event)
         self.decrement()
 
 
-    def execute_events(self, stop: threading.Event):
+    def execute_events(self, q: SimpleQueue):
         with ThreadPoolExecutor(4) as executor:
-            while not stop.is_set():
-                for processor, (inbox, semaphore) in self.inboxes.items():
-                    processor: AbstractProcessor
-                    inbox: Queue
-                    semaphore: threading.Semaphore
-                    if semaphore.acquire(blocking=False):
-                        event = None
-                        try:
-                            event = inbox.get(block=False)
-                            print(event)
-                            context = Context(self)
-                            future = executor.submit(processor.process, context, event)
-                            future.add_done_callback(
-                                functools.partial(
-                                    context.done_callback,
-                                    processor=processor,
-                                    context=context,
-                                    event=event,
-                                    semaphore=semaphore
-                                )
-                            )
-                        except Empty:
-                            semaphore.release()
+            while q.get():
+                try:
+                    processor = self.ready_queue.get()
+                    # one of the processors indicated that it's ready    
+                    inbox: Inbox = self.get_inbox(processor)
+                    event: Event = inbox.take_event()
+                    context = Context(self)
+                    future = executor.submit(processor.process, context, event)
+                    future.add_done_callback(
+                        functools.partial(
+                            context.done_callback,
+                            processor=processor,
+                            context=context,
+                            event=event,
+                            inbox=inbox,
+                        )
+                    )
+                    print('end of loop')
+                    q.put(True)
+                except Exception as e:
+                    print(e)
+                    q.put(False)
+                    
+                
+
 
     def increment(self):
         """Increment global job counter."""
@@ -344,6 +383,11 @@ class Pipeline:
             print('jobs decreased:', self.jobs)
             if self.jobs <= 0:
                 self.cond.notify_all()
+    
+    def wait(self):
+        with self.cond:
+            self.cond.wait_for(lambda: self.jobs <= 0)
+            
 
 
 def parse_pattern(p):
@@ -494,6 +538,18 @@ class AbstractProcessor(abc.ABC):
                 cached=False,
                 serialized=True,
             )
+
+
+class Terminator(AbstractProcessor):
+
+    def __init__(self, q: SimpleQueue):
+        super().__init__()
+        self.q = q
+
+    def process(self, context, event):
+        match event:
+            case Event(name='__POISON__'):
+                self.q.put(False)
 
 
 def caching(
