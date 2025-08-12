@@ -51,7 +51,7 @@ import functools
 import types
 from contextlib import contextmanager
 from collections import deque
-from typing import Any, Collection, Dict, List, Set
+from typing import Any, Collection, Dict, List, Set, Optional
 
 from pydantic import BaseModel, ConfigDict
 
@@ -81,7 +81,7 @@ class AbstractBuilder(AbstractProcessor):
     - ready: artifact available; respond immediately to resolve with built
     """
 
-    def __init__(self, provides: str, requires: Collection[str], cache: bool):
+    def __init__(self, provides: Optional[str] = None, requires: Collection[str] = tuple(), cache: bool = False):
         """Initialize the builder with its single provided target and runtime state.
 
         Parameters:
@@ -102,6 +102,7 @@ class AbstractBuilder(AbstractProcessor):
         """
         super().__init__()
         self.current_states: Set = {self.new, self.waiting}
+        assert provides is not None
         self.provides = provides
         self.requires = list(dict.fromkeys(requires))
         self.prerequisites: Dict[str, Any] = {}
@@ -250,7 +251,7 @@ class AbstractBuilder(AbstractProcessor):
                     raise e
 
     @abc.abstractmethod
-    def build(self, context, target, *args, **kwargs):
+    def build(self, context: Context, target: str, *args, **kwargs):
         """Construct and return the artifact for the given target.
 
         Implementations must:
