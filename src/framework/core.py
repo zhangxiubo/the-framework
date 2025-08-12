@@ -1,41 +1,3 @@
-"""Event-driven runtime core.
-
-This module provides:
-- An immutable Event model (pydantic BaseModel with frozen=True) as the lingua franca.
-- A processor abstraction (AbstractProcessor) with a single-threaded executor per processor
-  to avoid reentrancy and concurrent state mutation inside a processor.
-- A Pipeline that dispatches events to processors based on "interests" inferred from the
-  processor's match-case patterns over Event instances. Interests are keyed as:
-    (None, None)                         -> wildcard/default interest
-    (EventClassName, None)               -> any name for a given event class
-    (EventClassName, "specific_name")    -> specific name for a given event class
-- An optional caching decorator that records emitted events keyed by the processor class'
-  source code + input event JSON to enable deterministic replay.
-
-
-Interest inference:
-- Processors typically use Python's match-case on the immutable Event object. This module inspects
-  the AST of the processor's process function to infer which (event class, name) pairs a processor
-  is interested in. Only common/standard match-case shapes are recognized (e.g., MatchClass with an
-  optional 'name' kwd). Non-standard constructs, deeply dynamic patterns, or patterns that do not
-  fit expected shapes will yield (None, None), and the pipeline may fall back to default delivery
-  (unless strict interest inference is enabled).
-
-Caching decorator:
-- The caching decorator composes a digest from: [processor class source, event JSON].
-- It stores the tuple of events emitted during processing and, on cache hit, replays them by
-  resubmitting the events to the pipeline. dill is used to serialize the inputs (class source,
-  event contents) to ensure a stable digest.
-- Caveat: Only emitted events are cached/replayed. Any external side effects are not captured
-  and therefore will not be replayed deterministically.
-
-Light notes / TODOs:
-- Extension points: support additional interest inference strategies beyond AST of match-case,
-  allow configurable multi-threaded processors with explicit synchronization.
-- Archive backend: the current workspace cache uses klepto's sql_archive persisted per
-  processor class name; alternative backends could be made pluggable.
-"""
-
 import abc
 import functools
 import hashlib
@@ -49,7 +11,6 @@ from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-import time
 from typing import List
 
 import dill
@@ -185,7 +146,7 @@ class Context:
         processor: "AbstractProcessor",
         context: "Context",
         event: Event,
-        inbox: 'Inbox'
+        inbox: "Inbox",
     ):
         """Callback attached to processor futures to handle completion.
 
@@ -205,20 +166,23 @@ class Context:
 
 
 class Inbox:
-
-    def __init__(self, processor: 'AbstractProcessor', ready_queue: Queue, concurrency: int=1):
+    def __init__(
+        self, processor: "AbstractProcessor", ready_queue: Queue, concurrency: int = 1
+    ):
         self.processor = processor
         self.events: queue.SimpleQueue = queue.SimpleQueue()
         self.jobs = 0
         self.slots_left = concurrency
         self.lock = threading.RLock()
         self.ready_queue = ready_queue
-    
+
     def put_event(self, event: Event):
         with self.lock:
             self.events.put(event)
             self.jobs += 1
-            if self.slots_left > 0:  # we definitely has at least one job, check if we have any slots left
+            if (
+                self.slots_left > 0
+            ):  # we definitely has at least one job, check if we have any slots left
                 self.slots_left -= 1
                 self.ready_queue.put(self.processor)
 
@@ -226,7 +190,9 @@ class Inbox:
         try:
             return self.events.get(block=False)
         except Empty:
-            assert False, f'taking from empty inbox from {self.processor}; this should not have happened'
+            assert False, (
+                f"taking from empty inbox from {self.processor}; this should not have happened"
+            )
         finally:
             with self.lock:
                 self.jobs -= 1
@@ -234,10 +200,12 @@ class Inbox:
     def mark_task_done(self):
         with self.lock:
             self.slots_left += 1
-            if self.jobs > 0:  # we definitely has at least one slot, check if we have any jobs left
+            if (
+                self.jobs > 0
+            ):  # we definitely has at least one slot, check if we have any jobs left
                 self.slots_left -= 1
                 self.ready_queue.put(self.processor)
-        
+
 
 class Pipeline:
     """Event dispatch pipeline.
@@ -268,29 +236,30 @@ class Pipeline:
         strict_interest_inference=False,
         workspace=None,
     ):
-        self.processors = defaultdict(set)
-        for processor in processors:
-            self.register_processor(processor)
 
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.cond = threading.Condition()
-        self.ready_queue = Queue()
+        self.rdyq = Queue()
         self.strict_interest_inference = strict_interest_inference
+
+        self.processors = defaultdict(set)
+        for processor in processors:
+            self.register_processor(processor)
+
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
 
     @functools.cache
-    def get_inbox(self, processor: 'AbstractProcessor'):
-        return Inbox(processor, self.ready_queue, 1)
+    def get_inbox(self, processor: "AbstractProcessor"):
+        return Inbox(processor, self.rdyq, 1)
 
-
-    def register_processor(self, processor: 'AbstractProcessor'):
+    def register_processor(self, processor: "AbstractProcessor"):
         # Register every declared interest for this processor.
         for interest in processor.interests:
             logger.debug(f"registering interest for {processor}: {interest}")
-            self.processors[interest].add(processor)
+            self.processors[interest].add(processor)        
 
     def run(self):
         """Run the dispatcher loop until the queue drains, then shut down executors.
@@ -307,18 +276,19 @@ class Pipeline:
         """
         with ThreadPoolExecutor(1) as executor:
             q = SimpleQueue()
+            self.register_processor(Terminator(q))
             q.put(True)
             executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
             self.wait()
+            print('first stage processing done; proceeds to termination')
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-            self.register_processor(Terminator(q))
-            self.submit(Event(name='__POISON__'))
+            self.submit(Event(name="__POISON__"))
             # Wait until the poison event is processed and the dispatcher exits.
             self.wait()
-            print('reached the end of main executor')
+            print("reached the end of main executor")
 
-        print('exited main executor')
+        print("exited main executor")
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
@@ -334,20 +304,22 @@ class Pipeline:
         recipients |= self.processors.get((event.__class__.__name__, None), set())
         # Deliver to the most specific class+name handlers.
         recipients |= self.processors.get((event.__class__.__name__, event.name), set())
-        print('submitting', event)
+        print("submitting", event)
         for processor in recipients:
             self.increment()
             inbox: Inbox = self.get_inbox(processor)
             inbox.put_event(event)
         self.decrement()
 
-
     def execute_events(self, q: SimpleQueue):
+
         with ThreadPoolExecutor(4) as executor:
             while q.get():
                 try:
-                    processor = self.ready_queue.get()
-                    # one of the processors indicated that it's ready    
+                    print('getting a ready processor', (self.rdyq.qsize()))
+                    processor = self.rdyq.get()
+                    print('ready processor found', processor)
+                    # one of the processors indicated that it's ready (has event and has slots)
                     inbox: Inbox = self.get_inbox(processor)
                     event: Event = inbox.take_event()
                     context = Context(self)
@@ -361,33 +333,28 @@ class Pipeline:
                             inbox=inbox,
                         )
                     )
-                    print('end of loop')
-                    q.put(True)
+                    print("end of loop")
                 except Exception as e:
                     print(e)
-                    q.put(False)
-                    
+                    raise e
                 
-
-
     def increment(self):
         """Increment global job counter."""
         with self.cond:
             self.jobs += 1
-            print('jobs increased:', self.jobs)
+            print("jobs increased:", self.jobs)
 
     def decrement(self):
         """Decrement global job counter and notify waiters when it reaches zero."""
         with self.cond:
             self.jobs -= 1
-            print('jobs decreased:', self.jobs)
+            print("jobs decreased:", self.jobs)
             if self.jobs <= 0:
                 self.cond.notify_all()
-    
+
     def wait(self):
         with self.cond:
             self.cond.wait_for(lambda: self.jobs <= 0)
-            
 
 
 def parse_pattern(p):
@@ -545,11 +512,17 @@ class Terminator(AbstractProcessor):
     def __init__(self, q: SimpleQueue):
         super().__init__()
         self.q = q
+        self.default = True
 
     def process(self, context, event):
         match event:
-            case Event(name='__POISON__'):
-                self.q.put(False)
+            case Event(name="__POISON__"):
+                print('terminator processing', event)
+                self.default = False
+                self.q.put(self.default)
+            case Event():
+                print('terminator processing', event)
+                self.q.put(self.default)
 
 
 def caching(
