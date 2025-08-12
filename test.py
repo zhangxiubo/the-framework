@@ -1,13 +1,16 @@
 
-from framework import Pipeline
-from framework import AbstractProcessor
-from framework import Event
+from framework.core import Pipeline
+from framework.core import AbstractProcessor
+from framework.core import Event
 
 class TestProcessor(AbstractProcessor):
 
     def process(self, context, event):
         match event:
             case Event(name='test', payload=payload):
+                print(payload)
+                pass
+            case Event(name='abc', payload=payload):
                 print(payload)
                 pass
 
