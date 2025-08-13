@@ -164,8 +164,7 @@ class Context:
             inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
             # Suppress wake-up pulse for poison events to avoid stray True after termination.
-            if getattr(event, "name", None) != "__POISON__":
-                q.put(True)
+            q.put(True)
 
 
 class Inbox:
@@ -199,7 +198,6 @@ class Inbox:
             assert False, (
                 f"taking from empty inbox from {self.processor}; this should not have happened"
             )
-            
 
     def mark_task_done(self):
         with self.lock:
@@ -240,7 +238,6 @@ class Pipeline:
         strict_interest_inference=False,
         workspace=None,
     ):
-
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.cond = threading.Condition()
@@ -263,7 +260,7 @@ class Pipeline:
         # Register every declared interest for this processor.
         for interest in processor.interests:
             logger.debug(f"registering interest for {processor}: {interest}")
-            self.processors[interest].add(processor)        
+            self.processors[interest].add(processor)
 
     def run(self):
         """Run the dispatcher loop until the queue drains, then shut down executors.
@@ -284,7 +281,7 @@ class Pipeline:
             executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
             self.wait()
-            print('first stage processing done; proceeds to termination')
+            print("first stage processing done; proceeds to termination")
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
             self.register_processor(Terminator(q))
             self.submit(Event(name="__POISON__"))
@@ -319,24 +316,13 @@ class Pipeline:
         self.decrement()
 
     def execute_events(self, q: SimpleQueue):
-    
         with ThreadPoolExecutor(4) as executor:
             # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
-            running = True
-            while running:
+            while q.get():
                 try:
-                    token = q.get()
-                    if token is False:
-                        break
                     # Drain all ready processors without blocking on an empty ready queue.
-                    while True:
-                        try:
-                            print('getting a ready processor', (self.rdyq.qsize()))
-                            processor = self.rdyq.get_nowait()
-                        except Empty:
-                            break
-                        print('ready processor found', processor)
-                        # one of the processors indicated that it's ready (has event and has slots)
+                    while processor := self.rdyq.get_nowait():
+                        # One of the processors indicated readiness (has an event and an available slot).
                         inbox: Inbox = self.get_inbox(processor)
                         event: Event = inbox.take_event()
                         context = Context(self)
@@ -351,11 +337,11 @@ class Pipeline:
                                 q=q,
                             )
                         )
-                        print("end of loop")
+                except Empty:
+                    continue
                 except Exception as e:
-                    print(e)
                     raise e
-                
+
     def increment(self):
         """Increment global job counter."""
         with self.cond:
@@ -526,7 +512,6 @@ class AbstractProcessor(abc.ABC):
 
 
 class Terminator(AbstractProcessor):
-
     def __init__(self, q: SimpleQueue):
         super().__init__()
         self.q = q
@@ -534,8 +519,9 @@ class Terminator(AbstractProcessor):
     def process(self, context, event):
         match event:
             case Event(name="__POISON__"):
-                print('terminator processing', event)
+                print("terminator processing", event)
                 self.q.put(False)
+
 
 def caching(
     func=None,
