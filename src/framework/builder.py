@@ -74,7 +74,9 @@ class AbstractBuilder(AbstractProcessor):
         super().__init__()
         self.current_states: Set = {self.new, self.waiting}
         self.provides = provides
-        self.requires = list(dict.fromkeys(requires))  # Deduplicate while preserving order
+        self.requires = list(
+            dict.fromkeys(requires)
+        )  # Deduplicate while preserving order
         self.prerequisites: Dict[str, Any] = {}
         self.rsvp = deque()  # Queue for early resolve requests
         self.artifact = None
@@ -85,16 +87,20 @@ class AbstractBuilder(AbstractProcessor):
         Handles resolve requests while build is pending and transitions to ready when complete.
         """
         match event:
-            case BuilderEvent(name="resolve", target=target, sender=reply_to) if target == self.provides:
+            case BuilderEvent(name="resolve", target=target, sender=reply_to) if (
+                target == self.provides
+            ):
                 # Queue the request to respond once artifact is ready
                 self.rsvp.append((reply_to, target))
-                
-            case BuilderEvent(name="ready", sender=sender, to=to, artifact=artifact) if sender is self and to is self:
+
+            case BuilderEvent(
+                name="ready", sender=sender, to=to, artifact=artifact
+            ) if sender is self and to is self:
                 # Transition to ready state
                 self.current_states -= {self.waiting, self.building}
                 self.current_states |= {self.ready}
                 self.artifact = artifact
-                
+
                 # Respond to all queued requests
                 while self.rsvp:
                     reply_to, target = self.rsvp.popleft()
@@ -111,7 +117,9 @@ class AbstractBuilder(AbstractProcessor):
     def ready(self, context, event):
         """State: artifact is available. Immediately respond to resolve requests."""
         match event:
-            case BuilderEvent(name="resolve", target=target, sender=reply_to) if target == self.provides:
+            case BuilderEvent(name="resolve", target=target, sender=reply_to) if (
+                target == self.provides
+            ):
                 context.submit(
                     BuilderEvent(
                         name="built",
@@ -124,7 +132,7 @@ class AbstractBuilder(AbstractProcessor):
 
     def new(self, context, event):
         """State: initial state before prerequisites have been requested.
-        
+
         Transitions to collecting state and fans out resolve requests for prerequisites.
         """
         match event:
@@ -133,37 +141,47 @@ class AbstractBuilder(AbstractProcessor):
                     # Transition to collecting state
                     self.current_states -= {self.new}
                     self.current_states |= {self.collecting}
-                    
+
                     # Fan out resolve requests for all prerequisites
                     for required_target in self.requires:
                         context.submit(
-                            BuilderEvent(name="resolve", target=required_target, sender=self)
+                            BuilderEvent(
+                                name="resolve", target=required_target, sender=self
+                            )
                         )
 
     def collecting(self, context, event):
         """State: collect prerequisite artifacts as they are built.
-        
+
         Stores artifacts and triggers build when all prerequisites are satisfied.
         """
         match event:
-            case BuilderEvent(name="built", target=target, artifact=artifact, to=to) if to is self and target in self.requires:
+            case BuilderEvent(
+                name="built", target=target, artifact=artifact, to=to
+            ) if to is self and target in self.requires:
                 with self.check_prerequisites(context):
                     self.prerequisites[target] = artifact
 
     def building(self, context: Context, event):
         """State: perform the build once all prerequisites are available."""
         match event:
-            case BuilderEvent(name="build", sender=sender, to=to, target=target, prerequisites=prerequisites) if sender is self and to is self:
+            case BuilderEvent(
+                name="build",
+                sender=sender,
+                to=to,
+                target=target,
+                prerequisites=prerequisites,
+            ) if sender is self and to is self:
                 try:
                     # Build the artifact with prerequisites in required order
                     artifact = self.build(
                         context, target, *[prerequisites[r] for r in self.requires]
                     )
-                    
+
                     # Convert generators to lists to avoid serialization issues
                     if isinstance(artifact, types.GeneratorType):
                         artifact = list(artifact)
-                    
+
                     # Signal that the artifact is ready
                     context.submit(
                         BuilderEvent(
@@ -175,7 +193,9 @@ class AbstractBuilder(AbstractProcessor):
                         )
                     )
                 except Exception as e:
-                    logger.error(f"Build failed for target {target}: {e}", exc_info=True)
+                    logger.error(
+                        f"Build failed for target {target}: {e}", exc_info=True
+                    )
                     raise
 
     @abc.abstractmethod
@@ -187,7 +207,7 @@ class AbstractBuilder(AbstractProcessor):
             target: The target to build
             *args: Prerequisites in the exact order of self.requires
             **kwargs: Additional parameters (unused by framework)
-            
+
         Returns:
             The constructed artifact
         """
@@ -197,14 +217,14 @@ class AbstractBuilder(AbstractProcessor):
     def check_prerequisites(self, context: Context):
         """Context manager that checks if all prerequisites are satisfied after the wrapped block."""
         yield
-        
+
         # Check if all required prerequisites have been collected
         missing_prerequisites = set(self.requires) - set(self.prerequisites)
         if not missing_prerequisites:
             # Transition to building state
             self.current_states -= {self.new, self.collecting}
             self.current_states |= {self.building}
-            
+
             # Trigger the build
             if self.provides:
                 context.submit(
@@ -220,7 +240,12 @@ class AbstractBuilder(AbstractProcessor):
     def process(self, context, event):
         """Dispatch the incoming event to all currently active state handlers."""
         match event:
-            case BuilderEvent(name=name) if name in ("resolve", "build", "built", "ready"):
+            case BuilderEvent(name=name) if name in (
+                "resolve",
+                "build",
+                "built",
+                "ready",
+            ):
                 # Snapshot current_states to avoid mutation during iteration
                 for state in list(self.current_states):
                     state(context, event)
@@ -240,6 +265,7 @@ def builder(provides: str, requires: List[str], cache=False):
         requires: List of prerequisite target names
         cache: Reserved for future caching behavior (currently unused)
     """
+
     def decorator(cls):
         assert issubclass(cls, AbstractBuilder)
         cls.__init__ = functools.partialmethod(

@@ -86,7 +86,9 @@ def retry(max_attempts):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             for attempt in range(max_attempts):
-                logger.debug(f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}")
+                logger.debug(
+                    f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}"
+                )
                 try:
                     return func(*args, **kwargs)
                 except Exception:
@@ -294,15 +296,15 @@ class Pipeline:
         """Submit an event to the queue and increment job count."""
         self.increment()
         recipients = set()
-        
+
         # Collect all relevant recipients
         if not self.strict_interest_inference:
             recipients |= self.processors.get((None, None), set())
-        
+
         event_class = event.__class__.__name__
         recipients |= self.processors.get((event_class, None), set())
         recipients |= self.processors.get((event_class, event.name), set())
-        
+
         logger.debug("submitting %s", event)
         for processor in recipients:
             self.increment()
@@ -544,19 +546,19 @@ def caching(
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
-                
+
                 # Compute cache key from processor source and event
                 cache_key_data = [
                     inspect.getsource(self.__class__),
                     event.model_dump_json(),
                 ]
                 digest = hashlib.sha256(dill.dumps(cache_key_data)).hexdigest()
-                
+
                 if debug:
                     logger.debug("digest %s", digest)
-                
+
                 archive = self.archive(context.pipeline.workspace)
-                
+
                 if digest in archive:
                     # Cache hit: replay archived events
                     if debug:
@@ -567,7 +569,7 @@ def caching(
                     # Cache miss: execute and cache results
                     func(self, context, event, *args, **kwargs)
                     archive[digest] = tuple(context.events)
-                    
+
             except Exception:
                 logger.exception("caching wrapper failed")
                 raise
