@@ -66,11 +66,11 @@ def wrap(func):
     return middleware
 
 
-def retry(retry):
-    """Decorator that retries a callable up to `retry` times.
+def retry(max_attempts):
+    """Decorator that retries a callable up to `max_attempts` times.
 
     Args:
-        retry: Number of attempts. Last failure is logged at error level and re-raised.
+        max_attempts: Number of attempts. Last failure is logged at error level and re-raised.
 
     Returns:
         A decorator that wraps the target function with retry logic.
@@ -85,22 +85,22 @@ def retry(retry):
     def decorator_retry(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            for i in range(retry):
-                logger.debug(f"attempt {i + 1} / {retry} at {func.__qualname__}")
+            for attempt in range(max_attempts):
+                logger.debug(f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}")
                 try:
                     return func(*args, **kwargs)
                 except Exception:
-                    if i >= retry - 1:
+                    is_last_attempt = attempt >= max_attempts - 1
+                    if is_last_attempt:
                         logger.error(
-                            f"attempt {i + 1} / {retry} at {func.__qualname__} failed... escalating",
+                            f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... escalating",
                             exc_info=True,
                         )
                         raise
-                    else:
-                        logger.warning(
-                            f"attempt {i + 1} / {retry} at {func.__qualname__} failed... retrying",
-                            exc_info=True,
-                        )
+                    logger.warning(
+                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... retrying",
+                        exc_info=True,
+                    )
 
         return wrapper
 
@@ -181,9 +181,7 @@ class Inbox:
         with self.lock:
             self.events.put(event)
             self.jobs += 1
-            if (
-                self.slots_left > 0
-            ):  # we definitely has at least one job, check if we have any slots left
+            if self.slots_left > 0:  # Check if we have any slots left
                 self.slots_left -= 1
                 self.ready_queue.put(self.processor)
 
@@ -201,9 +199,7 @@ class Inbox:
     def mark_task_done(self):
         with self.lock:
             self.slots_left += 1
-            if (
-                self.jobs > 0
-            ):  # we definitely has at least one slot, check if we have any jobs left
+            if self.jobs > 0:  # Check if we have any jobs left
                 self.slots_left -= 1
                 self.ready_queue.put(self.processor)
 
@@ -298,20 +294,19 @@ class Pipeline:
         """Submit an event to the queue and increment job count."""
         self.increment()
         recipients = set()
-        # Wildcard delivery is disabled when strict interest inference is requested.
-        recipients |= (
-            self.processors[(None, None)]
-            if not self.strict_interest_inference
-            else set()
-        )
-        # Deliver to handlers that match on Event class irrespective of name.
-        recipients |= self.processors.get((event.__class__.__name__, None), set())
-        # Deliver to the most specific class+name handlers.
-        recipients |= self.processors.get((event.__class__.__name__, event.name), set())
+        
+        # Collect all relevant recipients
+        if not self.strict_interest_inference:
+            recipients |= self.processors.get((None, None), set())
+        
+        event_class = event.__class__.__name__
+        recipients |= self.processors.get((event_class, None), set())
+        recipients |= self.processors.get((event_class, event.name), set())
+        
         logger.debug("submitting %s", event)
         for processor in recipients:
             self.increment()
-            inbox: Inbox = self.get_inbox(processor)
+            inbox = self.get_inbox(processor)
             inbox.put_event(event)
         self.decrement()
 
@@ -373,16 +368,12 @@ def parse_pattern(p):
     Returns:
         Tuple[str | None, str | None]: (ClassIdentifier, EventName) where either may be None.
         Returns (None, None) when the pattern cannot be interpreted.
-
-    Limitations:
-        - Only a subset of conventional patterns is recognized. Exotic or dynamic patterns
-          may not be interpreted and will result in (None, None).
     """
     import ast
 
-    def cls_id(n):
-        # Extract a class identifier from Name or Attribute; otherwise return None.
-        match n:
+    def get_class_identifier(node):
+        """Extract a class identifier from Name or Attribute nodes."""
+        match node:
             case ast.Name(id=id):
                 return id
             case ast.Attribute(attr=attr):
@@ -396,17 +387,16 @@ def parse_pattern(p):
             kwd_attrs=["name", *_],
             kwd_patterns=[ast.MatchValue(value=ast.Constant(value=event_name)), *_],
         ):
-            cid = cls_id(cls)
-            yield (cid, event_name) if cid else (None, None)
+            class_id = get_class_identifier(cls)
+            yield (class_id, event_name) if class_id else (None, None)
         case ast.MatchClass(cls=cls):
-            cid = cls_id(cls)
-            yield (cid, None) if cid else (None, None)
-        case ast.MatchOr(patterns=pps):
-            for pp in pps:
-                yield from parse_pattern(pp)
-        case ast.AST(pattern=pp):
-            # Some wrappers carry the actual pattern in their `pattern` field.
-            yield from parse_pattern(pp)
+            class_id = get_class_identifier(cls)
+            yield (class_id, None) if class_id else (None, None)
+        case ast.MatchOr(patterns=patterns):
+            for pattern in patterns:
+                yield from parse_pattern(pattern)
+        case ast.AST(pattern=pattern):
+            yield from parse_pattern(pattern)
         case _:
             yield None, None
 
@@ -424,23 +414,16 @@ def infer_interests(func):
     Behavior:
         - If no recognizable match-case is found, yields (None, None) and logs a warning.
         - If a case cannot be interpreted, logs a warning and yields (None, None) for that case.
-
-    Limitations:
-        - Unusual control-flow, guards, or patterns may not be recognized and will produce
-          (None, None). In strict_interest_inference mode, such processors will not receive
-          events via wildcard delivery.
     """
-    # note that it is expected that processors will use a match-case clause as THE way to indicate interest.
-
     import ast
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
     match tree:
-        case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as m])]):
-            for c in m.cases:
-                for interest in parse_pattern(c.pattern):
+        case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as match_stmt])]):
+            for case in match_stmt.cases:
+                for interest in parse_pattern(case.pattern):
                     match interest:
                         case (None, None):
                             logger.warning(
@@ -451,7 +434,7 @@ def infer_interests(func):
                     yield interest
         case _:
             logger.warning(
-                f"the processor {func} does not seem to have declared any interest to events;"
+                f"The processor {func} does not seem to have declared any interest to events"
             )
             yield None, None
 
@@ -561,30 +544,31 @@ def caching(
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
-                # Compute digest over processor class source + input event JSON.
-                digest = hashlib.sha256(
-                    dill.dumps(
-                        [
-                            inspect.getsource(self.__class__),
-                            event.model_dump_json(),
-                        ]
-                    )
-                ).hexdigest()
+                
+                # Compute cache key from processor source and event
+                cache_key_data = [
+                    inspect.getsource(self.__class__),
+                    event.model_dump_json(),
+                ]
+                digest = hashlib.sha256(dill.dumps(cache_key_data)).hexdigest()
+                
                 if debug:
                     logger.debug("digest %s", digest)
+                
                 archive = self.archive(context.pipeline.workspace)
+                
                 if digest in archive:
-                    # Cache hit: replay by resubmitting archived events in original order.
+                    # Cache hit: replay archived events
                     if debug:
                         logger.debug("cache hit: %s", digest)
-                    for e in archive[digest]:
-                        context.submit(e)
+                    for cached_event in archive[digest]:
+                        context.submit(cached_event)
                 else:
-                    # Cache miss: execute and archive emitted events as an ordered tuple.
+                    # Cache miss: execute and cache results
                     func(self, context, event, *args, **kwargs)
                     archive[digest] = tuple(context.events)
+                    
             except Exception:
-                # Log failure details while preserving behavior.
                 logger.exception("caching wrapper failed")
                 raise
 
