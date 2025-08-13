@@ -2,7 +2,6 @@ import abc
 import functools
 import hashlib
 import inspect
-import itertools
 import logging
 import queue
 import sys
@@ -10,7 +9,7 @@ import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Queue, SimpleQueue
+from queue import Empty, PriorityQueue, Queue, SimpleQueue
 from typing import List
 
 import dill
@@ -147,6 +146,7 @@ class Context:
         context: "Context",
         event: Event,
         inbox: "Inbox",
+        q: SimpleQueue,
     ):
         """Callback attached to processor futures to handle completion.
 
@@ -163,6 +163,9 @@ class Context:
         finally:
             inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
+            # Suppress wake-up pulse for poison events to avoid stray True after termination.
+            if getattr(event, "name", None) != "__POISON__":
+                q.put(True)
 
 
 class Inbox:
@@ -188,14 +191,15 @@ class Inbox:
 
     def take_event(self):
         try:
-            return self.events.get(block=False)
+            event = self.events.get(block=False)
+            with self.lock:
+                self.jobs -= 1
+                return event
         except Empty:
             assert False, (
                 f"taking from empty inbox from {self.processor}; this should not have happened"
             )
-        finally:
-            with self.lock:
-                self.jobs -= 1
+            
 
     def mark_task_done(self):
         with self.lock:
@@ -276,14 +280,17 @@ class Pipeline:
         """
         with ThreadPoolExecutor(1) as executor:
             q = SimpleQueue()
-            self.register_processor(Terminator(q))
             q.put(True)
             executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
             self.wait()
             print('first stage processing done; proceeds to termination')
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
+            self.register_processor(Terminator(q))
             self.submit(Event(name="__POISON__"))
+            # Wake dispatcher to process the poison if it is currently waiting on q.get()
+            # with an empty ready queue.
+            q.put(True)
             # Wait until the poison event is processed and the dispatcher exits.
             self.wait()
             print("reached the end of main executor")
@@ -312,28 +319,39 @@ class Pipeline:
         self.decrement()
 
     def execute_events(self, q: SimpleQueue):
-
+    
         with ThreadPoolExecutor(4) as executor:
-            while q.get():
+            # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
+            running = True
+            while running:
                 try:
-                    print('getting a ready processor', (self.rdyq.qsize()))
-                    processor = self.rdyq.get()
-                    print('ready processor found', processor)
-                    # one of the processors indicated that it's ready (has event and has slots)
-                    inbox: Inbox = self.get_inbox(processor)
-                    event: Event = inbox.take_event()
-                    context = Context(self)
-                    future = executor.submit(processor.process, context, event)
-                    future.add_done_callback(
-                        functools.partial(
-                            context.done_callback,
-                            processor=processor,
-                            context=context,
-                            event=event,
-                            inbox=inbox,
+                    token = q.get()
+                    if token is False:
+                        break
+                    # Drain all ready processors without blocking on an empty ready queue.
+                    while True:
+                        try:
+                            print('getting a ready processor', (self.rdyq.qsize()))
+                            processor = self.rdyq.get_nowait()
+                        except Empty:
+                            break
+                        print('ready processor found', processor)
+                        # one of the processors indicated that it's ready (has event and has slots)
+                        inbox: Inbox = self.get_inbox(processor)
+                        event: Event = inbox.take_event()
+                        context = Context(self)
+                        future = executor.submit(processor.process, context, event)
+                        future.add_done_callback(
+                            functools.partial(
+                                context.done_callback,
+                                processor=processor,
+                                context=context,
+                                event=event,
+                                inbox=inbox,
+                                q=q,
+                            )
                         )
-                    )
-                    print("end of loop")
+                        print("end of loop")
                 except Exception as e:
                     print(e)
                     raise e
@@ -401,7 +419,7 @@ def parse_pattern(p):
                 yield from parse_pattern(pp)
         case ast.AST(pattern=pp):
             # Some wrappers carry the actual pattern in their `pattern` field.
-            yield parse_pattern(pp)
+            yield from parse_pattern(pp)
         case _:
             yield None, None
 
@@ -512,18 +530,12 @@ class Terminator(AbstractProcessor):
     def __init__(self, q: SimpleQueue):
         super().__init__()
         self.q = q
-        self.default = True
 
     def process(self, context, event):
         match event:
             case Event(name="__POISON__"):
                 print('terminator processing', event)
-                self.default = False
-                self.q.put(self.default)
-            case Event():
-                print('terminator processing', event)
-                self.q.put(self.default)
-
+                self.q.put(False)
 
 def caching(
     func=None,
