@@ -6,7 +6,7 @@ from framework.core import AbstractProcessor, Context
 
 
 class ReactiveRecordingSink(AbstractProcessor):
-    """Collects built() events for a given target addressed to self."""
+    """Collects built() events for a given target (broadcast by topic)."""
 
     def __init__(self, target: str):
         super().__init__()
@@ -15,8 +15,8 @@ class ReactiveRecordingSink(AbstractProcessor):
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="built", target=target, artifact=artifact, to=to) if (
-                target == self.target and to is self
+            case ReactiveEvent(name="built", target=target, artifact=artifact) if (
+                target == self.target
             ):
                 self.events.append(event)
 
@@ -97,14 +97,14 @@ def test_reactive_cartesian_product_across_two_sources():
     assert artifacts == {(1, "a"), (1, "b"), (2, "a"), (2, "b")}
 
 
-def test_reactive_zero_prerequisites_invokes_once_and_does_not_replay():
+def test_reactive_zero_prerequisites_invokes_once_and_broadcasts():
     sink1 = ReactiveRecordingSink(target="Z")
     sink2 = ReactiveRecordingSink(target="Z")
     builder = ZeroPrereqOnce()
 
     p = Pipeline([sink1, sink2, builder])
-    # Two subscribers resolve before run; 'new' state invokes exactly once,
-    # and only current subscribers (sink1) at that moment receive the emission.
+    # Resolve is a kick-off signal only; build is invoked exactly once and the result
+    # is broadcast on topic 'Z' to all interested listeners.
     p.submit(ReactiveEvent(name="resolve", target="Z", sender=sink1))
     p.submit(ReactiveEvent(name="resolve", target="Z", sender=sink2))
     p.run()
@@ -112,4 +112,4 @@ def test_reactive_zero_prerequisites_invokes_once_and_does_not_replay():
     a1 = [e.artifact for e in sink1.events]
     a2 = [e.artifact for e in sink2.events]
     assert a1 == ["only-once"]
-    assert a2 == [], "Second subscriber should not receive prior emission"
+    assert a2 == ["only-once"], "Broadcast semantics: all listeners receive the emission"

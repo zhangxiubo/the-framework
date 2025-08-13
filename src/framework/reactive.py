@@ -6,17 +6,17 @@ This module implements ReactiveBuilder, a processor that:
 - Publishes results to a provided topic ("provides")
 - Triggers upstream resolution on first resolve() request
 - Enters a listen mode; for every complete set of input values (Cartesian product),
-  it invokes build(context, target, *args) and streams each produced element to subscribers.
+  it invokes build(context, target, *args) and streams each produced element to the provides topic.
 
 Protocol (mirrors builder.BuilderEvent):
 - Incoming control:
-  - ReactiveEvent(name="resolve", target=provides, sender=client)  # subscribe client and start
+  - ReactiveEvent(name="resolve", target=provides, sender=client)  # kick-off only; no subscription
 - Fan-out to prerequisites:
   - ReactiveEvent(name="resolve", target=require_i, sender=self)
-- Incoming data from prerequisites:
-  - ReactiveEvent(name="built", target=require_i, artifact=value, to=self)
-- Outgoing streamed results to subscribers:
-  - ReactiveEvent(name="built", target=provides, sender=self, to=subscriber, artifact=item)
+- Incoming data from prerequisites (addressed by topic; no per-processor 'to' required):
+  - ReactiveEvent(name="built", target=require_i, artifact=value)
+- Outgoing streamed results (broadcast to the provides topic):
+  - ReactiveEvent(name="built", target=provides, sender=self, artifact=item)
 
 Behavior with multiple inputs:
 - Maintains a per-topic cache of distinct values (by content digest).
@@ -28,7 +28,6 @@ Behavior with multiple inputs:
 
 Notes:
 - Requires are deduplicated while preserving the first occurrence (like AbstractBuilder).
-- Subscribers are deduplicated by identity (object instance).
 - Generators are iterated; general iterables are enumerated (strings/bytes are treated as singletons).
 """
 
@@ -58,7 +57,8 @@ class ReactiveEvent(BaseModel):
     Extra:
         - extra="allow" to carry additional dynamic fields:
             - resolve: target, sender
-            - built: target, artifact, sender, to
+            - built: target, artifact, sender
+        Note: a 'to' field may appear in other subsystems; ReactiveBuilder uses broadcast semantics.
     """
 
     model_config = ConfigDict(frozen=True, extra="allow")
@@ -72,9 +72,9 @@ class ReactiveBuilder(AbstractProcessor):
     - Provides a single target topic (provides)
     - Requires zero or more prerequisite topics (requires)
     - On first resolve(provides), fans out resolve(require_i) and enters listen mode
-    - As prerequisite values arrive (built(..., to=self)), it computes Cartesian
+    - As prerequisite values arrive (built(...)), it computes Cartesian
       products across cached values and invokes build(context, provides, *args)
-    - Emits each produced element as built(provides, artifact=item, to=subscriber) to all subscribers
+    - Emits each produced element as built(provides, artifact=item) broadcast to the provides topic
 
     Caching:
     - Per-topic value cache (digest -> value) de-duplicates identical values by content
@@ -94,11 +94,8 @@ class ReactiveBuilder(AbstractProcessor):
 
         # State-machine style (mirrors AbstractBuilder): start in (new, listening)
         # - new: perform one-time fan-out of prerequisite resolves
-        # - listening: accept subscribers and stream outputs as data arrives
+        # - listening: accept resolve as a kick-off signal; stream outputs to topic
         self.current_states: Set = {self.new, self.listening}
-
-        # Subscribers (deduped by identity)
-        self._subscribers: List[Any] = []
 
         # Per-topic value caches: topic -> OrderedDict[digest -> value]
         self._values: Dict[str, "OrderedDict[str, Any]"] = {
@@ -111,22 +108,11 @@ class ReactiveBuilder(AbstractProcessor):
         self._cache_enabled: bool = bool(cache)
 
     def process(self, context: Context, event: ReactiveEvent):
-        """Dispatch the incoming event to active state handlers with deterministic ordering.
-
-        Rationale:
-            For zero-prerequisite builders, we must ensure subscribers are registered before the one-time
-            build emit. That requires invoking 'listening' before 'new' on resolve events.
-        """
+        """Dispatch the incoming event to all currently active state handlers."""
         match event:
-            case ReactiveEvent(name="resolve"):
-                # Invoke 'listening' first to register subscribers, then 'new' to kick off once.
-                for state in (self.listening, self.new):
-                    if state in self.current_states:
-                        state(context, event)
-            case ReactiveEvent(name="built"):
-                # Only 'listening' handles built events
-                if self.listening in self.current_states:
-                    self.listening(context, event)
+            case ReactiveEvent(name=name) if name in ("resolve", "built"):
+                for state in list(self.current_states):
+                    state(context, event)
 
     def new(self, context: Context, event: ReactiveEvent):
         """State: initial; perform one-time kick-off on first resolve(provides).
@@ -153,23 +139,17 @@ class ReactiveBuilder(AbstractProcessor):
                 self.current_states -= {self.new}
 
     def listening(self, context: Context, event: ReactiveEvent):
-        """State: accept subscribers and stream outputs as prerequisite data arrives."""
+        """State: treat resolve as kick-off only; stream outputs as prerequisite data arrives."""
         match event:
-            # Add/track subscribers when sender is provided
-            case ReactiveEvent(name="resolve", target=target, sender=reply_to) if (
-                target == self.provides
-            ):
-                self._add_subscriber(reply_to)
-            # Accept resolve without a sender (no subscription)
+            # Resolve is a kick-off signal; no subscription tracking
             case ReactiveEvent(name="resolve", target=target) if (
                 target == self.provides
             ):
                 pass
-
-            # Incoming prerequisite values
+            # Incoming prerequisite values (addressed by topic; accept broadcast)
             case ReactiveEvent(
-                name="built", target=topic, artifact=value, to=to_obj
-            ) if (to_obj is self and topic in self._values):
+                name="built", target=topic, artifact=value
+            ) if (topic in self._values):
                 # Record the new value; if it is not a duplicate, produce all new combos
                 is_new = self._add_value(topic, value)
                 if is_new:
@@ -179,12 +159,6 @@ class ReactiveBuilder(AbstractProcessor):
     # Internal helpers
     # --------------------------
 
-    def _add_subscriber(self, obj: Any):
-        """Add a subscriber if not already present (by identity)."""
-        for existing in self._subscribers:
-            if existing is obj:
-                return
-        self._subscribers.append(obj)
 
     def _digest(self, obj: Any) -> str:
         """Content digest for de-duplication; uses dill for broad Python object coverage."""
@@ -231,7 +205,7 @@ class ReactiveBuilder(AbstractProcessor):
             self._invoke_and_emit(context, values_tuple)
 
     def _invoke_and_emit(self, context: Context, args: Sequence[Any]):
-        """Invoke build with provided args (in requires order), emit each produced item."""
+        """Invoke build with provided args (in requires order), emit each produced item to topic."""
         try:
             artifact_or_iter = self.build(context, self.provides, *args)
         except Exception:
@@ -248,18 +222,16 @@ class ReactiveBuilder(AbstractProcessor):
         else:
             iterator = iter((artifact_or_iter,))
 
-        # Stream each item to all current subscribers
+        # Stream each item to the provides topic (broadcast; no per-subscriber addressing)
         for item in iterator:
-            for subscriber in self._subscribers:
-                context.submit(
-                    ReactiveEvent(
-                        name="built",
-                        target=self.provides,
-                        sender=self,
-                        to=subscriber,
-                        artifact=item,
-                    )
+            context.submit(
+                ReactiveEvent(
+                    name="built",
+                    target=self.provides,
+                    sender=self,
+                    artifact=item,
                 )
+            )
 
     # --------------------------
     # API for subclasses
