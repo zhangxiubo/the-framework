@@ -44,7 +44,7 @@ from typing import Any, Collection, Dict, Iterable, List, Sequence, Set
 import dill
 from pydantic import BaseModel, ConfigDict
 
-from .core import AbstractProcessor, Context
+from .core import AbstractProcessor, Context, caching
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +64,33 @@ class ReactiveEvent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="allow")
     name: str
 
+def cache_gate(func):
+    """
+    Per-instance cache gate that:
+      - When self._cache_enabled is False: unwraps inner decorators (e.g., @caching) and
+        calls the raw function with the original event (no persistence).
+      - When True: only applies core.caching() to the kickoff event resolve(provides).
+        All other events are processed without caching, and events are not sanitized.
+    """
+    @functools.wraps(func)
+    def wrapper(self, context: Context, event: ReactiveEvent, *args, **kwargs):
+        # Unwrap any inner decorator layers (e.g., @caching, @retry) to reach the raw function.
+        def call_raw():
+            raw = func
+            while hasattr(raw, "__wrapped__"):
+                raw = raw.__wrapped__
+            return raw(self, context, event, *args, **kwargs)
+
+        if not getattr(self, "_cache_enabled", False):
+            return call_raw()
+
+        # Apply caching only for the kickoff resolve directed at this builder's provides.
+        if getattr(event, "name", None) == "resolve" and getattr(event, "target", None) == getattr(self, "provides", None):
+            return func(self, context, event, *args, **kwargs)
+
+        # For all other events (including built(...) and unrelated resolve(...)), bypass caching.
+        return call_raw()
+    return wrapper
 
 class ReactiveBuilder(AbstractProcessor):
     """Streaming, dependency-aware builder.
@@ -80,6 +107,9 @@ class ReactiveBuilder(AbstractProcessor):
     - Per-topic value cache (digest -> value) de-duplicates identical values by content
     - Combination cache prevents re-invocation of build for already-seen value tuples
       during the lifetime of the processor (no persistence across runs)
+    - Optional persistent caching of emitted events across runs when constructed with cache=True;
+      uses the same semantics as core.caching (digest of processor class source + input event JSON)
+      and archives via AbstractProcessor.archive(workspace).
 
     Concurrency:
     - Single-threaded per instance (enforced by the Pipeline/Inbox)
@@ -104,9 +134,11 @@ class ReactiveBuilder(AbstractProcessor):
         # Seen combination keys (tuple of digests in self.requires order)
         self._combos_seen: Set[tuple[str, ...]] = set()
 
-        # Placeholder for future persistent caching toggle (currently unused)
+        # Persistent caching toggle used by @cache_gate on process()
         self._cache_enabled: bool = bool(cache)
 
+    @cache_gate
+    @caching
     def process(self, context: Context, event: ReactiveEvent):
         """Dispatch the incoming event to all currently active state handlers."""
         match event:
@@ -254,6 +286,13 @@ class ReactiveBuilder(AbstractProcessor):
 
 def reactive(provides: str, requires: List[str], cache: bool = False):
     """Class decorator to bind provides/requires for ReactiveBuilder subclasses.
+
+    Args:
+        provides: The provided topic name for the reactive builder.
+        requires: A list of prerequisite topic names (duplicates are deduplicated preserving order).
+        cache: When True, enable persistent caching and deterministic replay of emitted events for
+               identical input events, using the same keying as core.caching (digest of processor
+               class source + input event JSON) and the archive from AbstractProcessor.archive().
 
     Example:
         @reactive(provides="A", requires=["X", "Y"])
