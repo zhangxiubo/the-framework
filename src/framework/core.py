@@ -4,12 +4,11 @@ import hashlib
 import inspect
 import logging
 import queue
-import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, PriorityQueue, Queue, SimpleQueue
+from queue import Empty, Queue, SimpleQueue
 from typing import List
 
 import dill
@@ -43,11 +42,11 @@ def wrap(func):
         func: The function to wrap (e.g., AbstractProcessor.process).
 
     Returns:
-        A callable that delegates to func and logs exceptions at debug level.
+        A callable that delegates to func and logs exceptions at DEBUG level.
 
     Concurrency:
-        - Intended to run inside executor threads. No ordering guarantees beyond the
-          per-processor single-thread executor.
+        - Intended to run inside worker threads managed by the Pipeline's shared executor.
+          Per-processor ordering is enforced by Inbox slot gating (no reentrancy per instance).
 
     Error handling:
         - Exceptions are logged with traceback and re-raised unchanged.
@@ -57,12 +56,12 @@ def wrap(func):
     def middleware(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             logger.debug(
                 f"exception calling {func.__qualname__} from thread {threading.current_thread().name}",
                 exc_info=True,
             )
-            raise e
+            raise
 
     return middleware
 
@@ -90,13 +89,13 @@ def retry(retry):
                 logger.debug(f"attempt {i + 1} / {retry} at {func.__qualname__}")
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
+                except Exception:
                     if i >= retry - 1:
                         logger.error(
                             f"attempt {i + 1} / {retry} at {func.__qualname__} failed... escalating",
                             exc_info=True,
                         )
-                        raise e
+                        raise
                     else:
                         logger.warning(
                             f"attempt {i + 1} / {retry} at {func.__qualname__} failed... retrying",
@@ -117,7 +116,7 @@ class Context:
         - Provide a done_callback used by the pipeline to handle accounting and errors.
 
     Concurrency:
-        - Instances are created per dispatch; used within a processor's executor thread.
+        - Instances are created per dispatch; used within a worker thread managed by the shared executor.
           Emissions are thread-safe via Pipeline.submit.
 
     Error handling:
@@ -135,9 +134,9 @@ class Context:
                 event
             )  # Maintain emission order for deterministic replay.
             self.pipeline.submit(event)
-        except Exception as e:
-            print(e)
-            raise e
+        except Exception:
+            logger.exception("failed to submit event %s", event)
+            raise
 
     def done_callback(
         self,
@@ -163,7 +162,7 @@ class Context:
         finally:
             inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
-            # Suppress wake-up pulse for poison events to avoid stray True after termination.
+            # Wake the dispatcher to continue scheduling.
             q.put(True)
 
 
@@ -195,9 +194,9 @@ class Inbox:
                 self.jobs -= 1
                 return event
         except Empty:
-            assert False, (
-                f"taking from empty inbox from {self.processor}; this should not have happened"
-            )
+            msg = f"taking from empty inbox from {self.processor}; this should not have happened"
+            logger.critical(msg)
+            raise RuntimeError(msg)
 
     def mark_task_done(self):
         with self.lock:
@@ -222,14 +221,14 @@ class Pipeline:
         workspace: Optional directory path for caching archives.
 
     Concurrency and ordering:
-        - A single dispatcher thread drains the queue in arrival order.
-        - Each processor has its own single-thread executor, guaranteeing per-processor ordering
-          and preventing reentrancy.
+        - A single dispatcher thread drains the ready queue in arrival order.
+        - Work executes on a shared ThreadPoolExecutor; per-processor single-concurrency and ordering
+          are enforced by Inbox slot gating (no reentrancy per processor instance).
         - Global job accounting (jobs, cond) tracks all queued and executing tasks including
           nested emissions, enabling graceful shutdown.
 
     Shutdown:
-        - A special POISON event is enqueued to terminate the dispatcher after all work drains.
+        - A special "__POISON__" event is enqueued to terminate the dispatcher after all work drains.
     """
 
     def __init__(
@@ -267,13 +266,14 @@ class Pipeline:
 
         Behavior:
             - Start a single-thread executor for the dispatcher.
-            - Wait until global jobs drop to zero (all work including nested emissions done).
-            - Submit POISON to allow the dispatcher loop to observe termination.
-            - Wait again for job counter to reach zero, ensuring POISON handling and final tasks complete.
-            - Finally, shut down all per-processor executors.
+            - Wait until global jobs drop to zero (all work including nested emissions) to reach quiescence.
+            - Submit "__POISON__" so the dispatcher loop can observe termination.
+            - Wait again for job counter to reach zero, ensuring poison handling and final tasks complete.
+            - Executors exit via context managers upon loop termination.
 
         Notes:
-            - POISON is used as a clean termination signal read by dispatch_events(), which breaks its loop.
+            - A special "__POISON__" event is consumed by execute_events(), which breaks its loop.
+            - Progress and termination are reported via the module logger.
         """
         with ThreadPoolExecutor(1) as executor:
             q = SimpleQueue()
@@ -281,7 +281,7 @@ class Pipeline:
             executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
             self.wait()
-            print("first stage processing done; proceeds to termination")
+            logger.info("first stage processing done; proceeding to termination")
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
             self.register_processor(Terminator(q))
             self.submit(Event(name="__POISON__"))
@@ -290,9 +290,9 @@ class Pipeline:
             q.put(True)
             # Wait until the poison event is processed and the dispatcher exits.
             self.wait()
-            print("reached the end of main executor")
+            logger.info("dispatcher terminated")
 
-        print("exited main executor")
+        logger.info("pipeline run completed")
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
@@ -308,7 +308,7 @@ class Pipeline:
         recipients |= self.processors.get((event.__class__.__name__, None), set())
         # Deliver to the most specific class+name handlers.
         recipients |= self.processors.get((event.__class__.__name__, event.name), set())
-        print("submitting", event)
+        logger.debug("submitting %s", event)
         for processor in recipients:
             self.increment()
             inbox: Inbox = self.get_inbox(processor)
@@ -339,20 +339,21 @@ class Pipeline:
                         )
                 except Empty:
                     continue
-                except Exception as e:
-                    raise e
+                except Exception:
+                    logger.critical(
+                        "unexpected error in dispatcher loop", exc_info=True
+                    )
+                    raise
 
     def increment(self):
         """Increment global job counter."""
         with self.cond:
             self.jobs += 1
-            print("jobs increased:", self.jobs)
 
     def decrement(self):
         """Decrement global job counter and notify waiters when it reaches zero."""
         with self.cond:
             self.jobs -= 1
-            print("jobs decreased:", self.jobs)
             if self.jobs <= 0:
                 self.cond.notify_all()
 
@@ -460,12 +461,11 @@ class AbstractProcessor(abc.ABC):
 
     Responsibilities:
         - Declare interests (inferred at construction from process()).
-        - Execute work in a single-threaded executor to maintain per-processor ordering.
         - Provide an archive() utility to access the caching backend.
 
     Concurrency:
-        - Each instance owns a ThreadPoolExecutor(max_workers=1). This prevents concurrent
-          execution of process() within the same processor instance.
+        - Per-processor single-concurrency and ordering are enforced by the Pipeline via Inbox gating.
+          Processor instances do not own executors; work is executed on a shared thread pool.
 
     Notes:
         - interests is a frozen set of interest tuples inferred by infer_interests().
@@ -519,7 +519,7 @@ class Terminator(AbstractProcessor):
     def process(self, context, event):
         match event:
             case Event(name="__POISON__"):
-                print("terminator processing", event)
+                logger.debug("terminator processing %s", event)
                 self.q.put(False)
 
 
@@ -541,7 +541,7 @@ def caching(
 
     Args:
         func: The function to decorate (processor.process). When omitted, returns a configured decorator.
-        debug: If True, prints digest values and cache hits to stdout.
+        debug: If True, logs digest values and cache hits at DEBUG level.
 
     Concurrency:
         - Safe to use within the single-threaded processor executor; submissions are delegated
@@ -571,22 +571,22 @@ def caching(
                     )
                 ).hexdigest()
                 if debug:
-                    print("digest", digest)
+                    logger.debug("digest %s", digest)
                 archive = self.archive(context.pipeline.workspace)
                 if digest in archive:
                     # Cache hit: replay by resubmitting archived events in original order.
                     if debug:
-                        print("cache hit:", digest)
+                        logger.debug("cache hit: %s", digest)
                     for e in archive[digest]:
                         context.submit(e)
                 else:
                     # Cache miss: execute and archive emitted events as an ordered tuple.
                     func(self, context, event, *args, **kwargs)
                     archive[digest] = tuple(context.events)
-            except Exception as e:
-                # Surface failure details to stderr while preserving behavior.
-                print(type(e), e, file=sys.stderr)
-                raise e
+            except Exception:
+                # Log failure details while preserving behavior.
+                logger.exception("caching wrapper failed")
+                raise
 
         return wrapper
 
