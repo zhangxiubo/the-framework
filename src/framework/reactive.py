@@ -139,22 +139,14 @@ class ReactiveBuilder(AbstractProcessor):
                             context.submit(
                                 ReactiveEvent(name="resolve", target=req, sender=self)
                             )
-                    else:
-                        # Zero-prerequisite reactive: emit once per unique target
-                        seen = self._combos_seen_by_target.setdefault(target, set())
-                        if tuple() not in seen:
-                            seen.add(tuple())
-                            self._invoke_and_emit(context, target, ())
 
-                # Backfill all combinations for this target if caches are ready
-                if self.requires and self._all_topics_have_values():
-                    self._produce_all_combinations_for_target(context, target)
+                # Backfill all combinations for this target from current caches
+                self._produce_all_combinations_for_target(context, target)
 
             case ReactiveEvent(name="built", target=topic, artifact=value) if (topic in self._values):
-                # Record the new value; if it is not a duplicate, produce all new combos
-                is_new = self._add_value(topic, value)
-                if is_new:
-                    self._produce_new_combinations(context, topic, value)
+                # Record the value (de-dup happens in cache); generate combos (seen-set prevents reprocessing)
+                self._add_value(topic, value)
+                self._produce_new_combinations(context, topic, value)
 
     # --------------------------
     # Internal helpers
@@ -178,14 +170,8 @@ class ReactiveBuilder(AbstractProcessor):
         bucket[digest] = value
         return True
 
-    def _all_topics_have_values(self) -> bool:
-        return all(len(bucket) > 0 for bucket in self._values.values()) or not self.requires
-
     def _produce_new_combinations(self, context: Context, new_topic: str, new_value: Any):
         """Create and process combinations including the new value for new_topic across all active targets."""
-        if not self._all_topics_have_values() or not self._active_targets:
-            return
-
         # Build lists of value sequences per topic in requires order.
         # For the topic that just received a new value, only use that value;
         # For others, use all cached values.
@@ -199,7 +185,7 @@ class ReactiveBuilder(AbstractProcessor):
         # Iterate Cartesian product and process unseen combinations per active target
         for values_tuple in itertools.product(*per_topic_values):
             combo_key = tuple(self._digest(v) for v in values_tuple)
-            for target in list(self._active_targets):
+            for target in self._active_targets:
                 seen = self._combos_seen_by_target.setdefault(target, set())
                 if combo_key in seen:
                     continue
@@ -208,9 +194,6 @@ class ReactiveBuilder(AbstractProcessor):
 
     def _produce_all_combinations_for_target(self, context: Context, target: str):
         """For a given active target, (back)produce all combinations from current caches exactly once."""
-        if not self._all_topics_have_values():
-            return
-
         per_topic_values: List[List[Any]] = [list(self._values[topic].values()) for topic in self.requires]
         # When there are no requires, itertools.product() with no inputs yields a single empty tuple
         for values_tuple in itertools.product(*per_topic_values):
