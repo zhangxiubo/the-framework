@@ -41,6 +41,7 @@ Refactor overview (escalated abstractions):
 - State management (values, targets, combination-seen) is encapsulated in _ReactiveState.
 - Persistent caching is encapsulated behind a small policy interface (_NullCache | _ArchiveComboCache).
 - Combination generation is unified through _produce_for_targets(), reducing branching.
+- Build, invocation, and emission logic are encapsulated in a `BuildPolicy`.
 """
 
 from __future__ import annotations
@@ -51,6 +52,7 @@ import itertools
 import logging
 import re
 import inspect
+import abc
 from collections import OrderedDict
 from typing import Any, Collection, Dict, Iterable, List, Sequence, Set, Optional
 
@@ -168,6 +170,50 @@ class _ArchiveComboCache:
         archive[digest] = tuple(events)
 
 
+class BuildPolicy(abc.ABC):
+    """Policy for invoking a build and emitting results."""
+
+    @abc.abstractmethod
+    def execute(
+        self, owner: "ReactiveBuilder", context: Context, target: str, args: Sequence[Any]
+    ) -> List[ReactiveEvent]:
+        """Invoke the build, emit events, and return the created events for caching."""
+        pass
+
+
+class DefaultBuildPolicy(BuildPolicy):
+    """Default "build and stream" policy: iterate results and emit 'built' for each item."""
+
+    def execute(
+        self, owner: "ReactiveBuilder", context: Context, target: str, args: Sequence[Any]
+    ) -> List[ReactiveEvent]:
+        try:
+            artifact_or_iter = owner.build(context, target, *args)
+        except Exception:
+            logger.error("Reactive build failed for target %s", target, exc_info=True)
+            raise
+
+        # Normalize to iterable of items
+        if isinstance(artifact_or_iter, Iterable) and not isinstance(
+            artifact_or_iter, (str, bytes, bytearray, dict)
+        ):
+            iterator = iter(artifact_or_iter)
+        else:
+            iterator = iter((artifact_or_iter,))
+
+        created_events: List[ReactiveEvent] = []
+        for item in iterator:
+            ev = ReactiveEvent(
+                name="built",
+                target=target,
+                sender=owner,
+                artifact=item,
+            )
+            created_events.append(ev)
+            context.submit(ev)
+        return created_events
+
+
 # --------------------------
 # Processor
 # --------------------------
@@ -197,7 +243,7 @@ class ReactiveBuilder(AbstractProcessor):
     - Single-threaded per instance (enforced by the Pipeline/Inbox)
     """
 
-    def __init__(self, provides: str, requires: Collection[str], cache: bool = False):
+    def __init__(self, provides: str, requires: Collection[str], cache: bool = False, build_policy: BuildPolicy = None):
         super().__init__()
         # Public configuration
         self.provides: str = provides
@@ -213,8 +259,9 @@ class ReactiveBuilder(AbstractProcessor):
         # Compile provides into a regex; literal strings remain compatible via fullmatch
         self._provides_re = re.compile(self.provides)
 
-        # Persistent caching policy
-        self._cache = _ArchiveComboCache() if bool(cache)else _NullCache()
+        # Configurable policies
+        self._build_policy = build_policy or DefaultBuildPolicy()
+        self._cache = _ArchiveComboCache() if cache else _NullCache()
 
     def process(self, context: Context, event: ReactiveEvent):
         """Handle resolve kickoffs and prerequisite built events."""
@@ -295,31 +342,8 @@ class ReactiveBuilder(AbstractProcessor):
                 context.submit(ev)
             return
 
-        # Cache miss or caching disabled: call build and stream items, then archive if enabled
-        try:
-            artifact_or_iter = self.build(context, target, *args)
-        except Exception:
-            logger.error("Reactive build failed for target %s", target, exc_info=True)
-            raise
-
-        # Normalize to iterable of items
-        if isinstance(artifact_or_iter, Iterable) and not isinstance(
-            artifact_or_iter, (str, bytes, bytearray, dict)
-        ):
-            iterator = iter(artifact_or_iter)
-        else:
-            iterator = iter((artifact_or_iter,))
-
-        created_events: List[ReactiveEvent] = []
-        for item in iterator:
-            ev = ReactiveEvent(
-                name="built",
-                target=target,
-                sender=self,
-                artifact=item,
-            )
-            created_events.append(ev)
-            context.submit(ev)
+        # Delegate build and emission to the policy
+        created_events = self._build_policy.execute(self, context, target, args)
 
         # Persist if enabled
         self._cache.store(context, self, target, args, created_events)
@@ -343,7 +367,7 @@ class ReactiveBuilder(AbstractProcessor):
         raise NotImplementedError("ReactiveBuilder.build must be implemented by subclasses")
 
 
-def reactive(provides: str, requires: List[str], cache: bool = False):
+def reactive(provides: str, requires: List[str], cache: bool = False, **kwargs):
     """Class decorator to bind provides/requires for ReactiveBuilder subclasses.
 
     Args:
@@ -352,7 +376,7 @@ def reactive(provides: str, requires: List[str], cache: bool = False):
         cache: When True, enable persistent combo-level caching of emitted built() events keyed by
                [class source, provides pattern, target, ordered input digests], using the archive
                from AbstractProcessor.archive(). Resolve events are not cached.
-
+        **kwargs: Forwarded to the `ReactiveBuilder` constructor (e.g., `build_policy`).
     Example:
         @reactive(provides="A", requires=["X", "Y"])
         class JoinXY(ReactiveBuilder):
@@ -367,6 +391,7 @@ def reactive(provides: str, requires: List[str], cache: bool = False):
             provides=provides,
             requires=list(requires),
             cache=cache,
+            **kwargs,
         )
         return cls
 
