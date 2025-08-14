@@ -216,6 +216,7 @@ class Pipeline:
         strict_interest_inference: When True, disable wildcard delivery. Only explicit matches
             from interest inference receive events.
         workspace: Optional directory path for caching archives.
+        max_workers: Maximum threads in the shared executor used for processor work.
 
     Concurrency and ordering:
         - A single dispatcher thread drains the ready queue in arrival order.
@@ -233,12 +234,14 @@ class Pipeline:
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
         workspace=None,
+        max_workers=4,
     ):
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.cond = threading.Condition()
         self.rdyq = Queue()
         self.strict_interest_inference = strict_interest_inference
+        self.max_workers = max_workers
 
         self.processors = defaultdict(set)
         for processor in processors:
@@ -312,7 +315,7 @@ class Pipeline:
         self.decrement()
 
     def execute_events(self, q: SimpleQueue):
-        with ThreadPoolExecutor(4) as executor:
+        with ThreadPoolExecutor(self.max_workers) as executor:
             # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
             while q.get():
                 try:

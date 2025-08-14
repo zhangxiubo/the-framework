@@ -387,6 +387,43 @@ def test_pipeline_run_terminates_and_logs(caplog):
     assert "pipeline run completed" in text
 
 
+def test_pipeline_respects_max_workers():
+    import threading
+    import time
+
+    class Sleepy(AbstractProcessor):
+        def __init__(self, stats):
+            super().__init__()
+            self.stats = stats
+
+        def process(self, context, event):
+            match event:
+                case Event():
+                    with self.stats["lock"]:
+                        self.stats["active"] += 1
+                        self.stats["peak"] = max(
+                            self.stats["peak"], self.stats["active"]
+                        )
+                    time.sleep(0.05)
+                    with self.stats["lock"]:
+                        self.stats["active"] -= 1
+
+    def high_water(max_workers):
+        stats = {"active": 0, "peak": 0, "lock": threading.Lock()}
+        p = Pipeline(
+            processors=[Sleepy(stats), Sleepy(stats)],
+            strict_interest_inference=False,
+            workspace=None,
+            max_workers=max_workers,
+        )
+        p.submit(Event(name="x"))
+        p.run()
+        return stats["peak"]
+
+    assert high_water(1) == 1
+    assert high_water(2) == 2
+
+
 # -------------------------
 # AbstractProcessor.archive()
 # -------------------------
