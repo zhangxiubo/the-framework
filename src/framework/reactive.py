@@ -45,7 +45,6 @@ import hashlib
 import itertools
 import logging
 import re
-import types
 import inspect
 from collections import OrderedDict
 from typing import Any, Collection, Dict, Iterable, List, Sequence, Set
@@ -130,27 +129,25 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent(name="resolve", target=target) if self._target_matches(target):
                 # Track the resolved target
                 self._active_targets.add(target)
-
-                # One-time bootstrap: fan out prerequisite resolves
-                if not self._bootstrapped:
-                    self._bootstrapped = True
-                    if self.requires:
-                        for req in self.requires:
-                            context.submit(
-                                ReactiveEvent(name="resolve", target=req, sender=self)
-                            )
-
-                # Backfill all combinations for this target from current caches
+                self._bootstrap(context)
                 self._produce_all_combinations_for_target(context, target)
 
             case ReactiveEvent(name="built", target=topic, artifact=value) if (topic in self._values):
                 # Record the value (de-dup happens in cache); generate combos (seen-set prevents reprocessing)
-                self._add_value(topic, value)
-                self._produce_new_combinations(context, topic, value)
+                if self._add_value(topic, value):
+                    self._produce_new_combinations(context, topic, value)
 
     # --------------------------
     # Internal helpers
     # --------------------------
+
+    def _bootstrap(self, context: Context) -> None:
+        """Fan out prerequisite resolve events once."""
+        if self._bootstrapped:
+            return
+        self._bootstrapped = True
+        for req in self.requires:
+            context.submit(ReactiveEvent(name="resolve", target=req, sender=self))
 
     def _digest(self, obj: Any) -> str:
         """Content digest for de-duplication; uses dill for broad Python object coverage."""
@@ -170,39 +167,40 @@ class ReactiveBuilder(AbstractProcessor):
         bucket[digest] = value
         return True
 
-    def _produce_new_combinations(self, context: Context, new_topic: str, new_value: Any):
-        """Create and process combinations including the new value for new_topic across all active targets."""
-        # Build lists of value sequences per topic in requires order.
-        # For the topic that just received a new value, only use that value;
-        # For others, use all cached values.
-        per_topic_values: List[List[Any]] = []
+    def _collect_values(
+        self, new_topic: str | None = None, new_value: Any | None = None
+    ) -> List[List[Any]]:
+        """Assemble per-topic value lists, optionally injecting a new value for one topic."""
+        per_topic: List[List[Any]] = []
         for topic in self.requires:
             if topic == new_topic:
-                per_topic_values.append([new_value])
+                per_topic.append([new_value])
             else:
-                per_topic_values.append(list(self._values[topic].values()))
+                per_topic.append(list(self._values[topic].values()))
+        return per_topic
 
-        # Iterate Cartesian product and process unseen combinations per active target
+    def _produce_combinations(
+        self, context: Context, targets: Iterable[str], per_topic_values: List[List[Any]]
+    ):
+        """Process unseen Cartesian combinations for the given targets."""
         for values_tuple in itertools.product(*per_topic_values):
             combo_key = tuple(self._digest(v) for v in values_tuple)
-            for target in self._active_targets:
+            for target in targets:
                 seen = self._combos_seen_by_target.setdefault(target, set())
                 if combo_key in seen:
                     continue
                 seen.add(combo_key)
                 self._invoke_and_emit(context, target, values_tuple)
 
+    def _produce_new_combinations(self, context: Context, new_topic: str, new_value: Any):
+        """Create combinations including the new value for new_topic across all active targets."""
+        per_topic_values = self._collect_values(new_topic, new_value)
+        self._produce_combinations(context, self._active_targets, per_topic_values)
+
     def _produce_all_combinations_for_target(self, context: Context, target: str):
-        """For a given active target, (back)produce all combinations from current caches exactly once."""
-        per_topic_values: List[List[Any]] = [list(self._values[topic].values()) for topic in self.requires]
-        # When there are no requires, itertools.product() with no inputs yields a single empty tuple
-        for values_tuple in itertools.product(*per_topic_values):
-            combo_key = tuple(self._digest(v) for v in values_tuple)
-            seen = self._combos_seen_by_target.setdefault(target, set())
-            if combo_key in seen:
-                continue
-            seen.add(combo_key)
-            self._invoke_and_emit(context, target, values_tuple)
+        """Backfill all combinations for a target from current caches exactly once."""
+        per_topic_values = self._collect_values()
+        self._produce_combinations(context, [target], per_topic_values)
 
     def _target_matches(self, target: str) -> bool:
         """Return True when the target name matches the provides regex pattern (fullmatch)."""
@@ -238,9 +236,7 @@ class ReactiveBuilder(AbstractProcessor):
             raise
 
         # Normalize to iterable of items
-        if isinstance(artifact_or_iter, types.GeneratorType):
-            iterator = artifact_or_iter
-        elif isinstance(artifact_or_iter, Iterable) and not isinstance(
+        if isinstance(artifact_or_iter, Iterable) and not isinstance(
             artifact_or_iter, (str, bytes, bytearray, dict)
         ):
             iterator = iter(artifact_or_iter)
