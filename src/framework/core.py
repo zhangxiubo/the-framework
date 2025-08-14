@@ -3,7 +3,6 @@ import functools
 import hashlib
 import inspect
 import logging
-import queue
 import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -173,7 +172,7 @@ class Inbox:
         self, processor: "AbstractProcessor", ready_queue: Queue, concurrency: int = 1
     ):
         self.processor = processor
-        self.events: queue.SimpleQueue = queue.SimpleQueue()
+        self.events: SimpleQueue = SimpleQueue()
         self.jobs = 0
         self.slots_left = concurrency
         self.lock = threading.RLock()

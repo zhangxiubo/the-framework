@@ -88,8 +88,6 @@ class JsonLLoader(AbstractProcessor):
         self.name = name
         self.filepath = filepath
         self.file = open(self.filepath, "rt")
-        from pydantic import BaseModel
-
         assert issubclass(item_type, BaseModel)
         self.item_type = item_type
         self.attribute = name if attribute is None else attribute
@@ -137,7 +135,6 @@ class JsonLLoader(AbstractProcessor):
                 )
                 r = random.Random()
                 # Use an RNG instance for per-line independent sampling decisions.
-                # TODO: Consider parameterizing the RNG for deterministic tests or seeding from context.
                 line_count = 0
                 loaded_count = 0
                 for line in self.file:
@@ -164,7 +161,6 @@ class JsonLLoader(AbstractProcessor):
                                 break
                     except Exception as e:
                         # Propagate parsing/validation errors; no custom handling here.
-                        # TODO: Consider explicit error handling/log levels for malformed JSON lines (currently re-raises).
                         raise e
                 this_logger.debug(
                     f"finished loading jsonl... lines loaded {loaded_count} / {line_count} (ratio: {(loaded_count * 100 / line_count) if line_count > 0 else 0:.2f}%)"
@@ -175,7 +171,6 @@ class JsonLLoader(AbstractProcessor):
                         name=self.name + "$",
                     )
                 )
-                # TODO: Consider backpressure or flow-control mechanisms when emitting large volumes of events.
             case Event(name="__POISON__"):
                 # Close the file to release OS resources; additional cleanup should also live here if added later.
                 self.file.close()
@@ -253,7 +248,6 @@ class JsonLWriter(AbstractProcessor):
                 payload = getattr(e, self.attribute)
                 self.file.writelines((payload.model_dump_json(), "\n"))
                 # Flush after each write for durability; this can reduce throughput for large streams.
-                # TODO: Consider batching writes and a configurable flush policy in the writer for performance.
                 self.file.flush()
             case Event(name="__POISON__"):
                 # Close the file to release OS resources; additional cleanup should also live here if added later.
