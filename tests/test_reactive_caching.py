@@ -115,11 +115,10 @@ def test_reactive_cache_gate_disabled_does_not_persist(tmp_path):
     p2.run()
     assert NonCachingReactive.calls == 2
     assert [e.artifact for e in sink2.events] == ["G:1"]
-def test_reactive_cache_fails_on_unserializable_kickoff(tmp_path, caplog):
+def test_reactive_unserializable_kickoff_extras_are_ignored(tmp_path):
     """
-    When caching is enabled and the kickoff resolve(provides) event includes
-    non-serializable extras (e.g. 'sender' being a complex object), core.caching()
-    should fail serialization and log an error; the processor should not execute.
+    Resolve envelopes are not cached; unserializable extras must not block execution.
+    With cache=True, persistence happens at combo-level (target + input tuple).
     """
     # Reset counter
     CountingReactive.calls = 0
@@ -129,17 +128,10 @@ def test_reactive_cache_fails_on_unserializable_kickoff(tmp_path, caplog):
     prod = Producer("X", [1])
     p = Pipeline([sink, rx, prod], workspace=tmp_path)
 
-    # Include a non-serializable extra in the kickoff resolve() to trigger caching failure
+    # Include a non-serializable extra in the kickoff resolve(); should not affect execution
     p.submit(ReactiveEvent(name="resolve", target="C", sender=rx))
+    p.run()
 
-    with caplog.at_level("ERROR", logger="framework.core"):
-        p.run()
-
-    # No build executed, nothing emitted
-    assert CountingReactive.calls == 0
-    assert sink.events == []
-
-    # Error should be logged from core.caching wrapper and pipeline's done_callback
-    messages = " ".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
-    assert "caching wrapper failed" in messages
-    assert "processor failed" in messages
+    # Build executed and emission produced
+    assert CountingReactive.calls == 1
+    assert [e.artifact for e in sink.events] == ["C:1"]

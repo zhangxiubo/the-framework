@@ -4,27 +4,34 @@ Reactive builder: dependency-driven, streaming composition over the event runtim
 This module implements ReactiveBuilder, a processor that:
 - Subscribes to one or more prerequisite topics ("requires")
 - Publishes results to a provided topic ("provides")
-- Triggers upstream resolution on first resolve() request
-- Enters a listen mode; for every complete set of input values (Cartesian product),
-  it invokes build(context, target, *args) and streams each produced element to the provides topic.
+- Treats resolve(provides) as a pure kickoff to upstream producers (no subscription or caching)
+- Always listens for prerequisite built() events; for every complete set of input values
+  (Cartesian product), it invokes build(context, target, *args) and streams each produced
+  element to the provides topic.
 
 Protocol (mirrors builder.BuilderEvent):
 - Incoming control:
   - ReactiveEvent(name="resolve", target=provides, sender=client)  # kick-off only; no subscription
-- Fan-out to prerequisites:
+- Fan-out to prerequisites (one-time bootstrap on first resolve):
   - ReactiveEvent(name="resolve", target=require_i, sender=self)
 - Incoming data from prerequisites (addressed by topic; no per-processor 'to' required):
   - ReactiveEvent(name="built", target=require_i, artifact=value)
 - Outgoing streamed results (broadcast to the provides topic):
   - ReactiveEvent(name="built", target=provides, sender=self, artifact=item)
 
-Behavior with multiple inputs:
+Behavior with multiple inputs (per run, in-memory):
 - Maintains a per-topic cache of distinct values (by content digest).
 - On each new value for topic T, if all topics have at least one value:
   - Compute the Cartesian product where T contributes only the new value and other topics
     contribute all cached values; invoke build for each unseen combination.
-- Maintains a per-combination cache (by digest of the ordered tuple of value digests) to avoid
-  recomputing previously processed combinations during the run.
+- Maintains a per-combination "seen" set (digest of ordered tuple of value digests per target)
+  to avoid recomputing previously processed combinations during the run.
+
+Persistent caching (optional):
+- When constructed with cache=True, persist and deterministically replay emitted built() events
+  keyed by the computation unit: [class source, provides pattern, actual target, ordered input digests].
+- On cache hit for a (target, input tuple), replay stored built() events without invoking build().
+- Resolve events are never cached; they only trigger upstream resolution.
 
 Notes:
 - Requires are deduplicated while preserving the first occurrence (like AbstractBuilder).
@@ -37,14 +44,16 @@ import functools
 import hashlib
 import itertools
 import logging
+import re
 import types
+import inspect
 from collections import OrderedDict
 from typing import Any, Collection, Dict, Iterable, List, Sequence, Set
 
 import dill
 from pydantic import BaseModel, ConfigDict
 
-from .core import AbstractProcessor, Context, caching
+from .core import AbstractProcessor, Context
 
 logger = logging.getLogger(__name__)
 
@@ -64,23 +73,6 @@ class ReactiveEvent(BaseModel):
     model_config = ConfigDict(frozen=True, extra="allow")
     name: str
 
-def cache_gate(func):
-    """
-    Per-instance cache gate that:
-      - When self._cache_enabled is False: unwraps inner decorators (e.g., @caching) and
-        calls the raw function with the original event (no persistence).
-      - When True: delegates to the decorated function for all events (no sanitization).
-        Uncachable events may raise from core.caching(), by design.
-    """
-    @functools.wraps(func)
-    def wrapper(self, context: Context, event: ReactiveEvent, *args, **kwargs):
-        if not getattr(self, "_cache_enabled", False):
-            raw = func
-            while hasattr(raw, "__wrapped__"):
-                raw = raw.__wrapped__
-            return raw(self, context, event, *args, **kwargs)
-        return func(self, context, event, *args, **kwargs)
-    return wrapper
 
 class ReactiveBuilder(AbstractProcessor):
     """Streaming, dependency-aware builder.
@@ -88,18 +80,20 @@ class ReactiveBuilder(AbstractProcessor):
     A ReactiveBuilder:
     - Provides a single target topic (provides)
     - Requires zero or more prerequisite topics (requires)
-    - On first resolve(provides), fans out resolve(require_i) and enters listen mode
+    - On first resolve(provides), fans out resolve(require_i) once (bootstrap) and then always listens
     - As prerequisite values arrive (built(...)), it computes Cartesian
       products across cached values and invokes build(context, provides, *args)
     - Emits each produced element as built(provides, artifact=item) broadcast to the provides topic
 
-    Caching:
+    Runtime (in-memory) caching:
     - Per-topic value cache (digest -> value) de-duplicates identical values by content
     - Combination cache prevents re-invocation of build for already-seen value tuples
       during the lifetime of the processor (no persistence across runs)
-    - Optional persistent caching of emitted events across runs when constructed with cache=True;
-      uses the same semantics as core.caching (digest of processor class source + input event JSON)
-      and archives via AbstractProcessor.archive(workspace).
+
+    Persistent caching (optional):
+    - When cache=True, persist and replay built() outputs for a specific (target, input tuple)
+      using the processor class source + provides pattern + target + ordered input digests as key.
+      Archive storage is provided by AbstractProcessor.archive(workspace).
 
     Concurrency:
     - Single-threaded per instance (enforced by the Pipeline/Inbox)
@@ -112,66 +106,51 @@ class ReactiveBuilder(AbstractProcessor):
         # Deduplicate requires while preserving order (first occurrence wins)
         self.requires: List[str] = list(dict.fromkeys(requires))
 
-        # State-machine style (mirrors AbstractBuilder): start in (new, listening)
-        # - new: perform one-time fan-out of prerequisite resolves
-        # - listening: accept resolve as a kick-off signal; stream outputs to topic
-        self.current_states: Set = {self.new, self.listening}
+        # Always-listening mode with one-time bootstrap fanout
+        self._bootstrapped: bool = False
 
         # Per-topic value caches: topic -> OrderedDict[digest -> value]
         self._values: Dict[str, "OrderedDict[str, Any]"] = {
             topic: OrderedDict() for topic in self.requires
         }
-        # Seen combination keys (tuple of digests in self.requires order)
-        self._combos_seen: Set[tuple[str, ...]] = set()
+        # Active targets observed via resolve(target) that match provides pattern
+        self._active_targets: Set[str] = set()
+        # Seen combination keys per-target: target -> Set[tuple of digests in self.requires order]
+        self._combos_seen_by_target: Dict[str, Set[tuple[str, ...]]] = {}
 
-        # Persistent caching toggle used by @cache_gate on process()
+        # Compile provides into a regex; literal strings remain compatible via fullmatch
+        self._provides_re = re.compile(self.provides)
+
+        # Persistent caching toggle for combo-level caching
         self._cache_enabled: bool = bool(cache)
 
-    @cache_gate
-    @caching
     def process(self, context: Context, event: ReactiveEvent):
-        """Dispatch the incoming event to all currently active state handlers."""
+        """Handle resolve kickoffs and prerequisite built events."""
         match event:
-            case ReactiveEvent(name=name) if name in ("resolve", "built"):
-                for state in list(self.current_states):
-                    state(context, event)
+            case ReactiveEvent(name="resolve", target=target) if self._target_matches(target):
+                # Track the resolved target
+                self._active_targets.add(target)
 
-    def new(self, context: Context, event: ReactiveEvent):
-        """State: initial; perform one-time kick-off on first resolve(provides).
+                # One-time bootstrap: fan out prerequisite resolves
+                if not self._bootstrapped:
+                    self._bootstrapped = True
+                    if self.requires:
+                        for req in self.requires:
+                            context.submit(
+                                ReactiveEvent(name="resolve", target=req, sender=self)
+                            )
+                    else:
+                        # Zero-prerequisite reactive: emit once per unique target
+                        seen = self._combos_seen_by_target.setdefault(target, set())
+                        if tuple() not in seen:
+                            seen.add(tuple())
+                            self._invoke_and_emit(context, target, ())
 
-        Behavior mirrors AbstractBuilder's 'new' state:
-        - If prerequisites exist: fan out resolve(require_i) once
-        - If no prerequisites: invoke build exactly once
-        - Then drop 'new' from current_states
-        """
-        match event:
-            case ReactiveEvent(name="resolve", target=target) if (
-                target == self.provides
-            ):
-                if self.requires:
-                    # Fan out prerequisite resolutions only once
-                    for req in self.requires:
-                        context.submit(
-                            ReactiveEvent(name="resolve", target=req, sender=self)
-                        )
-                else:
-                    # Zero-prerequisite reactive: invoke build exactly once
-                    self._invoke_and_emit(context, ())
-                # Transition: drop 'new' state
-                self.current_states -= {self.new}
+                # Backfill all combinations for this target if caches are ready
+                if self.requires and self._all_topics_have_values():
+                    self._produce_all_combinations_for_target(context, target)
 
-    def listening(self, context: Context, event: ReactiveEvent):
-        """State: treat resolve as kick-off only; stream outputs as prerequisite data arrives."""
-        match event:
-            # Resolve is a kick-off signal; no subscription tracking
-            case ReactiveEvent(name="resolve", target=target) if (
-                target == self.provides
-            ):
-                pass
-            # Incoming prerequisite values (addressed by topic; accept broadcast)
-            case ReactiveEvent(
-                name="built", target=topic, artifact=value
-            ) if (topic in self._values):
+            case ReactiveEvent(name="built", target=topic, artifact=value) if (topic in self._values):
                 # Record the new value; if it is not a duplicate, produce all new combos
                 is_new = self._add_value(topic, value)
                 if is_new:
@@ -180,7 +159,6 @@ class ReactiveBuilder(AbstractProcessor):
     # --------------------------
     # Internal helpers
     # --------------------------
-
 
     def _digest(self, obj: Any) -> str:
         """Content digest for de-duplication; uses dill for broad Python object coverage."""
@@ -204,8 +182,8 @@ class ReactiveBuilder(AbstractProcessor):
         return all(len(bucket) > 0 for bucket in self._values.values()) or not self.requires
 
     def _produce_new_combinations(self, context: Context, new_topic: str, new_value: Any):
-        """Create and process combinations including the new value for new_topic."""
-        if not self._all_topics_have_values():
+        """Create and process combinations including the new value for new_topic across all active targets."""
+        if not self._all_topics_have_values() or not self._active_targets:
             return
 
         # Build lists of value sequences per topic in requires order.
@@ -218,20 +196,62 @@ class ReactiveBuilder(AbstractProcessor):
             else:
                 per_topic_values.append(list(self._values[topic].values()))
 
-        # Iterate Cartesian product and process unseen combinations
+        # Iterate Cartesian product and process unseen combinations per active target
         for values_tuple in itertools.product(*per_topic_values):
             combo_key = tuple(self._digest(v) for v in values_tuple)
-            if combo_key in self._combos_seen:
-                continue
-            self._combos_seen.add(combo_key)
-            self._invoke_and_emit(context, values_tuple)
+            for target in list(self._active_targets):
+                seen = self._combos_seen_by_target.setdefault(target, set())
+                if combo_key in seen:
+                    continue
+                seen.add(combo_key)
+                self._invoke_and_emit(context, target, values_tuple)
 
-    def _invoke_and_emit(self, context: Context, args: Sequence[Any]):
-        """Invoke build with provided args (in requires order), emit each produced item to topic."""
+    def _produce_all_combinations_for_target(self, context: Context, target: str):
+        """For a given active target, (back)produce all combinations from current caches exactly once."""
+        if not self._all_topics_have_values():
+            return
+
+        per_topic_values: List[List[Any]] = [list(self._values[topic].values()) for topic in self.requires]
+        # When there are no requires, itertools.product() with no inputs yields a single empty tuple
+        for values_tuple in itertools.product(*per_topic_values):
+            combo_key = tuple(self._digest(v) for v in values_tuple)
+            seen = self._combos_seen_by_target.setdefault(target, set())
+            if combo_key in seen:
+                continue
+            seen.add(combo_key)
+            self._invoke_and_emit(context, target, values_tuple)
+
+    def _target_matches(self, target: str) -> bool:
+        """Return True when the target name matches the provides regex pattern (fullmatch)."""
+        return self._provides_re.fullmatch(target) is not None
+
+    def _combo_cache_key(self, target: str, args: Sequence[Any]) -> str:
+        """Compute persistent cache key for (class source, provides pattern, actual target, ordered input digests)."""
+        input_digests = tuple(self._digest(v) for v in args)
+        key_parts = [
+            inspect.getsource(self.__class__),
+            self.provides,
+            target,
+            input_digests,
+        ]
+        return hashlib.sha256(dill.dumps(key_parts)).hexdigest()
+
+    def _invoke_and_emit(self, context: Context, target: str, args: Sequence[Any]):
+        """Invoke build with provided args (in requires order) or replay from persistent cache; emit items."""
+        # Persistent combo-level caching
+        if self._cache_enabled:
+            digest = self._combo_cache_key(target, args)
+            archive = self.archive(context.pipeline.workspace)
+            if digest in archive:
+                for cached_event in archive[digest]:
+                    context.submit(cached_event)
+                return
+
+        # Cache miss or caching disabled: call build and stream items, then archive if enabled
         try:
-            artifact_or_iter = self.build(context, self.provides, *args)
+            artifact_or_iter = self.build(context, target, *args)
         except Exception:
-            logger.error("Reactive build failed for target %s", self.provides, exc_info=True)
+            logger.error("Reactive build failed for target %s", target, exc_info=True)
             raise
 
         # Normalize to iterable of items
@@ -244,16 +264,21 @@ class ReactiveBuilder(AbstractProcessor):
         else:
             iterator = iter((artifact_or_iter,))
 
-        # Stream each item to the provides topic (broadcast; no per-subscriber addressing)
+        created_events: List[ReactiveEvent] = []
         for item in iterator:
-            context.submit(
-                ReactiveEvent(
-                    name="built",
-                    target=self.provides,
-                    sender=self,
-                    artifact=item,
-                )
+            ev = ReactiveEvent(
+                name="built",
+                target=target,
+                sender=self,
+                artifact=item,
             )
+            created_events.append(ev)
+            context.submit(ev)
+
+        if self._cache_enabled:
+            digest = self._combo_cache_key(target, args)
+            archive = self.archive(context.pipeline.workspace)
+            archive[digest] = tuple(created_events)
 
     # --------------------------
     # API for subclasses
@@ -264,7 +289,7 @@ class ReactiveBuilder(AbstractProcessor):
 
         Args:
             context: Execution context
-            target: Target (self.provides)
+            target: Target (actual matched name)
             *args: Values in the exact order of self.requires
             **kwargs: Reserved for custom subclass parameters
 
@@ -278,11 +303,11 @@ def reactive(provides: str, requires: List[str], cache: bool = False):
     """Class decorator to bind provides/requires for ReactiveBuilder subclasses.
 
     Args:
-        provides: The provided topic name for the reactive builder.
+        provides: The provided topic name or regex pattern for the reactive builder.
         requires: A list of prerequisite topic names (duplicates are deduplicated preserving order).
-        cache: When True, enable persistent caching and deterministic replay of emitted events for
-               identical input events, using the same keying as core.caching (digest of processor
-               class source + input event JSON) and the archive from AbstractProcessor.archive().
+        cache: When True, enable persistent combo-level caching of emitted built() events keyed by
+               [class source, provides pattern, target, ordered input digests], using the archive
+               from AbstractProcessor.archive(). Resolve events are not cached.
 
     Example:
         @reactive(provides="A", requires=["X", "Y"])
