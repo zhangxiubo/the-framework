@@ -19,7 +19,9 @@ class TopicSink(AbstractProcessor):
 
 
 class Producer(AbstractProcessor):
-    """Produces a fixed sequence of values on built(topic, artifact=v) when resolved."""
+    """Produces a fixed sequence of values on built(topic, artifact=v) when resolved.
+    Note: emits no non-serializable extras so events are cachable.
+    """
 
     def __init__(self, topic: str, values: List[Any]):
         super().__init__()
@@ -28,15 +30,13 @@ class Producer(AbstractProcessor):
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="resolve", target=target, sender=reply_to) if target == self.topic:
+            case ReactiveEvent(name="resolve", target=target) if target == self.topic:
                 for v in self.values:
                     context.submit(
                         ReactiveEvent(
                             name="built",
                             target=self.topic,
                             artifact=v,
-                            sender=self,
-                            to=reply_to,
                         )
                     )
 
@@ -115,3 +115,31 @@ def test_reactive_cache_gate_disabled_does_not_persist(tmp_path):
     p2.run()
     assert NonCachingReactive.calls == 2
     assert [e.artifact for e in sink2.events] == ["G:1"]
+def test_reactive_cache_fails_on_unserializable_kickoff(tmp_path, caplog):
+    """
+    When caching is enabled and the kickoff resolve(provides) event includes
+    non-serializable extras (e.g. 'sender' being a complex object), core.caching()
+    should fail serialization and log an error; the processor should not execute.
+    """
+    # Reset counter
+    CountingReactive.calls = 0
+
+    sink = TopicSink("C")
+    rx = CountingReactive()  # cache=True
+    prod = Producer("X", [1])
+    p = Pipeline([sink, rx, prod], workspace=tmp_path)
+
+    # Include a non-serializable extra in the kickoff resolve() to trigger caching failure
+    p.submit(ReactiveEvent(name="resolve", target="C", sender=rx))
+
+    with caplog.at_level("ERROR", logger="framework.core"):
+        p.run()
+
+    # No build executed, nothing emitted
+    assert CountingReactive.calls == 0
+    assert sink.events == []
+
+    # Error should be logged from core.caching wrapper and pipeline's done_callback
+    messages = " ".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
+    assert "caching wrapper failed" in messages
+    assert "processor failed" in messages

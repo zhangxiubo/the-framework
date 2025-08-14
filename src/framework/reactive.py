@@ -69,27 +69,17 @@ def cache_gate(func):
     Per-instance cache gate that:
       - When self._cache_enabled is False: unwraps inner decorators (e.g., @caching) and
         calls the raw function with the original event (no persistence).
-      - When True: only applies core.caching() to the kickoff event resolve(provides).
-        All other events are processed without caching, and events are not sanitized.
+      - When True: delegates to the decorated function for all events (no sanitization).
+        Uncachable events may raise from core.caching(), by design.
     """
     @functools.wraps(func)
     def wrapper(self, context: Context, event: ReactiveEvent, *args, **kwargs):
-        # Unwrap any inner decorator layers (e.g., @caching, @retry) to reach the raw function.
-        def call_raw():
+        if not getattr(self, "_cache_enabled", False):
             raw = func
             while hasattr(raw, "__wrapped__"):
                 raw = raw.__wrapped__
             return raw(self, context, event, *args, **kwargs)
-
-        if not getattr(self, "_cache_enabled", False):
-            return call_raw()
-
-        # Apply caching only for the kickoff resolve directed at this builder's provides.
-        if getattr(event, "name", None) == "resolve" and getattr(event, "target", None) == getattr(self, "provides", None):
-            return func(self, context, event, *args, **kwargs)
-
-        # For all other events (including built(...) and unrelated resolve(...)), bypass caching.
-        return call_raw()
+        return func(self, context, event, *args, **kwargs)
     return wrapper
 
 class ReactiveBuilder(AbstractProcessor):
