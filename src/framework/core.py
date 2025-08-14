@@ -1,60 +1,13 @@
-"""Event-driven runtime core.
-
-This module provides:
-- An immutable Event model (pydantic BaseModel with frozen=True) as the lingua franca.
-- A processor abstraction (AbstractProcessor) with a single-threaded executor per processor
-  to avoid reentrancy and concurrent state mutation inside a processor.
-- A Pipeline that dispatches events to processors based on "interests" inferred from the
-  processor's match-case patterns over Event instances. Interests are keyed as:
-    (None, None)                         -> wildcard/default interest
-    (EventClassName, None)               -> any name for a given event class
-    (EventClassName, "specific_name")    -> specific name for a given event class
-- An optional caching decorator that records emitted events keyed by the processor class'
-  source code + input event JSON to enable deterministic replay.
-
-Threading model:
-- Each processor owns a ThreadPoolExecutor with max_workers=1. This serializes work inside a
-  given processor and avoids reentrancy issues when a processor emits new events while still
-  handling the current one.
-- The Pipeline runs a dispatcher loop in a single dedicated thread. Submissions to processors
-  are scheduled onto their per-processor executors. A global job counter guarded by a condition
-  variable tracks in-flight tasks to support graceful shutdown.
-
-Interest inference:
-- Processors typically use Python's match-case on the immutable Event object. This module inspects
-  the AST of the processor's process function to infer which (event class, name) pairs a processor
-  is interested in. Only common/standard match-case shapes are recognized (e.g., MatchClass with an
-  optional 'name' kwd). Non-standard constructs, deeply dynamic patterns, or patterns that do not
-  fit expected shapes will yield (None, None), and the pipeline may fall back to default delivery
-  (unless strict interest inference is enabled).
-
-Caching decorator:
-- The caching decorator composes a digest from: [processor class source, event JSON].
-- It stores the tuple of events emitted during processing and, on cache hit, replays them by
-  resubmitting the events to the pipeline. dill is used to serialize the inputs (class source,
-  event contents) to ensure a stable digest.
-- Caveat: Only emitted events are cached/replayed. Any external side effects are not captured
-  and therefore will not be replayed deterministically.
-
-Light notes / TODOs:
-- Extension points: support additional interest inference strategies beyond AST of match-case,
-  allow configurable multi-threaded processors with explicit synchronization.
-- Archive backend: the current workspace cache uses klepto's sql_archive persisted per
-  processor class name; alternative backends could be made pluggable.
-"""
-
 import abc
 import functools
 import hashlib
 import inspect
-import itertools
 import logging
-import sys
 import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from queue import Queue
+from queue import Empty, Queue, SimpleQueue
 from typing import List
 
 import dill
@@ -88,11 +41,11 @@ def wrap(func):
         func: The function to wrap (e.g., AbstractProcessor.process).
 
     Returns:
-        A callable that delegates to func and logs exceptions at debug level.
+        A callable that delegates to func and logs exceptions at DEBUG level.
 
     Concurrency:
-        - Intended to run inside executor threads. No ordering guarantees beyond the
-          per-processor single-thread executor.
+        - Intended to run inside worker threads managed by the Pipeline's shared executor.
+          Per-processor ordering is enforced by Inbox slot gating (no reentrancy per instance).
 
     Error handling:
         - Exceptions are logged with traceback and re-raised unchanged.
@@ -102,21 +55,21 @@ def wrap(func):
     def middleware(*args, **kwargs):
         try:
             return func(*args, **kwargs)
-        except Exception as e:
+        except Exception:
             logger.debug(
                 f"exception calling {func.__qualname__} from thread {threading.current_thread().name}",
                 exc_info=True,
             )
-            raise e
+            raise
 
     return middleware
 
 
-def retry(retry):
-    """Decorator that retries a callable up to `retry` times.
+def retry(max_attempts):
+    """Decorator that retries a callable up to `max_attempts` times.
 
     Args:
-        retry: Number of attempts. Last failure is logged at error level and re-raised.
+        max_attempts: Number of attempts. Last failure is logged at error level and re-raised.
 
     Returns:
         A decorator that wraps the target function with retry logic.
@@ -131,22 +84,24 @@ def retry(retry):
     def decorator_retry(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
-            for i in range(retry):
-                logger.debug(f"attempt {i + 1} / {retry} at {func.__qualname__}")
+            for attempt in range(max_attempts):
+                logger.debug(
+                    f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}"
+                )
                 try:
                     return func(*args, **kwargs)
-                except Exception as e:
-                    if i >= retry - 1:
+                except Exception:
+                    is_last_attempt = attempt >= max_attempts - 1
+                    if is_last_attempt:
                         logger.error(
-                            f"attempt {i + 1} / {retry} at {func.__qualname__} failed... escalating",
+                            f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... escalating",
                             exc_info=True,
                         )
-                        raise e
-                    else:
-                        logger.warning(
-                            f"attempt {i + 1} / {retry} at {func.__qualname__} failed... retrying",
-                            exc_info=True,
-                        )
+                        raise
+                    logger.warning(
+                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... retrying",
+                        exc_info=True,
+                    )
 
         return wrapper
 
@@ -162,7 +117,7 @@ class Context:
         - Provide a done_callback used by the pipeline to handle accounting and errors.
 
     Concurrency:
-        - Instances are created per dispatch; used within a processor's executor thread.
+        - Instances are created per dispatch; used within a worker thread managed by the shared executor.
           Emissions are thread-safe via Pipeline.submit.
 
     Error handling:
@@ -180,9 +135,9 @@ class Context:
                 event
             )  # Maintain emission order for deterministic replay.
             self.pipeline.submit(event)
-        except Exception as e:
-            print(e)
-            raise e
+        except Exception:
+            logger.exception("failed to submit event %s", event)
+            raise
 
     def done_callback(
         self,
@@ -190,6 +145,8 @@ class Context:
         processor: "AbstractProcessor",
         context: "Context",
         event: Event,
+        inbox: "Inbox",
+        q: SimpleQueue,
     ):
         """Callback attached to processor futures to handle completion.
 
@@ -204,7 +161,48 @@ class Context:
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
         finally:
+            inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
+            # Wake the dispatcher to continue scheduling.
+            q.put(True)
+
+
+class Inbox:
+    def __init__(
+        self, processor: "AbstractProcessor", ready_queue: Queue, concurrency: int = 1
+    ):
+        self.processor = processor
+        self.events: SimpleQueue = SimpleQueue()
+        self.jobs = 0
+        self.slots_left = concurrency
+        self.lock = threading.RLock()
+        self.ready_queue = ready_queue
+
+    def put_event(self, event: Event):
+        with self.lock:
+            self.events.put(event)
+            self.jobs += 1
+            if self.slots_left > 0:  # Check if we have any slots left
+                self.slots_left -= 1
+                self.ready_queue.put(self.processor)
+
+    def take_event(self):
+        try:
+            event = self.events.get(block=False)
+            with self.lock:
+                self.jobs -= 1
+                return event
+        except Empty:
+            msg = f"taking from empty inbox from {self.processor}; this should not have happened"
+            logger.critical(msg)
+            raise RuntimeError(msg)
+
+    def mark_task_done(self):
+        with self.lock:
+            self.slots_left += 1
+            if self.jobs > 0:  # Check if we have any jobs left
+                self.slots_left -= 1
+                self.ready_queue.put(self.processor)
 
 
 class Pipeline:
@@ -218,16 +216,17 @@ class Pipeline:
         strict_interest_inference: When True, disable wildcard delivery. Only explicit matches
             from interest inference receive events.
         workspace: Optional directory path for caching archives.
+        max_workers: Maximum threads in the shared executor used for processor work.
 
     Concurrency and ordering:
-        - A single dispatcher thread drains the queue in arrival order.
-        - Each processor has its own single-thread executor, guaranteeing per-processor ordering
-          and preventing reentrancy.
+        - A single dispatcher thread drains the ready queue in arrival order.
+        - Work executes on a shared ThreadPoolExecutor; per-processor single-concurrency and ordering
+          are enforced by Inbox slot gating (no reentrancy per processor instance).
         - Global job accounting (jobs, cond) tracks all queued and executing tasks including
           nested emissions, enabling graceful shutdown.
 
     Shutdown:
-        - A special POISON event is enqueued to terminate the dispatcher after all work drains.
+        - A special "__POISON__" event is enqueued to terminate the dispatcher after all work drains.
     """
 
     def __init__(
@@ -235,129 +234,115 @@ class Pipeline:
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
         workspace=None,
+        max_workers=4,
     ):
-        self.queue = Queue()
-        self.processors = defaultdict(set)
-        for processor in processors:
-            # Register every declared interest for this processor.
-            for interest in processor.interests:
-                logger.debug(f"registering interest for {processor}: {interest}")
-                self.processors[interest].add(processor)
-
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
-        self.lock = threading.Lock()
-        self.cond = threading.Condition(self.lock)
-        self.POISON = Event(
-            name="__POISON__"
-        )  # Poison-pill sentinel used to stop the dispatcher.
+        self.cond = threading.Condition()
+        self.rdyq = Queue()
         self.strict_interest_inference = strict_interest_inference
+        self.max_workers = max_workers
+
+        self.processors = defaultdict(set)
+        for processor in processors:
+            self.register_processor(processor)
+
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
+
+    @functools.cache
+    def get_inbox(self, processor: "AbstractProcessor"):
+        return Inbox(processor, self.rdyq, 1)
+
+    def register_processor(self, processor: "AbstractProcessor"):
+        # Register every declared interest for this processor.
+        for interest in processor.interests:
+            logger.debug(f"registering interest for {processor}: {interest}")
+            self.processors[interest].add(processor)
 
     def run(self):
         """Run the dispatcher loop until the queue drains, then shut down executors.
 
         Behavior:
             - Start a single-thread executor for the dispatcher.
-            - Wait until global jobs drop to zero (all work including nested emissions done).
-            - Submit POISON to allow the dispatcher loop to observe termination.
-            - Wait again for job counter to reach zero, ensuring POISON handling and final tasks complete.
-            - Finally, shut down all per-processor executors.
+            - Wait until global jobs drop to zero (all work including nested emissions) to reach quiescence.
+            - Submit "__POISON__" so the dispatcher loop can observe termination.
+            - Wait again for job counter to reach zero, ensuring poison handling and final tasks complete.
+            - Executors exit via context managers upon loop termination.
 
         Notes:
-            - POISON is used as a clean termination signal read by dispatch_events(), which breaks its loop.
+            - A special "__POISON__" event is consumed by execute_events(), which breaks its loop.
+            - Progress and termination are reported via the module logger.
         """
         with ThreadPoolExecutor(1) as executor:
-            executor.submit(self.dispatch_events)
+            q = SimpleQueue()
+            q.put(True)
+            executor.submit(self.execute_events, q)
             # Wait for all outstanding jobs (including nested emissions) to complete.
-            with self.cond:
-                while self.jobs > 0:
-                    self.cond.wait()
+            self.wait()
+            logger.info("first stage processing done; proceeding to termination")
             # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-            self.submit(self.POISON)
+            self.register_processor(Terminator(q))
+            self.submit(Event(name="__POISON__"))
+            # Wake dispatcher to process the poison if it is currently waiting on q.get()
+            # with an empty ready queue.
+            q.put(True)
             # Wait until the poison event is processed and the dispatcher exits.
-            with self.cond:
-                while self.jobs > 0:
-                    self.cond.wait()
-        # After dispatcher drained and all jobs completed, shutdown processor executors
-        for proc in set(itertools.chain.from_iterable(self.processors.values())):
-            try:
-                proc.executor.shutdown(wait=True)
-            except Exception:
-                logger.error("error shutting down executor for %r", proc, exc_info=True)
+            self.wait()
+            logger.info("dispatcher terminated")
+
+        logger.info("pipeline run completed")
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
         self.increment()
-        self.queue.put(event)
+        recipients = set()
 
-    def dispatch_events(self):
-        """Continuously drain the queue and dispatch events to matching processors.
+        # Collect all relevant recipients
+        if not self.strict_interest_inference:
+            recipients |= self.processors.get((None, None), set())
 
-        Recipient selection:
-            - Start with wildcard listeners (None, None) unless strict_interest_inference is True.
-            - Add listeners for (EventClassName, None) and the most specific (EventClassName, event.name).
-          The union of these sets forms the recipients for the event.
+        event_class = event.__class__.__name__
+        recipients |= self.processors.get((event_class, None), set())
+        recipients |= self.processors.get((event_class, event.name), set())
 
-        Shutdown:
-            - When the POISON sentinel is observed, break out of the loop after normal processing,
-              allowing the dispatcher to terminate gracefully.
+        logger.debug("submitting %s", event)
+        for processor in recipients:
+            self.increment()
+            inbox = self.get_inbox(processor)
+            inbox.put_event(event)
+        self.decrement()
 
-        Error handling:
-            - Logs unexpected exceptions and always decrements the job counter in finally.
-        """
-        while event := self.queue.get():
-            try:
-                recipients = set()
-                # Wildcard delivery is disabled when strict interest inference is requested.
-                recipients |= (
-                    self.processors[(None, None)]
-                    if not self.strict_interest_inference
-                    else set()
-                )
-                # Deliver to handlers that match on Event class irrespective of name.
-                recipients |= self.processors.get(
-                    (event.__class__.__name__, None), set()
-                )
-                # Deliver to the most specific class+name handlers.
-                recipients |= self.processors.get(
-                    (event.__class__.__name__, event.name), set()
-                )
-                for processor in recipients:
-                    context = Context(self)
-                    try:
-                        # Each processor uses a single-thread executor to preserve per-processor ordering
-                        # and avoid reentrancy issues within processor state.
-                        future = processor.executor.submit(
-                            wrap(processor.process),
-                            context,
-                            event,
-                        )
-                        # Track processor task as a new job; a matching decrement occurs in done_callback.
-                        self.increment()
-                        # Ensure that exceptions surface in logs and job accounting is decremented.
+    def execute_events(self, q: SimpleQueue):
+        with ThreadPoolExecutor(self.max_workers) as executor:
+            # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
+            while q.get():
+                try:
+                    # Drain all ready processors without blocking on an empty ready queue.
+                    while processor := self.rdyq.get_nowait():
+                        # One of the processors indicated readiness (has an event and an available slot).
+                        inbox: Inbox = self.get_inbox(processor)
+                        event: Event = inbox.take_event()
+                        context = Context(self)
+                        future = executor.submit(processor.process, context, event)
                         future.add_done_callback(
                             functools.partial(
                                 context.done_callback,
                                 processor=processor,
                                 context=context,
                                 event=event,
+                                inbox=inbox,
+                                q=q,
                             )
                         )
-                    except Exception:
-                        logger.error(
-                            "failed to submit event to %r", processor, exc_info=True
-                        )
-                if event is self.POISON:
-                    # Poison-pill terminates the dispatcher loop once drained.
-                    break
-            except Exception as e:
-                logger.error(e, exc_info=True)
-            finally:
-                # Decrement for the event fetched from the queue (paired with submit()).
-                self.decrement()
+                except Empty:
+                    continue
+                except Exception:
+                    logger.critical(
+                        "unexpected error in dispatcher loop", exc_info=True
+                    )
+                    raise
 
     def increment(self):
         """Increment global job counter."""
@@ -371,6 +356,10 @@ class Pipeline:
             if self.jobs <= 0:
                 self.cond.notify_all()
 
+    def wait(self):
+        with self.cond:
+            self.cond.wait_for(lambda: self.jobs <= 0)
+
 
 def parse_pattern(p):
     """Extract an (event_class_id, event_name) pair from a match-case pattern AST.
@@ -383,16 +372,12 @@ def parse_pattern(p):
     Returns:
         Tuple[str | None, str | None]: (ClassIdentifier, EventName) where either may be None.
         Returns (None, None) when the pattern cannot be interpreted.
-
-    Limitations:
-        - Only a subset of conventional patterns is recognized. Exotic or dynamic patterns
-          may not be interpreted and will result in (None, None).
     """
     import ast
 
-    def cls_id(n):
-        # Extract a class identifier from Name or Attribute; otherwise return None.
-        match n:
+    def get_class_identifier(node):
+        """Extract a class identifier from Name or Attribute nodes."""
+        match node:
             case ast.Name(id=id):
                 return id
             case ast.Attribute(attr=attr):
@@ -406,17 +391,16 @@ def parse_pattern(p):
             kwd_attrs=["name", *_],
             kwd_patterns=[ast.MatchValue(value=ast.Constant(value=event_name)), *_],
         ):
-            cid = cls_id(cls)
-            yield (cid, event_name) if cid else (None, None)
+            class_id = get_class_identifier(cls)
+            yield (class_id, event_name) if class_id else (None, None)
         case ast.MatchClass(cls=cls):
-            cid = cls_id(cls)
-            yield (cid, None) if cid else (None, None)
-        case ast.MatchOr(patterns=pps):
-            for pp in pps:
-                yield from parse_pattern(pp)
-        case ast.AST(pattern=pp):
-            # Some wrappers carry the actual pattern in their `pattern` field.
-            yield parse_pattern(pp)
+            class_id = get_class_identifier(cls)
+            yield (class_id, None) if class_id else (None, None)
+        case ast.MatchOr(patterns=patterns):
+            for pattern in patterns:
+                yield from parse_pattern(pattern)
+        case ast.AST(pattern=pattern):
+            yield from parse_pattern(pattern)
         case _:
             yield None, None
 
@@ -434,23 +418,16 @@ def infer_interests(func):
     Behavior:
         - If no recognizable match-case is found, yields (None, None) and logs a warning.
         - If a case cannot be interpreted, logs a warning and yields (None, None) for that case.
-
-    Limitations:
-        - Unusual control-flow, guards, or patterns may not be recognized and will produce
-          (None, None). In strict_interest_inference mode, such processors will not receive
-          events via wildcard delivery.
     """
-    # note that it is expected that processors will use a match-case clause as THE way to indicate interest.
-
     import ast
     import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
     match tree:
-        case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as m])]):
-            for c in m.cases:
-                for interest in parse_pattern(c.pattern):
+        case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as match_stmt])]):
+            for case in match_stmt.cases:
+                for interest in parse_pattern(case.pattern):
                     match interest:
                         case (None, None):
                             logger.warning(
@@ -461,7 +438,7 @@ def infer_interests(func):
                     yield interest
         case _:
             logger.warning(
-                f"the processor {func} does not seem to have declared any interest to events;"
+                f"The processor {func} does not seem to have declared any interest to events"
             )
             yield None, None
 
@@ -471,12 +448,11 @@ class AbstractProcessor(abc.ABC):
 
     Responsibilities:
         - Declare interests (inferred at construction from process()).
-        - Execute work in a single-threaded executor to maintain per-processor ordering.
         - Provide an archive() utility to access the caching backend.
 
     Concurrency:
-        - Each instance owns a ThreadPoolExecutor(max_workers=1). This prevents concurrent
-          execution of process() within the same processor instance.
+        - Per-processor single-concurrency and ordering are enforced by the Pipeline via Inbox gating.
+          Processor instances do not own executors; work is executed on a shared thread pool.
 
     Notes:
         - interests is a frozen set of interest tuples inferred by infer_interests().
@@ -484,7 +460,6 @@ class AbstractProcessor(abc.ABC):
 
     def __init__(self):
         self.interests = frozenset(infer_interests(self.process))
-        self.executor = ThreadPoolExecutor(1)
 
     @abc.abstractmethod
     def process(self, context: Context, event: Event):
@@ -523,6 +498,18 @@ class AbstractProcessor(abc.ABC):
             )
 
 
+class Terminator(AbstractProcessor):
+    def __init__(self, q: SimpleQueue):
+        super().__init__()
+        self.q = q
+
+    def process(self, context, event):
+        match event:
+            case Event(name="__POISON__"):
+                logger.debug("terminator processing %s", event)
+                self.q.put(False)
+
+
 def caching(
     func=None,
     *,
@@ -541,7 +528,7 @@ def caching(
 
     Args:
         func: The function to decorate (processor.process). When omitted, returns a configured decorator.
-        debug: If True, prints digest values and cache hits to stdout.
+        debug: If True, logs digest values and cache hits at DEBUG level.
 
     Concurrency:
         - Safe to use within the single-threaded processor executor; submissions are delegated
@@ -561,32 +548,33 @@ def caching(
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
-                # Compute digest over processor class source + input event JSON.
-                digest = hashlib.sha256(
-                    dill.dumps(
-                        [
-                            inspect.getsource(self.__class__),
-                            event.model_dump_json(),
-                        ]
-                    )
-                ).hexdigest()
+
+                # Compute cache key from processor source and event
+                cache_key_data = [
+                    inspect.getsource(self.__class__),
+                    event.model_dump_json(),
+                ]
+                digest = hashlib.sha256(dill.dumps(cache_key_data)).hexdigest()
+
                 if debug:
-                    print("digest", digest)
+                    logger.debug("digest %s", digest)
+
                 archive = self.archive(context.pipeline.workspace)
+
                 if digest in archive:
-                    # Cache hit: replay by resubmitting archived events in original order.
+                    # Cache hit: replay archived events
                     if debug:
-                        print("cache hit:", digest)
-                    for e in archive[digest]:
-                        context.submit(e)
+                        logger.debug("cache hit: %s", digest)
+                    for cached_event in archive[digest]:
+                        context.submit(cached_event)
                 else:
-                    # Cache miss: execute and archive emitted events as an ordered tuple.
+                    # Cache miss: execute and cache results
                     func(self, context, event, *args, **kwargs)
                     archive[digest] = tuple(context.events)
-            except Exception as e:
-                # Surface failure details to stderr while preserving behavior.
-                print(type(e), e, file=sys.stderr)
-                raise e
+
+            except Exception:
+                logger.exception("caching wrapper failed")
+                raise
 
         return wrapper
 
