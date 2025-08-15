@@ -9,6 +9,7 @@ from types import MethodType
 from collections import OrderedDict, defaultdict
 from typing import Collection, List, Literal
 
+import deepdiff
 from pydantic import BaseModel, ConfigDict
 import dill
 import hashlib
@@ -62,7 +63,7 @@ class ReactiveBuilder(AbstractProcessor):
         for key in itertools.product(
             *[self.input_store[require] for require in self.requires]
         ):
-            skey = hashlib.sha256( dill.dumps(key) ).hexdigest()
+            skey = deepdiff.DeepHash(key)[key]
             if skey not in self.build_cache[target]:
                 for artifact in self.build(context, target, *key):
                     self.build_cache[target][skey].append(artifact)
@@ -99,6 +100,7 @@ class ReactiveBuilder(AbstractProcessor):
                         ReactiveEvent(
                             name="built",
                             target=target,
+                            artifact=artifact,
                         )
                     )
                     pass
