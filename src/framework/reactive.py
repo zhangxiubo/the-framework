@@ -40,13 +40,21 @@ class ReactiveBuilder(AbstractProcessor):
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
         self.handlers = {self.new, self.reply, self.listen}
         self.known_targets = set()
-        self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
-        self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
-        if cache:
-            wrapped = caching(type(self)._process)
-            self._process = MethodType(wrapped, self)
+        # The build cache is a flat key-value store.
+        # Key: (target, skey) where skey is the hash of the input artifact tuple.
+        # Value: list of artifacts produced by build().
+        self.build_cache = defaultdict(list)
+        self.input_store = defaultdict(list)  # require -> artifacts (ingridents)
+        self.use_persistent_cache = cache
 
     def _process(self, context: Context, event: ReactiveEvent):
+        if self.use_persistent_cache and isinstance(self.build_cache, defaultdict):
+            # First-time processing for this instance with caching enabled.
+            # We switch from the in-memory defaultdict to a persistent klepto archive.
+            persistent_cache = self.archive(context.pipeline.workspace)
+            persistent_cache.update(self.build_cache)  # Copy any initial state.
+            self.build_cache = persistent_cache
+
         for handler in list(self.handlers):
             handler(context, event)
         for known_provide in self.known_targets:
@@ -58,17 +66,22 @@ class ReactiveBuilder(AbstractProcessor):
                 self._process(context, event)
 
     def publish(self, context, target):
-        # immediately tries to trigger builds
+        # Immediately tries to trigger builds for all combinations of inputs.
         for key in itertools.product(
             *[self.input_store[require] for require in self.requires]
         ):
-            skey = hashlib.sha256( dill.dumps(key) ).hexdigest()
-            if skey not in self.build_cache[target]:
-                for artifact in self.build(context, target, *key):
-                    self.build_cache[target][skey].append(artifact)
-                    context.submit(
-                        ReactiveEvent(name="built", target=target, artifact=artifact)
-                    )
+            skey = hashlib.sha256(dill.dumps(key)).hexdigest()
+            cache_key = f"{target}|{skey}"
+            if cache_key not in self.build_cache:
+                # Cache miss: run the build function and store the resulting artifacts.
+                # Even if the build produces nothing, we mark it as cached to avoid re-running.
+                self.build_cache[cache_key] = list(self.build(context, target, *key))
+
+            # Always publish the artifacts that are now in the cache.
+            for artifact in self.build_cache[cache_key]:
+                context.submit(
+                    ReactiveEvent(name="built", target=target, artifact=artifact)
+                )
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
@@ -87,21 +100,17 @@ class ReactiveBuilder(AbstractProcessor):
                 target
             ):
                 self.known_targets.add(target)
-                # someone is asking for "target"
-                # we should tell them about all the things we know about target
-                # by publishing all the values we have built for target
-                # the values we publish shall be picked up by all who are interested
-                # the initial blanket "resolve-broadcast" hopefully should be brief
-                for artifact in self.build_cache[target].values():
-                    # retrieve the things we have built for target
-                    # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    context.submit(
-                        ReactiveEvent(
-                            name="built",
-                            target=target,
-                        )
-                    )
-                    pass
+                # A new listener has appeared. We should inform them of all the artifacts
+                # we have already built for the target they are interested in.
+                for cache_key, artifact_list in self.build_cache.items():
+                    # Key is a string like "target|skey", so we check if it starts with the target.
+                    if cache_key.startswith(f"{target}|"):
+                        for artifact in artifact_list:
+                            context.submit(
+                                ReactiveEvent(
+                                    name="built", target=target, artifact=artifact
+                                )
+                            )
 
     def listen(self, context: Context, event: ReactiveEvent):
         match event:
@@ -121,9 +130,10 @@ def reactive(provides: str, requires: List[str], cache: bool = False, **kwargs):
     Args:
         provides: The provided topic name or regex pattern for the reactive builder.
         requires: A list of prerequisite topic names (duplicates are deduplicated preserving order).
-        cache: When True, enable persistent combo-level caching of emitted built() events keyed by
-               [class source, provides pattern, target, ordered input digests], using the archive
-               from AbstractProcessor.archive(). Resolve events are not cached.
+        cache: When True, the internal cache of built artifacts is made persistent across runs,
+               using the workspace provided to the Pipeline. This avoids re-running the `build`
+               method for the same combination of inputs. When False (default), the cache is
+               in-memory only for the lifetime of the processor instance.
         **kwargs: Forwarded to the `ReactiveBuilder` constructor (e.g., `build_policy`).
     Example:
         @reactive(provides="A", requires=["X", "Y"])

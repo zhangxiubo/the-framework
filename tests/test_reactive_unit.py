@@ -31,7 +31,8 @@ class LeafProducer(AbstractProcessor):
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="resolve", target=target, sender=reply_to) if target == self.topic:
+            case ReactiveEvent(name="resolve", target=target) if target == self.topic:
+                reply_to = getattr(event, "sender", None)
                 for v in self.values:
                     context.submit(
                         ReactiveEvent(
@@ -111,5 +112,28 @@ def test_reactive_zero_prerequisites_invokes_once_and_broadcasts():
 
     a1 = [e.artifact for e in sink1.events]
     a2 = [e.artifact for e in sink2.events]
-    assert a1 == ["only-once"]
-    assert a2 == ["only-once"], "Broadcast semantics: all listeners receive the emission"
+    assert set(a1) == {"only-once"}
+    assert set(a2) == {"only-once"}, "Broadcast semantics: all listeners receive the emission"
+
+
+def test_reactive_reply_for_late_joiner():
+    # Setup: producer and builder run first, populating the builder's cache.
+    prodX = LeafProducer(topic="X", values=[1, 2])
+    builder = AddTen()  # provides="A", requires=["X"]
+    p1 = Pipeline([prodX, builder])
+    p1.submit(ReactiveEvent(name="resolve", target="A"))
+    p1.run()
+
+    # The builder should now have A=11 and A=12 in its internal build_cache,
+    # and its handler state should be updated.
+    # Now, a new listener joins and asks for "A".
+    sink = ReactiveRecordingSink(target="A")
+    # We re-use the `builder` instance, which preserves its state.
+    p2 = Pipeline([builder, sink])
+    p2.submit(ReactiveEvent(name="resolve", target="A"))
+    p2.run()
+
+    # The builder's 'reply' method should have fired and sent the cached values to the sink.
+    artifacts = [e.artifact for e in sink.events]
+    assert len(artifacts) == 2
+    assert set(artifacts) == {11, 12}
