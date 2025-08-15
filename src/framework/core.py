@@ -42,7 +42,8 @@ def timeit(name, logger):
         yield
     finally:
         end = time.perf_counter()
-        logger.debug(f'{name} finished after {end - start:.4f} seconds')
+        logger.debug(f"{name} finished after {end - start:.4f} seconds")
+
 
 def wrap(func):
     """Middleware wrapper for processor callables.
@@ -99,21 +100,28 @@ def retry(max_attempts):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
             for attempt in range(max_attempts):
+                start = time.perf_counter()
                 logger.debug(
                     f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}"
                 )
                 try:
-                    return func(*args, **kwargs)
+                    result = func(*args, **kwargs)
+                    elapsed = time.perf_counter() - start
+                    logger.debug(
+                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} finished in {elapsed:.4f}s"
+                    )
+                    return result
                 except Exception:
+                    elapsed = time.perf_counter() - start
                     is_last_attempt = attempt >= max_attempts - 1
                     if is_last_attempt:
                         logger.error(
-                            f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... escalating",
+                            f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed after {elapsed:.4f}s ... escalating",
                             exc_info=True,
                         )
                         raise
                     logger.warning(
-                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed... retrying",
+                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed  failed after {elapsed:.4f}s ... retrying",
                         exc_info=True,
                     )
 
@@ -180,10 +188,13 @@ class Context:
             # Wake the dispatcher to continue scheduling.
             q.put(True)
 
+
 @dataclass(order=True, frozen=True)
 class ProcessEntry:
     priority: int
-    processor: 'AbstractProcessor' = field(compare=False,)
+    processor: "AbstractProcessor" = field(
+        compare=False,
+    )
 
 
 class Inbox:
@@ -203,7 +214,9 @@ class Inbox:
             self.jobs += 1
             if self.slots_left > 0:  # Check if we have any slots left
                 self.slots_left -= 1
-                self.ready_queue.put(ProcessEntry(self.processor.priority,  self.processor))
+                self.ready_queue.put(
+                    ProcessEntry(self.processor.priority, self.processor)
+                )
 
     def take_event(self):
         try:
@@ -221,7 +234,9 @@ class Inbox:
             self.slots_left += 1
             if self.jobs > 0:  # Check if we have any jobs left
                 self.slots_left -= 1
-                self.ready_queue.put(ProcessEntry(self.processor.priority,  self.processor))
+                self.ready_queue.put(
+                    ProcessEntry(self.processor.priority, self.processor)
+                )
 
 
 class Pipeline:
@@ -459,6 +474,7 @@ def infer_interests(func):
                 f"The processor {func} does not seem to have declared any interest to events"
             )
             yield None, None
+
 
 class AbstractProcessor(abc.ABC):
     """Base class for processors that handle events.
