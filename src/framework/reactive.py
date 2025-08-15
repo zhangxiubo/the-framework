@@ -47,8 +47,10 @@ class ReactiveBuilder(AbstractProcessor):
         self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
 
     def _process(self, context: Context, event: ReactiveEvent):
-        for handler in list(self.handlers):
-            handler(context, event)
+            for handler in list(self.handlers):
+                handler(context, event)
+            for known_provide in self.known_targets:
+                self.publish(context, known_provide)
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
@@ -59,9 +61,7 @@ class ReactiveBuilder(AbstractProcessor):
 
 
 
-    @contextmanager
-    def check_prerequisites(self, context, target):
-        yield
+    def publish(self, context, target):
         # immediately tries to trigger builds
         for key in itertools.product( *[self.input_store[require] for require in self.requires]):
             if key not in self.build_cache[target]:
@@ -75,19 +75,18 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent(name="resolve", target=target) if self.matcher.match(
                 target
             ):
-                with self.check_prerequisites(context, target):
-                    print('resolving', target)
-                    self.handlers -= {self.new}
-                    for require in self.requires:
-                        # kicks-off downstream tasks
-                        context.submit(ReactiveEvent(name="resolve", target=require))
+                print('resolving', target)
+                self.handlers -= {self.new}
+                for require in self.requires:
+                    # kicks-off downstream tasks
+                    context.submit(ReactiveEvent(name="resolve", target=require))
         pass
 
     def reply(self, context: Context, event: ReactiveEvent):
         match event:
             case ReactiveEvent(name="resolve", target=target) if self.matcher.match(
                 target
-            ): 
+            ):
                 self.known_targets.add(target)
                 # someone is asking for "target"
                 # we should tell them about all the things we know about target
@@ -103,9 +102,7 @@ class ReactiveBuilder(AbstractProcessor):
     def listen(self, context: Context, event: ReactiveEvent):
         match event:
             case ReactiveEvent(name="built", target=target, artifact=artifact) if target in self.requires:
-                for known_provide in self.known_targets:
-                    with self.check_prerequisites(context, known_provide):
-                        self.input_store[target].append(artifact)
+                self.input_store[target].append(artifact)
 
                     
 
