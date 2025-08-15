@@ -179,7 +179,7 @@ class Context:
             exc = future.exception()
             if exc is not None:
                 logger.error(
-                    f"processor failed: {processor} on event {event}",
+                    f"processor failed: {processor} on event {event.__class__.__name__}, name: {event.name}",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
         finally:
