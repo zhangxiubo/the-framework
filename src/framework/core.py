@@ -1,6 +1,6 @@
 import abc
 import functools
-import hashlib
+
 import inspect
 import logging
 import threading
@@ -10,7 +10,8 @@ from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
 from typing import List
 
-import dill
+import deepdiff
+
 import klepto
 from pydantic import BaseModel, ConfigDict
 
@@ -419,7 +420,6 @@ def infer_interests(func):
         - If a case cannot be interpreted, logs a warning and yields (None, None) for that case.
     """
     import ast
-    import inspect
     import textwrap
 
     tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
@@ -509,10 +509,20 @@ class Terminator(AbstractProcessor):
                 self.q.put(False)
 
 
+def in_jupyter_notebook() -> bool:
+    try:
+        from IPython import get_ipython
+
+        shell = get_ipython().__class__.__name__
+        return shell in {"ZMQInteractiveShell", "TerminalInteractiveShell"}
+    except (NameError, ImportError):
+        return False
+
+
 def caching(
     func=None,
     *,
-    debug: bool = False,
+    debug: bool = True,
 ):
     """Decorator to cache and deterministically replay emitted events.
 
@@ -547,13 +557,21 @@ def caching(
         def wrapper(self, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
+                class_source = None
+                match in_jupyter_notebook():
+                    case True:
+                        from IPython.core import oinspect
+
+                        class_source = oinspect.getsource(self.__class__)
+                    case False:
+                        class_source = inspect.getsource(self.__class__)
 
                 # Compute cache key from processor source and event
-                cache_key_data = [
-                    inspect.getsource(self.__class__),
-                    event.model_dump_json(),
+                cache_key = [
+                    class_source,
+                    event,
                 ]
-                digest = hashlib.sha256(dill.dumps(cache_key_data)).hexdigest()
+                digest = deepdiff.DeepHash(cache_key)[cache_key]
 
                 if debug:
                     logger.debug("digest %s", digest)

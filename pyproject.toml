@@ -7,7 +7,7 @@ authors = [
     { name = "Xiubo Zhang", email = "zhangxiubo@gmail.com" }
 ]
 dependencies = [
-    "dill>=0.4.0",
+    "deepdiff>=8.6.0",
     "klepto>=0.2.7",
     "pydantic>=2.11.7",
     "sqlalchemy>=2.0.42",
