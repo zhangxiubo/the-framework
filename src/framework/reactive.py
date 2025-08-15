@@ -1,18 +1,17 @@
 from __future__ import annotations
 
-from contextlib import contextmanager
 import functools
 import itertools
 import logging
 import re
 import abc
+from types import MethodType
 from collections import OrderedDict, defaultdict
-from typing import Any, Collection, Dict, Iterable, List, Sequence, Set, Optional
+from typing import Collection, List, Literal
 
-import dill
 from pydantic import BaseModel, ConfigDict
 
-from .core import AbstractProcessor, Context
+from .core import AbstractProcessor, Context, caching
 
 logger = logging.getLogger(__name__)
 
@@ -28,14 +27,11 @@ class ReactiveEvent(BaseModel):
 
 
 class ReactiveBuilder(AbstractProcessor):
-
-
     def __init__(
         self,
         provides: str,
         requires: Collection[str],
         cache: bool = False,
-        build_policy: BuildPolicy = None,
     ):
         super().__init__()
         self.provides: str = provides
@@ -45,37 +41,38 @@ class ReactiveBuilder(AbstractProcessor):
         self.known_targets = set()
         self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
         self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
+        if cache:
+            wrapped = caching(type(self)._process)
+            self._process = MethodType(wrapped, self)
 
     def _process(self, context: Context, event: ReactiveEvent):
-            for handler in list(self.handlers):
-                handler(context, event)
-            for known_provide in self.known_targets:
-                self.publish(context, known_provide)
+        for handler in list(self.handlers):
+            handler(context, event)
+        for known_provide in self.known_targets:
+            self.publish(context, known_provide)
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="resolve"):
+            case ReactiveEvent():
                 self._process(context, event)
-            case ReactiveEvent(name="built"):
-                self._process(context, event)
-
-
 
     def publish(self, context, target):
         # immediately tries to trigger builds
-        for key in itertools.product( *[self.input_store[require] for require in self.requires]):
+        for key in itertools.product(
+            *[self.input_store[require] for require in self.requires]
+        ):
             if key not in self.build_cache[target]:
                 for artifact in self.build(context, target, *key):
                     self.build_cache[target][key].append(artifact)
-                    context.submit(ReactiveEvent(name="built", target=target, artifact=artifact))
-
+                    context.submit(
+                        ReactiveEvent(name="built", target=target, artifact=artifact)
+                    )
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
             case ReactiveEvent(name="resolve", target=target) if self.matcher.match(
                 target
             ):
-                print('resolving', target)
                 self.handlers -= {self.new}
                 for require in self.requires:
                     # kicks-off downstream tasks
@@ -96,16 +93,20 @@ class ReactiveBuilder(AbstractProcessor):
                 for artifact in self.build_cache[target].values():
                     # retrieve the things we have built for target
                     # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    context.submit(ReactiveEvent(name="built", target=target, ))
+                    context.submit(
+                        ReactiveEvent(
+                            name="built",
+                            target=target,
+                        )
+                    )
                     pass
 
     def listen(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="built", target=target, artifact=artifact) if target in self.requires:
+            case ReactiveEvent(name="built", target=target, artifact=artifact) if (
+                target in self.requires
+            ):
                 self.input_store[target].append(artifact)
-
-                    
-
 
     @abc.abstractmethod
     def build(self, context: Context, target: str, *args, **kwargs):
