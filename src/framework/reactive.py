@@ -10,7 +10,8 @@ from collections import OrderedDict, defaultdict
 from typing import Collection, List, Literal
 
 from pydantic import BaseModel, ConfigDict
-
+import dill
+import hashlib
 from .core import AbstractProcessor, Context, caching
 
 logger = logging.getLogger(__name__)
@@ -61,9 +62,10 @@ class ReactiveBuilder(AbstractProcessor):
         for key in itertools.product(
             *[self.input_store[require] for require in self.requires]
         ):
-            if key not in self.build_cache[target]:
+            skey = hashlib.sha256( dill.dumps(key) ).hexdigest()
+            if skey not in self.build_cache[target]:
                 for artifact in self.build(context, target, *key):
-                    self.build_cache[target][key].append(artifact)
+                    self.build_cache[target][skey].append(artifact)
                     context.submit(
                         ReactiveEvent(name="built", target=target, artifact=artifact)
                     )

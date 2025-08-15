@@ -307,7 +307,6 @@ class Pipeline:
         recipients |= self.processors.get((event_class, None), set())
         recipients |= self.processors.get((event_class, event.name), set())
 
-        logger.debug("submitting %s", event)
         for processor in recipients:
             self.increment()
             inbox = self.get_inbox(processor)
