@@ -41,7 +41,7 @@ class ReactiveBuilder(AbstractProcessor):
         self.handlers = {self.new, self.reply, self.listen}
         self.known_targets = set()
         # The build cache is a flat key-value store.
-        # Key: (target, skey) where skey is the hash of the input artifact tuple.
+        # Key: "target|skey" where skey is the hash of the input artifact tuple.
         # Value: list of artifacts produced by build().
         self.build_cache = defaultdict(list)
         self.input_store = defaultdict(list)  # require -> artifacts (ingridents)
