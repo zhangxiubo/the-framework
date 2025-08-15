@@ -1,4 +1,6 @@
 import abc
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 import functools
 
 import inspect
@@ -7,7 +9,8 @@ import threading
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
-from queue import Empty, Queue, SimpleQueue
+from queue import Empty, PriorityQueue, Queue, SimpleQueue
+import time
 from typing import List
 
 import deepdiff
@@ -32,6 +35,15 @@ class Event(BaseModel):
     name: str
 
 
+@contextmanager
+def timeit(name, logger):
+    start = time.perf_counter()
+    try:
+        yield
+    finally:
+        end = time.perf_counter()
+        logger.debug(f'{name} finished after {end - start:.4f} seconds')
+
 def wrap(func):
     """Middleware wrapper for processor callables.
 
@@ -55,7 +67,8 @@ def wrap(func):
     @functools.wraps(func)
     def middleware(*args, **kwargs):
         try:
-            return func(*args, **kwargs)
+            with timeit(func.__qualname__, logger):
+                return func(*args, **kwargs)
         except Exception:
             logger.debug(
                 f"exception calling {func.__qualname__} from thread {threading.current_thread().name}",
@@ -167,6 +180,11 @@ class Context:
             # Wake the dispatcher to continue scheduling.
             q.put(True)
 
+@dataclass(order=True, frozen=True)
+class ProcessEntry:
+    priority: int
+    processor: 'AbstractProcessor' = field(compare=False,)
+
 
 class Inbox:
     def __init__(
@@ -185,7 +203,7 @@ class Inbox:
             self.jobs += 1
             if self.slots_left > 0:  # Check if we have any slots left
                 self.slots_left -= 1
-                self.ready_queue.put(self.processor)
+                self.ready_queue.put(ProcessEntry(self.processor.priority,  self.processor))
 
     def take_event(self):
         try:
@@ -203,7 +221,7 @@ class Inbox:
             self.slots_left += 1
             if self.jobs > 0:  # Check if we have any jobs left
                 self.slots_left -= 1
-                self.ready_queue.put(self.processor)
+                self.ready_queue.put(ProcessEntry(self.processor.priority,  self.processor))
 
 
 class Pipeline:
@@ -240,7 +258,7 @@ class Pipeline:
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.cond = threading.Condition()
-        self.rdyq = Queue()
+        self.rdyq = PriorityQueue()
         self.strict_interest_inference = strict_interest_inference
         self.max_workers = max_workers
 
@@ -320,7 +338,8 @@ class Pipeline:
             while q.get():
                 try:
                     # Drain all ready processors without blocking on an empty ready queue.
-                    while processor := self.rdyq.get_nowait():
+                    while entry := self.rdyq.get_nowait():
+                        processor = entry.processor
                         # One of the processors indicated readiness (has an event and an available slot).
                         inbox: Inbox = self.get_inbox(processor)
                         event: Event = inbox.take_event()
@@ -441,7 +460,6 @@ def infer_interests(func):
             )
             yield None, None
 
-
 class AbstractProcessor(abc.ABC):
     """Base class for processors that handle events.
 
@@ -457,8 +475,9 @@ class AbstractProcessor(abc.ABC):
         - interests is a frozen set of interest tuples inferred by infer_interests().
     """
 
-    def __init__(self):
+    def __init__(self, priority: int = 0):
         self.interests = frozenset(infer_interests(self.process))
+        self.priority = priority
 
     @abc.abstractmethod
     def process(self, context: Context, event: Event):

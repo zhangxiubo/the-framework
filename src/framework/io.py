@@ -84,7 +84,7 @@ class JsonLLoader(AbstractProcessor):
         Resource lifecycle:
         - The file is closed when a "__POISON__" Event is processed.
         """
-        super().__init__()
+        super().__init__(priority=100)
         self.name = name
         self.filepath = filepath
         self.file = open(self.filepath, "rt")
@@ -213,7 +213,7 @@ class JsonLWriter(AbstractProcessor):
         - Opens 'filepath' for writing in text mode.
         - Sets 'self.attribute' accordingly.
         """
-        super().__init__()
+        super().__init__(priority=-100)
         self.name = name
         self.filepath = filepath
         assert issubclass(item_type, BaseModel)
