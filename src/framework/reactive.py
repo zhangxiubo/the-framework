@@ -43,9 +43,7 @@ class ReactiveBuilder(AbstractProcessor):
         self.known_targets = set()
         self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
         self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
-        if cache:
-            wrapped = caching(type(self)._process)
-            self._process = MethodType(wrapped, self)
+        self.cache = cache
 
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
@@ -64,11 +62,21 @@ class ReactiveBuilder(AbstractProcessor):
             *[self.input_store[require] for require in self.requires]
         ):
             skey = deepdiff.DeepHash(key)[key]
-            if skey not in self.build_cache[target]:
-                artifacts = self.build(context, target, *key)
+            cache = (
+                self.archive(context.pipeline.workspace)
+                if self.cache
+                else self.build_cache[target]
+            )
+            if skey not in cache:
+                artifacts = list(self.build(context, target, *key))
                 assert isinstance(artifacts, Iterable)
+                cache[skey] = artifacts
                 for artifact in artifacts:
-                    self.build_cache[target][skey].append(artifact)
+                    context.submit(
+                        ReactiveEvent(name="built", target=target, artifact=artifact)
+                    )
+            else:
+                for artifact in cache[skey]:
                     context.submit(
                         ReactiveEvent(name="built", target=target, artifact=artifact)
                     )
@@ -95,16 +103,22 @@ class ReactiveBuilder(AbstractProcessor):
                 # by publishing all the values we have built for target
                 # the values we publish shall be picked up by all who are interested
                 # the initial blanket "resolve-broadcast" hopefully should be brief
-                for artifact in self.build_cache[target].values():
+                cache = (
+                    self.archive(context.pipeline.workspace)
+                    if self.cache
+                    else self.build_cache[target]
+                )
+                for artifacts in cache.values():
                     # retrieve the things we have built for target
                     # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    context.submit(
-                        ReactiveEvent(
-                            name="built",
-                            target=target,
-                            artifact=artifact,
+                    for artifact in artifacts:
+                        context.submit(
+                            ReactiveEvent(
+                                name="built",
+                                target=target,
+                                artifact=artifact,
+                            )
                         )
-                    )
                     pass
 
     def listen(self, context: Context, event: ReactiveEvent):
