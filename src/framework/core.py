@@ -269,6 +269,7 @@ class Pipeline:
         strict_interest_inference=False,
         workspace=None,
         max_workers=4,
+        config=None,
     ):
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
@@ -276,6 +277,7 @@ class Pipeline:
         self.rdyq = PriorityQueue()
         self.strict_interest_inference = strict_interest_inference
         self.max_workers = max_workers
+        self.config = dict() if config is None else config.copy()
 
         self.processors = defaultdict(set)
         for processor in processors:

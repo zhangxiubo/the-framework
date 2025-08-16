@@ -33,7 +33,7 @@ class ReactiveBuilder(AbstractProcessor):
         self,
         provides: str,
         requires: Collection[str],
-        cache: bool = False,
+        persist: bool = False,
     ):
         super().__init__()
         self.provides: str = provides
@@ -43,9 +43,11 @@ class ReactiveBuilder(AbstractProcessor):
         self.known_targets = set()
         self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
         self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
-        if cache:
+        if persist:
             wrapped = caching(type(self)._process)
             self._process = MethodType(wrapped, self)
+        # else:
+        #     self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
 
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
@@ -75,7 +77,7 @@ class ReactiveBuilder(AbstractProcessor):
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="resolve", target=target) if self.matcher.match(
+            case ReactiveEvent(name="resolve", target=target) if self.matcher.fullmatch(
                 target
             ):
                 self.handlers -= {self.new}
@@ -86,7 +88,7 @@ class ReactiveBuilder(AbstractProcessor):
 
     def reply(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent(name="resolve", target=target) if self.matcher.match(
+            case ReactiveEvent(name="resolve", target=target) if self.matcher.fullmatch(
                 target
             ):
                 self.known_targets.add(target)
