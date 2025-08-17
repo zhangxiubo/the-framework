@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 import functools
 
+import hashlib
 import inspect
 import logging
 import threading
@@ -458,7 +459,7 @@ def infer_interests(func):
     import ast
     import textwrap
 
-    tree = ast.parse(textwrap.dedent(inspect.getsource(func)))
+    tree = ast.parse(textwrap.dedent(get_source(func)))
     match tree:
         case ast.Module(body=[ast.FunctionDef(body=[*_, ast.Match() as match_stmt])]):
             for case in match_stmt.cases:
@@ -527,12 +528,22 @@ class AbstractProcessor(abc.ABC):
         if workspace is None:
             return klepto.archives.null_archive()
         else:
-            workspace.mkdir(parents=True, exist_ok=True)
+            source_hash = hashlib.sha256(get_source(self.__class__).encode()).hexdigest()
+            path = workspace.joinpath(self.__class__.__name__)
+            path.mkdir(parents=True, exist_ok=True)
             return klepto.archives.sql_archive(
-                name=f"sqlite:///{workspace.joinpath(self.__class__.__name__)}.sqlite",
+                name=f"sqlite:///{path.joinpath(source_hash)}.sqlite",
                 cached=False,
                 serialized=True,
             )
+    
+def get_source(obj) -> str:
+    match in_jupyter_notebook():
+        case True:
+            from IPython.core import oinspect
+            return oinspect.getsource(obj)
+        case False:
+            return inspect.getsource(obj)
 
 
 class Terminator(AbstractProcessor):
@@ -555,6 +566,8 @@ def in_jupyter_notebook() -> bool:
         return shell in {"ZMQInteractiveShell", "TerminalInteractiveShell"}
     except (NameError, ImportError):
         return False
+
+
 
 
 def caching(
@@ -592,21 +605,12 @@ def caching(
 
     def decorator(func):
         @functools.wraps(func)
-        def wrapper(self, context: Context, event: Event, *args, **kwargs):
+        def wrapper(self: AbstractProcessor, context: Context, event: Event, *args, **kwargs):
             try:
                 assert isinstance(self, AbstractProcessor)
-                class_source = None
-                match in_jupyter_notebook():
-                    case True:
-                        from IPython.core import oinspect
-
-                        class_source = oinspect.getsource(self.__class__)
-                    case False:
-                        class_source = inspect.getsource(self.__class__)
 
                 # Compute cache key from processor source and event
                 cache_key = [
-                    class_source,
                     event,
                 ]
                 digest = deepdiff.DeepHash(cache_key)[cache_key]
