@@ -5,7 +5,6 @@ import itertools
 import logging
 import re
 import abc
-from types import MethodType
 from collections import OrderedDict, defaultdict
 from typing import Collection, List
 from collections.abc import Iterable
@@ -13,7 +12,7 @@ from collections.abc import Iterable
 import deepdiff
 from pydantic import BaseModel, ConfigDict
 
-from .core import AbstractProcessor, Context, caching
+from .core import AbstractProcessor, Context
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +32,7 @@ class ReactiveBuilder(AbstractProcessor):
         self,
         provides: str,
         requires: Collection[str],
-        persist: bool = False,
+        cache: bool = False,
     ):
         super().__init__()
         self.provides: str = provides
@@ -41,13 +40,25 @@ class ReactiveBuilder(AbstractProcessor):
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
         self.handlers = {self.new, self.reply, self.listen}
         self.known_targets = set()
-        self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
         self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
-        if persist:
-            wrapped = caching(type(self)._process)
-            self._process = MethodType(wrapped, self)
-        # else:
-        #     self.build_cache = defaultdict(lambda: defaultdict(lambda: list()))
+        self.persist = cache
+
+    @functools.cache
+    def _get_cache(self, target, workspace):
+        match self.persist:
+            case True:
+                assert workspace is not None
+                return self.archive(workspace)
+            case False:
+                assert workspace is None
+                return dict()
+
+    def get_cache(self, target, context):
+        match self.persist:
+            case True:
+                return self._get_cache(target, context.pipeline.workspace)
+            case False:
+                return self._get_cache(target, None)
 
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
@@ -66,14 +77,17 @@ class ReactiveBuilder(AbstractProcessor):
             *[self.input_store[require] for require in self.requires]
         ):
             skey = deepdiff.DeepHash(key)[key]
-            if skey not in self.build_cache[target]:
+            if skey not in self.get_cache(target, context):
                 artifacts = self.build(context, target, *key)
                 assert isinstance(artifacts, Iterable)
-                for artifact in artifacts:
-                    self.build_cache[target][skey].append(artifact)
+                collected = list(artifacts)
+                for artifact in collected:
                     context.submit(
                         ReactiveEvent(name="built", target=target, artifact=artifact)
                     )
+                if skey not in self.get_cache(target, context):
+                    self.get_cache(target, context)[skey] = list()
+                self.get_cache(target, context)[skey] += collected
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
@@ -97,16 +111,17 @@ class ReactiveBuilder(AbstractProcessor):
                 # by publishing all the values we have built for target
                 # the values we publish shall be picked up by all who are interested
                 # the initial blanket "resolve-broadcast" hopefully should be brief
-                for artifact in self.build_cache[target].values():
+                for artifacts in self.get_cache(target, context).values():
                     # retrieve the things we have built for target
                     # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    context.submit(
-                        ReactiveEvent(
-                            name="built",
-                            target=target,
-                            artifact=artifact,
+                    for artifact in set(artifacts):
+                        context.submit(
+                            ReactiveEvent(
+                                name="built",
+                                target=target,
+                                artifact=artifact,
+                            )
                         )
-                    )
                     pass
 
     def listen(self, context: Context, event: ReactiveEvent):
@@ -121,7 +136,11 @@ class ReactiveBuilder(AbstractProcessor):
         pass
 
 
-def reactive(provides: str, requires: List[str], cache: bool = False,):
+def reactive(
+    provides: str,
+    requires: List[str],
+    cache: bool = False,
+):
     """Class decorator to bind provides/requires for ReactiveBuilder subclasses.
 
     Args:
