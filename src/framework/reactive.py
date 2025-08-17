@@ -48,10 +48,12 @@ class ReactiveBuilder(AbstractProcessor):
         match self.persist:
             case True:
                 assert workspace is not None
-                return self.archive(workspace)
+                target_workspace = workspace.joinpath(target)
+                target_workspace.mkdir(parents=True, exist_ok=True)
+                return self.archive(target_workspace)
             case False:
                 assert workspace is None
-                return dict()
+                return {}
 
     def get_cache(self, target, context):
         match self.persist:
@@ -73,11 +75,12 @@ class ReactiveBuilder(AbstractProcessor):
 
     def publish(self, context, target):
         # immediately tries to trigger builds
+        cache = self.get_cache(target, context)
         for key in itertools.product(
             *[self.input_store[require] for require in self.requires]
         ):
             skey = deepdiff.DeepHash(key)[key]
-            if skey not in self.get_cache(target, context):
+            if skey not in cache:
                 artifacts = self.build(context, target, *key)
                 assert isinstance(artifacts, Iterable)
                 collected = list(artifacts)
@@ -85,9 +88,9 @@ class ReactiveBuilder(AbstractProcessor):
                     context.submit(
                         ReactiveEvent(name="built", target=target, artifact=artifact)
                     )
-                if skey not in self.get_cache(target, context):
-                    self.get_cache(target, context)[skey] = list()
-                self.get_cache(target, context)[skey] += collected
+                cache[skey] = collected
+                if self.persist:
+                    cache.dump()
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
@@ -111,10 +114,14 @@ class ReactiveBuilder(AbstractProcessor):
                 # by publishing all the values we have built for target
                 # the values we publish shall be picked up by all who are interested
                 # the initial blanket "resolve-broadcast" hopefully should be brief
-                for artifacts in self.get_cache(target, context).values():
-                    # retrieve the things we have built for target
-                    # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    for artifact in set(artifacts):
+                cache = self.get_cache(target, context)
+                for artifacts in cache.values():
+                    seen = set()
+                    for artifact in artifacts:
+                        digest = deepdiff.DeepHash(artifact)[artifact]
+                        if digest in seen:
+                            continue
+                        seen.add(digest)
                         context.submit(
                             ReactiveEvent(
                                 name="built",
@@ -122,7 +129,6 @@ class ReactiveBuilder(AbstractProcessor):
                                 artifact=artifact,
                             )
                         )
-                    pass
 
     def listen(self, context: Context, event: ReactiveEvent):
         match event:
