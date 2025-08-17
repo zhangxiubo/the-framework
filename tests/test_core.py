@@ -276,7 +276,7 @@ class Dummy(AbstractProcessor):
 
 
 def test_inbox_slot_gating_and_take_event_errors():
-    ready_q = queue.Queue()
+    ready_q = queue.PriorityQueue()
     dummy = Dummy()
     inbox = Inbox(dummy, ready_q, concurrency=1)
 
@@ -287,7 +287,7 @@ def test_inbox_slot_gating_and_take_event_errors():
     inbox.put_event(e2)
 
     # Only one readiness notification while a slot is held
-    assert ready_q.get_nowait() is dummy
+    assert ready_q.get_nowait().processor is dummy
     with pytest.raises(queue.Empty):
         ready_q.get_nowait()
 
@@ -296,7 +296,7 @@ def test_inbox_slot_gating_and_take_event_errors():
 
     # Signal task done -> reopen slot -> enqueue processor again since job remains
     inbox.mark_task_done()
-    assert ready_q.get_nowait() is dummy
+    assert ready_q.get_nowait().processor is dummy
 
     # Drain second event
     assert inbox.take_event() == e2
