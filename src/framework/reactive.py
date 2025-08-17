@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import itertools
 import logging
+from pathlib import Path
 import re
 import abc
 from collections import OrderedDict, defaultdict
@@ -44,11 +45,11 @@ class ReactiveBuilder(AbstractProcessor):
         self.persist = cache
 
     @functools.cache
-    def _get_cache(self, target, workspace):
+    def _get_cache(self, target: str, workspace: Path):
         match self.persist:
             case True:
                 assert workspace is not None
-                return self.archive(workspace)
+                return self.archive(workspace.joinpath(target))
             case False:
                 assert workspace is None
                 return dict()
@@ -114,7 +115,7 @@ class ReactiveBuilder(AbstractProcessor):
                 for artifacts in self.get_cache(target, context).values():
                     # retrieve the things we have built for target
                     # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
-                    for artifact in set(artifacts):
+                    for artifact in artifacts:
                         context.submit(
                             ReactiveEvent(
                                 name="built",

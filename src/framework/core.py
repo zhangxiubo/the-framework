@@ -527,6 +527,7 @@ class AbstractProcessor(abc.ABC):
         if workspace is None:
             return klepto.archives.null_archive()
         else:
+            workspace.mkdir(parents=True, exist_ok=True)
             return klepto.archives.sql_archive(
                 name=f"sqlite:///{workspace.joinpath(self.__class__.__name__)}.sqlite",
                 cached=False,
