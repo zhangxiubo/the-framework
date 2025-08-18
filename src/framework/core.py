@@ -103,7 +103,7 @@ def retry(max_attempts):
             for attempt in range(max_attempts):
                 start = time.perf_counter()
                 logger.debug(
-                    f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__}"
+                    f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} began"
                 )
                 try:
                     result = func(*args, **kwargs)
@@ -271,7 +271,9 @@ class Pipeline:
         workspace=None,
         max_workers=4,
         config=None,
+        **kwargs,
     ):
+        super().__init__(**kwargs)
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.cond = threading.Condition()

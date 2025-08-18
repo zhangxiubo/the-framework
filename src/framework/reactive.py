@@ -7,13 +7,13 @@ from pathlib import Path
 import re
 import abc
 from collections import OrderedDict, defaultdict
-from typing import Collection, List
+from typing import Any, Collection, Dict, List
 from collections.abc import Iterable
 
 import deepdiff
 from pydantic import BaseModel, ConfigDict
 
-from .core import AbstractProcessor, Context
+from .core import AbstractProcessor, Context, Event
 
 logger = logging.getLogger(__name__)
 
@@ -34,8 +34,10 @@ class ReactiveBuilder(AbstractProcessor):
         provides: str,
         requires: Collection[str],
         cache: bool = False,
+        priority=0,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(priority=priority, **kwargs)
         self.provides: str = provides
         self.matcher = re.compile(self.provides)
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
@@ -64,31 +66,32 @@ class ReactiveBuilder(AbstractProcessor):
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
             handler(context, event)
-        for known_provide in self.known_targets:
-            self.publish(context, known_provide)
 
     def process(self, context: Context, event: ReactiveEvent):
         match event:
-            case ReactiveEvent():
-                self._process(context, event)
+            case ReactiveEvent() as e:
+                self._process(context, e)
+            case Event(name="__POISON__") as e:
+                self.on_terminate(context, e)
 
-    def publish(self, context, target):
+    def publish(self, context):
         # immediately tries to trigger builds
         for key in itertools.product(
             *[self.input_store[require] for require in self.requires]
         ):
             skey = deepdiff.DeepHash(key)[key]
-            if skey not in self.get_cache(target, context):
-                artifacts = self.build(context, target, *key)
-                assert isinstance(artifacts, Iterable)
-                collected = list(artifacts)
-                for artifact in collected:
-                    context.submit(
-                        ReactiveEvent(name="built", target=target, artifact=artifact)
-                    )
+            for target in self.known_targets:
                 if skey not in self.get_cache(target, context):
-                    self.get_cache(target, context)[skey] = list()
-                self.get_cache(target, context)[skey] += collected
+                    artifacts = self.build(context, target, *key)
+                    assert isinstance(artifacts, Iterable)
+                    collected = list(artifacts)
+                    for artifact in collected:
+                        context.submit(
+                            ReactiveEvent(
+                                name="built", target=target, artifact=artifact
+                            )
+                        )
+                    self.get_cache(target, context)[skey] = collected
 
     def new(self, context: Context, event: ReactiveEvent):
         match event:
@@ -99,6 +102,10 @@ class ReactiveBuilder(AbstractProcessor):
                 for require in self.requires:
                     # kicks-off downstream tasks
                     context.submit(ReactiveEvent(name="resolve", target=require))
+                # for known_provide in self.known_targets:
+                self.publish(
+                    context,
+                )
         pass
 
     def reply(self, context: Context, event: ReactiveEvent):
@@ -123,7 +130,9 @@ class ReactiveBuilder(AbstractProcessor):
                                 artifact=artifact,
                             )
                         )
-                    pass
+                self.publish(
+                    context,
+                )
 
     def listen(self, context: Context, event: ReactiveEvent):
         match event:
@@ -131,9 +140,15 @@ class ReactiveBuilder(AbstractProcessor):
                 target in self.requires
             ):
                 self.input_store[target].append(artifact)
+                self.publish(
+                    context,
+                )
 
     @abc.abstractmethod
     def build(self, context: Context, target: str, *args, **kwargs):
+        pass
+
+    def on_terminate(self, context: Context, event: Event):
         pass
 
 
