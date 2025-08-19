@@ -324,7 +324,7 @@ class Pipeline:
                 stop = False
 
             phase = 0
-            noop_diff = 1
+            noop_diff = 0
             while not stop:
                 print("phase:", phase)
                 q.put(True)
@@ -337,10 +337,14 @@ class Pipeline:
                     last_jobs = self.jobs
 
                 phase += 1
-                noop_diff = self.submit(Event(name="__PHASE__", phase=phase))
+                noop_diff = self.submit(Event(name="__PHASE__", phase=phase)) + 1
             else:
+                q.put(True)
+                self.wait()  # wait for the phasing-spawned events to finish
+
                 # final phase
-                logger.info("first stage processing done; proceeding to termination")
+                logger.info("processing done; proceeding to shutdown phase")
+
                 # Submit poison-pill so the dispatcher can exit its blocking queue loop.
                 self.register_processor(Terminator(q))
                 self.submit(Event(name="__POISON__"))
@@ -348,7 +352,7 @@ class Pipeline:
                 # with an empty ready queue.
                 q.put(True)
                 # Wait until the poison event is processed and the dispatcher exits.
-                self.wait()
+                self.wait()  # this could still hang if terminator queued False to q before some other process is able to call task done callback to return job tickets
                 logger.info("dispatcher terminated")
 
         logger.info("pipeline run completed")
@@ -371,7 +375,7 @@ class Pipeline:
             inbox = self.get_inbox(processor)
             inbox.put_event(event)
         self.decrement()
-        return len(recipients) + 1
+        return len(recipients)
 
     def execute_events(self, q: SimpleQueue):
         with ThreadPoolExecutor(self.max_workers) as executor:
