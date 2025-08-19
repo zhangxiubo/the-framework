@@ -73,8 +73,9 @@ class ReactiveBuilder(AbstractProcessor):
                 self._process(context, e)
             case Event(name="__POISON__") as e:
                 self.on_terminate(context, e)
-            case Event(name="__PHASE__") as e:
-                self.on_phase(context, e)
+            case Event(name="__PHASE__", phase=phase) as e:
+                for target in self.known_targets:
+                    self.phase(context, target, phase)
 
     def publish(self, context):
         # immediately tries to trigger builds
@@ -150,11 +151,12 @@ class ReactiveBuilder(AbstractProcessor):
     def build(self, context: Context, target: str, *args, **kwargs):
         pass
 
+    def phase(self, context: Context, target: str, phase: int):
+        pass
+
     def on_terminate(self, context: Context, event: Event):
         pass
 
-    def on_phase(self, context: Context, event: Event):
-        pass
 
 
 def reactive(

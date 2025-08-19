@@ -318,11 +318,13 @@ class Pipeline:
         with ThreadPoolExecutor(1) as executor:
             q = SimpleQueue()
             executor.submit(self.execute_events, q)
+
             with self.cond:
                 last_jobs = self.jobs
-            stop = False
+                stop = False
+
             phase = 0
-            noop_diff = 0
+            noop_diff = 1
             while not stop:
                 print("phase:", phase)
                 q.put(True)
@@ -333,8 +335,9 @@ class Pipeline:
                     if self.jobs == last_jobs + noop_diff:
                         stop = True
                     last_jobs = self.jobs
+
                 phase += 1
-                noop_diff = self.submit(Event(name="__PHASE__"))
+                noop_diff = self.submit(Event(name="__PHASE__", phase=phase))
             else:
                 # final phase
                 logger.info("first stage processing done; proceeding to termination")
