@@ -8,7 +8,7 @@ import re
 import abc
 from collections import OrderedDict, defaultdict
 from typing import Any, Collection, Dict, List
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 
 import deepdiff
 from pydantic import BaseModel, ConfigDict
@@ -158,7 +158,6 @@ class ReactiveBuilder(AbstractProcessor):
         pass
 
 
-
 def reactive(
     provides: str,
     requires: List[str],
@@ -191,3 +190,64 @@ def reactive(
         return cls
 
     return decorator
+
+
+class Collector(ReactiveBuilder):
+    def __init__(self, forwards_to, topics):
+        super().__init__(forwards_to, topics, cache=False)
+        self.values = list()
+        self.last = None  # setting last to None gurantees that the collector shall publish at least once during the initial phasing
+
+    def build(self, context, target, *args, **kwargs):
+        self.values.append(args)
+        yield from []
+
+    def phase(self, context, target, phase):
+        if self.values != self.last:
+            context.submit(
+                ReactiveEvent(name="built", target=target, artifact=self.values.copy())
+            )
+            self.last = list(self.values)
+
+
+class StreamGrouper(ReactiveBuilder):
+    def __init__(
+        self,
+        provides,
+        requires,
+        keyfunc: Callable[..., Any],
+    ):
+        super().__init__(provides, requires, cache=False)
+        self.lastkey = None
+        self.lastset = list()
+        self.keyfunc = keyfunc
+
+    def build(
+        self,
+        context,
+        target,
+        *args,
+    ):
+        thiskey = self.keyfunc(*args)
+        if thiskey == self.lastkey:
+            self.lastset.append(args)
+        else:
+            yield self.lastkey, self.lastset
+            self.lastkey = thiskey
+            self.lastset = list()
+
+
+class JsonLSink(ReactiveBuilder):
+    def __init__(self, name: str, filepath: str):
+        super().__init__(name, [name], cache=False, priority=-100)
+        self.filepath = filepath
+        self.file = open(self.filepath, "wt")
+
+    def build(self, context, target, item):
+        assert isinstance(item, BaseModel)
+        self.file.writelines((item.model_dump_json(), "\n"))
+        self.file.flush()
+        yield from []
+
+    def on_terminate(self, context, event):
+        self.file.close()
