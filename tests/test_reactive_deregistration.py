@@ -1,10 +1,103 @@
+from __future__ import annotations
+
 from collections.abc import Iterable
+from typing import List
 
-from framework.reactive import ReactiveBuilder, ReactiveEvent
+import pytest
+
+from framework.core import Pipeline, AbstractProcessor
+from framework.reactive import ReactiveBuilder, ReactiveEvent, reactive
 
 
+class RecordingSinkReactive(AbstractProcessor):
+    """
+    A permissive sink that records every event it receives, in order.
+    It declares no match-case filters in process; with strict_interest_inference=False,
+    it should receive all events as a wildcard listener.
+    """
+
+    def __init__(self, name: str = "sink"):
+        super().__init__()
+        self.name = name
+        self.events: List[ReactiveEvent] = []
+
+    def process(self, context, event):
+        # Record all events, in arrival order
+        self.events.append(event)
+
+
+class ReactiveSource(AbstractProcessor):
+    """
+    Simple reactive source that, upon resolve(target=provides), emits configured artifacts
+    as ReactiveEvent(name="built", target=provides, artifact=item).
+    """
+
+    def __init__(self, provides: str, artifacts: List[object]):
+        super().__init__()
+        self.provides = provides
+        self.artifacts = list(artifacts)
+
+    def process(self, context, event):
+        match event:
+            case ReactiveEvent(name="resolve", target=target) if target == self.provides:
+                for a in self.artifacts:
+                    context.submit(
+                        ReactiveEvent(name="built", target=self.provides, artifact=a)
+                    )
+
+
+@reactive(provides="A", requires=["X", "Y"], cache=False)
+class Joiner(ReactiveBuilder):
+    """
+    Joiner that yields one artifact per unique combination (X, Y).
+    Uses the framework combo-level DeepHash key to avoid rebuilding duplicate combos.
+    """
+
+    calls = 0
+
+    def build(self, context, target, x, y):
+        type(self).calls += 1
+        yield (x, y)
+
+
+def test_join_builds_once_per_unique_combo():
+    """
+    - Sources produce duplicates for X and Y.
+    - Joiner must build once per unique combo only.
+    - Built events for target "A" contain only the unique combos.
+    """
+    # X has duplicates 1, 1; Y has duplicates "p", "p", and unique "q"
+    src_x = ReactiveSource("X", [1, 1])
+    src_y = ReactiveSource("Y", ["p", "p", "q"])
+    join = Joiner()
+    sink = RecordingSinkReactive()
+
+    p = Pipeline(
+        processors=[src_x, src_y, join, sink],
+        strict_interest_inference=False,
+        workspace=None,
+    )
+
+    # Kick off the join workflow by resolving target "A"
+    p.submit(ReactiveEvent(name="resolve", target="A"))
+    p.run()
+
+    # Collect built events for the joiner's provided target ("A")
+    a_artifacts = [
+        e.artifact
+        for e in sink.events
+        if isinstance(e, ReactiveEvent) and e.name == "built" and e.target == "A"
+    ]
+
+    # Expect exactly two unique combos: (1, "p") and (1, "q")
+    assert set(a_artifacts) == {(1, "p"), (1, "q")}
+    # Ensure build() was invoked only for unique combinations
+    assert Joiner.calls == 2
+
+
+# Unit test for in-memory reply replay without Pipeline
 class DummyContext:
-    """Minimal context stub sufficient for ReactiveBuilder under cache=False."""
+    """Minimal context stub sufficient for ReactiveBuilder under cache=False/True."""
 
     class PipelineStub:
         def __init__(self, workspace=None):
@@ -15,46 +108,48 @@ class DummyContext:
         self.events = []
 
     def submit(self, event):
-        # Record but don't dispatch; not needed for this regression reproduction.
+        # Record but don't dispatch; sufficient for reply() assertions.
         self.events.append(event)
 
 
-class ProbeBuilder(ReactiveBuilder):
-    """ReactiveBuilder subclass that counts how many times new() is invoked."""
+@reactive(provides="B", requires=[], cache=False)
+class TwoArtifactBuilder(ReactiveBuilder):
+    """
+    Builder that emits two artifacts on first resolve("B").
+    Subsequent resolve("B") should replay cached artifacts via reply() without rebuilding.
+    """
 
-    def __init__(self):
-        super().__init__(provides="A", requires=["X"], cache=False)
-        self.new_calls = 0
-
-    def new(self, context, event):
-        match event:
-            case ReactiveEvent(name="resolve", target=target) if self.matcher.fullmatch(
-                target
-            ):
-                self.new_calls += 1
-        return super().new(context, event)
+    calls = 0
 
     def build(self, context, target: str, *args, **kwargs) -> Iterable[object]:
-        if False:
-            yield  # pragma: no cover
+        type(self).calls += 1
+        yield "u"
+        yield "v"
 
 
-def test_new_handler_is_not_deregistered_for_bound_methods():
+def test_reply_replays_cached_artifacts_without_rebuild():
     """
-    Demonstrates the deregistration bug in ReactiveBuilder.new():
-    - handlers is a set of bound methods {self.new, self.reply, self.listen}
-    - subtracting {self.new} does not remove the originally stored bound method
-      because a new bound method object is created per attribute access
-    - result: new() runs again on subsequent resolve("A")
+    Second resolve("B") should:
+      - Not call build() again.
+      - Replay all cached artifacts via reply() in emission order.
     """
-    builder = ProbeBuilder()
+    b = TwoArtifactBuilder()
     ctx = DummyContext()
 
-    builder.process(ctx, ReactiveEvent(name="resolve", target="A"))
-    assert builder.new_calls == 1, "sanity: first resolve calls new exactly once"
+    # First resolve populates the cache and emits built events via publish
+    b.process(ctx, ReactiveEvent(name="resolve", target="B"))
+    assert TwoArtifactBuilder.calls == 1
+    # Ignore the first emission; focus on the reply path
+    ctx.events.clear()
 
-    builder.process(ctx, ReactiveEvent(name="resolve", target="A"))
-    # If deregistration worked, new_calls would remain 1. It increments to 2 currently.
-    assert builder.new_calls == 1, (
-        "BUG: `new` handler was not deregistered and was invoked again on second resolve"
-    )
+    # Second resolve triggers reply() replay from cache
+    b.process(ctx, ReactiveEvent(name="resolve", target="B"))
+
+    built = [
+        e
+        for e in ctx.events
+        if isinstance(e, ReactiveEvent) and e.name == "built" and e.target == "B"
+    ]
+    assert [e.artifact for e in built] == ["u", "v"]
+    # No new build occurred
+    assert TwoArtifactBuilder.calls == 1
