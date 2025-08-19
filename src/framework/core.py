@@ -346,13 +346,16 @@ class Pipeline:
                 logger.info("processing done; proceeding to shutdown phase")
 
                 # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-                self.register_processor(Terminator(q))
                 self.submit(Event(name="__POISON__"))
+
                 # Wake dispatcher to process the poison if it is currently waiting on q.get()
                 # with an empty ready queue.
                 q.put(True)
+
                 # Wait until the poison event is processed and the dispatcher exits.
-                self.wait()  # this could still hang if terminator queued False to q before some other process is able to call task done callback to return job tickets
+                self.wait()
+
+                q.put(False)
                 logger.info("dispatcher terminated")
 
         logger.info("pipeline run completed")
@@ -576,17 +579,6 @@ def get_source(obj) -> str:
         case False:
             return inspect.getsource(obj)
 
-
-class Terminator(AbstractProcessor):
-    def __init__(self, q: SimpleQueue):
-        super().__init__()
-        self.q = q
-
-    def process(self, context, event):
-        match event:
-            case Event(name="__POISON__"):
-                logger.debug("terminator processing %s", event)
-                self.q.put(False)
 
 
 def in_jupyter_notebook() -> bool:
