@@ -276,6 +276,7 @@ class Pipeline:
         super().__init__(**kwargs)
         # Global job accounting guarded by a condition variable.
         self.jobs = 0
+        self.done = 0
         self.cond = threading.Condition()
         self.rdyq = PriorityQueue()
         self.strict_interest_inference = strict_interest_inference
@@ -316,20 +317,36 @@ class Pipeline:
         """
         with ThreadPoolExecutor(1) as executor:
             q = SimpleQueue()
-            q.put(True)
             executor.submit(self.execute_events, q)
-            # Wait for all outstanding jobs (including nested emissions) to complete.
-            self.wait()
-            logger.info("first stage processing done; proceeding to termination")
-            # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-            self.register_processor(Terminator(q))
-            self.submit(Event(name="__POISON__"))
-            # Wake dispatcher to process the poison if it is currently waiting on q.get()
-            # with an empty ready queue.
-            q.put(True)
-            # Wait until the poison event is processed and the dispatcher exits.
-            self.wait()
-            logger.info("dispatcher terminated")
+            with self.cond:
+                last_jobs = self.jobs
+            stop = False
+            phase = 0
+            noop_diff = 0
+            while not stop:
+                print("phase:", phase)
+                q.put(True)
+                # Wait for all outstanding jobs (including nested emissions) to complete.
+                self.wait()
+
+                with self.cond:
+                    if self.jobs == last_jobs + noop_diff:
+                        stop = True
+                    last_jobs = self.jobs
+                phase += 1
+                noop_diff = self.submit(Event(name="__PHASE__"))
+            else:
+                # final phase
+                logger.info("first stage processing done; proceeding to termination")
+                # Submit poison-pill so the dispatcher can exit its blocking queue loop.
+                self.register_processor(Terminator(q))
+                self.submit(Event(name="__POISON__"))
+                # Wake dispatcher to process the poison if it is currently waiting on q.get()
+                # with an empty ready queue.
+                q.put(True)
+                # Wait until the poison event is processed and the dispatcher exits.
+                self.wait()
+                logger.info("dispatcher terminated")
 
         logger.info("pipeline run completed")
 
@@ -351,6 +368,7 @@ class Pipeline:
             inbox = self.get_inbox(processor)
             inbox.put_event(event)
         self.decrement()
+        return len(recipients) + 1
 
     def execute_events(self, q: SimpleQueue):
         with ThreadPoolExecutor(self.max_workers) as executor:
@@ -391,13 +409,13 @@ class Pipeline:
     def decrement(self):
         """Decrement global job counter and notify waiters when it reaches zero."""
         with self.cond:
-            self.jobs -= 1
-            if self.jobs <= 0:
+            self.done += 1
+            if self.done >= self.jobs:
                 self.cond.notify_all()
 
     def wait(self):
         with self.cond:
-            self.cond.wait_for(lambda: self.jobs <= 0)
+            self.cond.wait_for(lambda: self.done >= self.jobs)
 
 
 def parse_pattern(p):
@@ -530,7 +548,9 @@ class AbstractProcessor(abc.ABC):
         if workspace is None:
             return klepto.archives.null_archive()
         else:
-            source_hash = hashlib.sha256(get_source(self.__class__).encode()).hexdigest()
+            source_hash = hashlib.sha256(
+                get_source(self.__class__).encode()
+            ).hexdigest()
             path = workspace.joinpath(self.__class__.__name__)
             path.mkdir(parents=True, exist_ok=True)
             return klepto.archives.sql_archive(
@@ -538,11 +558,13 @@ class AbstractProcessor(abc.ABC):
                 cached=False,
                 serialized=True,
             )
-    
+
+
 def get_source(obj) -> str:
     match in_jupyter_notebook():
         case True:
             from IPython.core import oinspect
+
             return oinspect.getsource(obj)
         case False:
             return inspect.getsource(obj)
@@ -568,8 +590,6 @@ def in_jupyter_notebook() -> bool:
         return shell in {"ZMQInteractiveShell", "TerminalInteractiveShell"}
     except (NameError, ImportError):
         return False
-
-
 
 
 def caching(
@@ -607,7 +627,9 @@ def caching(
 
     def decorator(func):
         @functools.wraps(func)
-        def wrapper(self: AbstractProcessor, context: Context, event: Event, *args, **kwargs):
+        def wrapper(
+            self: AbstractProcessor, context: Context, event: Event, *args, **kwargs
+        ):
             try:
                 assert isinstance(self, AbstractProcessor)
 

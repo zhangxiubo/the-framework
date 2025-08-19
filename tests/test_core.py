@@ -324,7 +324,7 @@ def test_pipeline_routing_non_strict_and_strict():
     p.run()
 
     # Filter out __POISON__ which is used for pipeline shutdown
-    wildcard_names = [e.name for e in wildcard.events if e.name != "__POISON__"]
+    wildcard_names = [e.name for e in wildcard.events if e.name not in {"__POISON__", "__PHASE__"}]
     assert wildcard_names == ["foo", "bar"]
     assert [e.name for e in foo_sink.events] == ["foo"]
 
@@ -342,7 +342,7 @@ def test_pipeline_routing_non_strict_and_strict():
 
     assert [e.name for e in foo_sink2.events] == ["foo"]
     # Filter out __POISON__ in case it sneaks through
-    wildcard2_names = [e.name for e in wildcard2.events if e.name != "__POISON__"]
+    wildcard2_names = [e.name for e in wildcard2.events if e.name not in {"__POISON__", "__PHASE__"}]
     assert wildcard2_names == []  # no wildcard on strict
 
 
@@ -355,7 +355,7 @@ def test_pipeline_get_inbox_cached_and_jobs_quiesce():
 
     p.submit(Event(name="x"))
     p.run()
-    assert p.jobs == 0
+    assert p.jobs == p.done
 
 
 def test_execute_events_preserves_per_processor_fifo():
@@ -375,7 +375,7 @@ def test_done_callback_logs_errors_and_quiesces(caplog):
         p.run()
     msgs = " ".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
     assert "processor failed" in msgs
-    assert p.jobs == 0
+    assert p.jobs == p.done
 
 
 def test_pipeline_run_terminates_and_logs(caplog):
@@ -505,5 +505,5 @@ def test_context_submit_records_and_enqueues(make_pipeline):
     # Drain the pipeline
     p.run()
     # Filter out __POISON__ which is used for pipeline shutdown
-    sink_names = [e.name for e in sink.events if e.name != "__POISON__"]
+    sink_names = [e.name for e in sink.events if e.name not in {"__POISON__", "__PHASE__"}]
     assert sink_names == ["alpha", "beta"]
