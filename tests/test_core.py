@@ -108,28 +108,6 @@ class ArchProc(AbstractProcessor):
         pass
 
 
-# -------------------------
-# Event model
-# -------------------------
-
-
-def test_event_model_immutability_and_equality():
-    e1 = Event(name="x", payload=123)  # extra fields allowed
-    e2 = Event(name="x", payload=123)
-    e3 = Event(name="x", payload=999)
-
-    # Frozen/immutable - Pydantic raises ValidationError for frozen models
-    with pytest.raises(ValidationError):
-        setattr(e1, "name", "y")
-
-    # Hashable and equality by value
-    s = {e1, e2}
-    assert len(s) == 1
-    assert e1 == e2
-    assert e1 != e3
-    # Extra attrs preserved
-    assert e1.payload == 123
-
 
 # -------------------------
 # wrap()

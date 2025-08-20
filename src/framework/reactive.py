@@ -7,27 +7,46 @@ from pathlib import Path
 import re
 import abc
 from collections import OrderedDict, defaultdict
-from typing import Any, Collection, Dict, List
+from typing import Any, Collection, List
 from collections.abc import Callable, Iterable
+from smart_open import open
 
 import deepdiff
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel
 
 from .core import AbstractProcessor, Context, Event
 
 logger = logging.getLogger(__name__)
 
 
-class ReactiveEvent(BaseModel):
-    """Immutable reactive event carrying a 'name' and arbitrary extra fields.
+class ReactiveEvent(Event):
+    pass
 
-    Notes:
-        - model_config uses frozen=True so instances are immutable and hashable by value.
-        - extra="allow" lets events carry dynamic fields like 'target' and 'artifact'.
-    """
-    model_config = ConfigDict(frozen=True, extra="allow")
-    name: str
 
+class CustomSet:
+
+    def __init__(self):
+        self.data = dict()
+
+    def hash(self, item):
+        digest = deepdiff.DeepHash(item)[item]
+        return digest
+    
+    def add(self, item):
+        digest = self.hash(item)
+        self.data[digest] = item
+    
+    def __contains__(self, item):
+        return self.hash(item) in self.data
+
+    def __iter__(self):
+        return iter(self.data.values())
+    
+    def __len__(self):
+        return len(self.data)
+    
+    def __repr(self):
+        return f"DeepHashSet({list(self.data.values())})"
 
 # --------------------------
 # Processor
@@ -80,7 +99,7 @@ class ReactiveBuilder(AbstractProcessor):
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
         self.handlers = {self.new, self.reply, self.listen}
         self.known_targets = set()
-        self.input_store = defaultdict(list)  # requrie -> artifacts (ingridents)
+        self.input_store = defaultdict(CustomSet)  # requrie -> artifacts (ingridents)
         self.persist = cache
 
     @functools.cache
@@ -131,13 +150,14 @@ class ReactiveBuilder(AbstractProcessor):
                 if skey not in self.get_cache(target, context):
                     artifacts = self.build(context, target, *key)
                     assert isinstance(artifacts, Iterable)
-                    collected = list(artifacts)
-                    for artifact in collected:
+                    collected = list()
+                    for artifact in artifacts:
                         context.submit(
                             ReactiveEvent(
                                 name="built", target=target, artifact=artifact
                             )
                         )
+                        collected.append(artifact)
                     self.get_cache(target, context)[skey] = collected
 
     def new(self, context: Context, event: ReactiveEvent):
@@ -199,7 +219,7 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent(name="built", target=target, artifact=artifact) if (
                 target in self.requires
             ):
-                self.input_store[target].append(artifact)
+                self.input_store[target].add(artifact)
                 self.publish(
                     context,
                 )
@@ -258,14 +278,16 @@ class Collector(ReactiveBuilder):
       built(forwards_to, artifact=copy_of_values) and update last. Initial last=None
       ensures at least one emission once values arrive.
     """
-    def __init__(self, forwards_to, topics):
+    def __init__(self, forwards_to, topics, limit=None):
         super().__init__(forwards_to, topics, cache=False)
         self.values = list()
         self.last = None  # setting last to None gurantees that the collector shall publish at least once during the initial phasing
+        self.limit = float('inf') if limit is None else limit 
 
     def build(self, context, target, *args, **kwargs):
         """Record the received args tuple; do not emit immediately. Emission happens in phase()."""
-        self.values.append(args)
+        if len(self.values) < self.limit:
+            self.values.append(args)
         yield from []
 
     def phase(self, context, target, phase):
@@ -320,10 +342,10 @@ class JsonLSink(ReactiveBuilder):
     - build() asserts artifact is a BaseModel, writes model_dump_json() + newline, flushes.
     - on_terminate() closes the file; class runs at low priority so it executes after producers.
     """
-    def __init__(self, name: str, filepath: str):
+    def __init__(self, name: str, filepath: str, compression='infer_from_extension'):
         super().__init__(name, [name], cache=False, priority=-100)
         self.filepath = filepath
-        self.file = open(self.filepath, "wt")
+        self.file = open(self.filepath, "wt", compression=compression)
 
     def build(self, context, target, item):
         assert isinstance(item, BaseModel)
@@ -333,4 +355,21 @@ class JsonLSink(ReactiveBuilder):
 
     def on_terminate(self, context, event):
         """Close the underlying file on pipeline termination (__POISON__)."""
+        self.file.close()
+
+
+class JsonLSource(ReactiveBuilder):
+    def __init__(self, name: str, filepath: str, itemtype, compression='infer_from_extension'):
+        super().__init__(name, [], cache=False, priority=100)
+        self.filepath = filepath
+        assert issubclass(itemtype, BaseModel)
+        self.itemtype = itemtype
+        self.file = open(self.filepath, "rt", compression=compression)
+
+    def build(self, context, target, ):
+        for line in self.file:
+            yield self.itemtype.model_validate_json(line)
+        
+
+    def on_terminate(self, context, event):
         self.file.close()

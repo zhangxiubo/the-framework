@@ -22,18 +22,11 @@ from pydantic import BaseModel, ConfigDict
 logger = logging.getLogger(__name__)
 
 
-class Event(BaseModel):
-    """Immutable event passed through the runtime.
+class Event:
 
-    Attributes:
-        name: The logical name of the event (often used to refine interests).
-    Notes:
-        - model_config uses frozen=True so instances are immutable and hashable by value.
-        - extra="allow" lets events carry additional dynamic fields as needed.
-    """
-
-    model_config = ConfigDict(frozen=True, extra="allow")
-    name: str
+    def __init__(self, name: str, **kwargs):    
+        self.name: str = name
+        self.__dict__.update(kwargs)
 
 
 @contextmanager
