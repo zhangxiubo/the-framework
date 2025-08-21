@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import re
 import abc
-from collections import OrderedDict, defaultdict
+from collections import OrderedDict, defaultdict, ChainMap
 from typing import Any, Collection, List
 from collections.abc import Callable, Iterable
 from smart_open import open
@@ -24,29 +24,29 @@ class ReactiveEvent(Event):
 
 
 class CustomSet:
-
     def __init__(self):
         self.data = dict()
 
     def hash(self, item):
         digest = deepdiff.DeepHash(item)[item]
         return digest
-    
+
     def add(self, item):
         digest = self.hash(item)
         self.data[digest] = item
-    
+
     def __contains__(self, item):
         return self.hash(item) in self.data
 
     def __iter__(self):
         return iter(self.data.values())
-    
+
     def __len__(self):
         return len(self.data)
-    
+
     def __repr(self):
         return f"DeepHashSet({list(self.data.values())})"
+
 
 # --------------------------
 # Processor
@@ -85,6 +85,7 @@ class ReactiveBuilder(AbstractProcessor):
         - 'provides' is treated as a fullmatch regex against resolve.target.
         - 'requires' is deduplicated preserving order.
     """
+
     def __init__(
         self,
         provides: str,
@@ -97,7 +98,7 @@ class ReactiveBuilder(AbstractProcessor):
         self.provides: str = provides
         self.matcher = re.compile(self.provides)
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
-        self.handlers = {self.new, self.reply, self.listen}
+        self.handlers = {self.new,  self.listen}
         self.known_targets = set()
         self.input_store = defaultdict(CustomSet)  # requrie -> artifacts (ingridents)
         self.persist = cache
@@ -133,7 +134,7 @@ class ReactiveBuilder(AbstractProcessor):
                 for target in self.known_targets:
                     self.phase(context, target, phase)
 
-    def publish(self, context):
+    def publish(self, context: Context, input_target: str, new_artifact: Any):
         """Attempt to build and emit artifacts for all known targets.
 
         For each product of self.input_store[require] across requires, compute a DeepHash key.
@@ -142,8 +143,9 @@ class ReactiveBuilder(AbstractProcessor):
         artifacts in the cache keyed by the combo key. No-op if no known targets yet.
         """
         # immediately tries to trigger builds
+        input_store = ChainMap({input_target: [new_artifact]}, self.input_store)
         for key in itertools.product(
-            *[self.input_store[require] for require in self.requires]
+            *[input_store[require] for require in self.requires]
         ):
             skey = deepdiff.DeepHash(key)[key]
             for target in self.known_targets:
@@ -172,13 +174,17 @@ class ReactiveBuilder(AbstractProcessor):
                 target
             ):
                 self.handlers -= {self.new}
+                self.reply(context, event)           
+                self.publish(
+                    context,
+                    None,
+                    None
+                )
+                self.handlers |= {self.reply}
                 for require in self.requires:
                     # kicks-off downstream tasks
                     context.submit(ReactiveEvent(name="resolve", target=require))
-                # for known_provide in self.known_targets:
-                self.publish(
-                    context,
-                )
+
         pass
 
     def reply(self, context: Context, event: ReactiveEvent):
@@ -209,9 +215,7 @@ class ReactiveBuilder(AbstractProcessor):
                                 artifact=artifact,
                             )
                         )
-                self.publish(
-                    context,
-                )
+
 
     def listen(self, context: Context, event: ReactiveEvent):
         """Handle built(require, artifact) by recording the input and attempting publish()."""
@@ -220,9 +224,7 @@ class ReactiveBuilder(AbstractProcessor):
                 target in self.requires
             ):
                 self.input_store[target].add(artifact)
-                self.publish(
-                    context,
-                )
+                self.publish(context, target, artifact)
 
     @abc.abstractmethod
     def build(self, context: Context, target: str, *args, **kwargs):
@@ -278,11 +280,12 @@ class Collector(ReactiveBuilder):
       built(forwards_to, artifact=copy_of_values) and update last. Initial last=None
       ensures at least one emission once values arrive.
     """
+
     def __init__(self, forwards_to, topics, limit=None):
         super().__init__(forwards_to, topics, cache=False)
         self.values = list()
         self.last = None  # setting last to None gurantees that the collector shall publish at least once during the initial phasing
-        self.limit = float('inf') if limit is None else limit 
+        self.limit = float("inf") if limit is None else limit
 
     def build(self, context, target, *args, **kwargs):
         """Record the received args tuple; do not emit immediately. Emission happens in phase()."""
@@ -294,7 +297,7 @@ class Collector(ReactiveBuilder):
         """On each phase, emit a snapshot if values changed since last emission."""
         if self.values != self.last:
             context.submit(
-                ReactiveEvent(name="built", target=target, artifact=self.values.copy())
+                ReactiveEvent(name="built", target=target, artifact=self.values)
             )
             self.last = list(self.values)
 
@@ -309,6 +312,7 @@ class StreamGrouper(ReactiveBuilder):
     - Initial emission yields (None, []) before the first key.
     - No final flush is performed at end of stream.
     """
+
     def __init__(
         self,
         provides,
@@ -342,7 +346,8 @@ class JsonLSink(ReactiveBuilder):
     - build() asserts artifact is a BaseModel, writes model_dump_json() + newline, flushes.
     - on_terminate() closes the file; class runs at low priority so it executes after producers.
     """
-    def __init__(self, name: str, filepath: str, compression='infer_from_extension'):
+
+    def __init__(self, name: str, filepath: str, compression="infer_from_extension"):
         super().__init__(name, [name], cache=False, priority=-100)
         self.filepath = filepath
         self.file = open(self.filepath, "wt", compression=compression)
@@ -359,17 +364,29 @@ class JsonLSink(ReactiveBuilder):
 
 
 class JsonLSource(ReactiveBuilder):
-    def __init__(self, name: str, filepath: str, itemtype, compression='infer_from_extension'):
+    def __init__(
+        self,
+        name: str,
+        filepath: str,
+        itemtype,
+        limit=None,
+        compression="infer_from_extension",
+    ):
         super().__init__(name, [], cache=False, priority=100)
         self.filepath = filepath
         assert issubclass(itemtype, BaseModel)
         self.itemtype = itemtype
+        self.limit = float("inf") if limit is None else limit
         self.file = open(self.filepath, "rt", compression=compression)
 
-    def build(self, context, target, ):
-        for line in self.file:
-            yield self.itemtype.model_validate_json(line)
-        
+    def build(
+        self,
+        context,
+        target,
+    ):
+        for i, line in enumerate(self.file):
+            if i < self.limit:
+                yield self.itemtype.model_validate_json(line)
 
     def on_terminate(self, context, event):
         self.file.close()
