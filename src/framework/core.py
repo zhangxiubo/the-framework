@@ -23,8 +23,7 @@ logger = logging.getLogger(__name__)
 
 
 class Event:
-
-    def __init__(self, name: str, **kwargs):    
+    def __init__(self, name: str, **kwargs):
         self.name: str = name
         self.__dict__.update(kwargs)
 
@@ -233,6 +232,7 @@ class Inbox:
                 )
 
 
+
 class Pipeline:
     """Event dispatch pipeline.
 
@@ -294,6 +294,29 @@ class Pipeline:
             logger.debug(f"registering interest for {processor}: {interest}")
             self.processors[interest].add(processor)
 
+
+    @contextmanager
+    def interrupt_handled(
+        self,
+        executor: ThreadPoolExecutor,
+    ):
+        import signal
+        import sys
+
+        old_handler = signal.getsignal(signal.SIGINT)
+
+        def handler(signum, frame):
+            print("main pipeline executor shutting down...", file=sys.stderr)
+            signal.signal(signal.SIGINT, signal.SIG_DFL)
+            executor.shutdown(cancel_futures=True, wait=False)
+
+        signal.signal(signal.SIGINT, handler)
+        try:
+            yield
+        finally:
+            signal.signal(signal.SIGINT, old_handler)
+
+
     def run(self):
         """Run the dispatcher loop until the queue drains, then shut down executors.
 
@@ -308,48 +331,55 @@ class Pipeline:
             - A special "__POISON__" event is consumed by execute_events(), which breaks its loop.
             - Progress and termination are reported via the module logger.
         """
-        with ThreadPoolExecutor(1) as executor:
+        with (
+            ThreadPoolExecutor(1) as main_executor,
+            ThreadPoolExecutor(self.max_workers) as task_executor,
+        ):
             q = SimpleQueue()
-            executor.submit(self.execute_events, q)
+            with self.interrupt_handled(task_executor):
 
-            with self.cond:
-                last_jobs = self.jobs
-                stop = False
-
-            phase = 0
-            noop_diff = 0
-            while not stop:
-                print("phase:", phase)
-                q.put(True)
-                # Wait for all outstanding jobs (including nested emissions) to complete.
-                self.wait()
-
+                stop = threading.Event()
                 with self.cond:
-                    if self.jobs == last_jobs + noop_diff:
-                        stop = True
                     last_jobs = self.jobs
+                    stop.clear()
 
-                phase += 1
-                noop_diff = self.submit(Event(name="__PHASE__", phase=phase)) + 1
-            else:
-                q.put(True)
-                self.wait()  # wait for the phasing-spawned events to finish
+                main_executor.submit(self.execute_events, task_executor, q)
 
-                # final phase
-                logger.info("processing done; proceeding to shutdown phase")
+                phase = 0
+                noop_diff = 0
+                while not stop:
+                    print("phase:", phase)
+                    q.put(True)
+                    # Wait for all outstanding jobs (including nested emissions) to complete.
+                    self.wait()
 
-                # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-                self.submit(Event(name="__POISON__"))
+                    with self.cond:
+                        if self.jobs == (last_jobs + noop_diff):
+                            stop.set()
+                        last_jobs = self.jobs
 
-                # Wake dispatcher to process the poison if it is currently waiting on q.get()
-                # with an empty ready queue.
-                q.put(True)
+                    phase += 1
+                    noop_diff = self.submit(Event(name="__PHASE__", phase=phase)) + 1
+                else:
+                    q.put(True)
+                    self.wait()  # wait for the phasing-spawned events to finish
 
-                # Wait until the poison event is processed and the dispatcher exits.
-                self.wait()
+                    # final phase
+                    logger.info("processing done; proceeding to shutdown phase")
 
-                q.put(False)
-                logger.info("dispatcher terminated")
+                    # Submit poison-pill so the dispatcher can exit its blocking queue loop.
+                    self.submit(Event(name="__POISON__"))
+
+                    # Wake dispatcher to process the poison if it is currently waiting on q.get()
+                    # with an empty ready queue.
+                    q.put(True)
+
+                    # Wait until the poison event is processed and the dispatcher exits.
+                    self.wait()
+
+                    q.put(False)
+
+                    logger.info("dispatcher terminated")
 
         logger.info("pipeline run completed")
 
@@ -373,8 +403,8 @@ class Pipeline:
         self.decrement()
         return len(recipients)
 
-    def execute_events(self, q: SimpleQueue):
-        with ThreadPoolExecutor(self.max_workers) as executor:
+    def execute_events(self, executor: ThreadPoolExecutor, q: SimpleQueue):
+        with executor:
             # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
             while q.get():
                 try:
@@ -385,24 +415,25 @@ class Pipeline:
                         inbox: Inbox = self.get_inbox(processor)
                         event: Event = inbox.take_event()
                         context = Context(self)
+                        callback = functools.partial(
+                            context.done_callback,
+                            processor=processor,
+                            context=context,
+                            event=event,
+                            inbox=inbox,
+                            q=q,
+                        )
                         future = executor.submit(processor.process, context, event)
                         future.add_done_callback(
-                            functools.partial(
-                                context.done_callback,
-                                processor=processor,
-                                context=context,
-                                event=event,
-                                inbox=inbox,
-                                q=q,
-                            )
+                            callback
                         )
                 except Empty:
                     continue
-                except Exception:
-                    logger.critical(
-                        "unexpected error in dispatcher loop", exc_info=True
-                    )
-                    raise
+                except Exception as e:
+                    f = Future()
+                    f.set_exception(e)
+                    callback(f)  # manually invoke the call back function to ensure integrity of job counting 
+
 
     def increment(self):
         """Increment global job counter."""
@@ -571,7 +602,6 @@ def get_source(obj) -> str:
             return oinspect.getsource(obj)
         case False:
             return inspect.getsource(obj)
-
 
 
 def in_jupyter_notebook() -> bool:
