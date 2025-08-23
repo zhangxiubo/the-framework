@@ -158,7 +158,6 @@ class Context:
         self,
         future: Future,
         processor: "AbstractProcessor",
-        context: "Context",
         event: Event,
         inbox: "Inbox",
         q: SimpleQueue,
@@ -418,7 +417,6 @@ class Pipeline:
                         callback = functools.partial(
                             context.done_callback,
                             processor=processor,
-                            context=context,
                             event=event,
                             inbox=inbox,
                             q=q,
