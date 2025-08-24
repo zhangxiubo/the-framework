@@ -17,7 +17,7 @@ from typing import List
 import deepdiff
 
 import klepto
-from pydantic import BaseModel, ConfigDict
+
 
 logger = logging.getLogger(__name__)
 
@@ -38,56 +38,7 @@ def timeit(name, logger):
         logger.debug(f"{name} finished after {end - start:.4f} seconds")
 
 
-def wrap(func):
-    """Middleware wrapper for processor callables.
-
-    Wraps a callable to surface and log exceptions with thread context,
-    without altering the return value or re-raising semantics.
-
-    Args:
-        func: The function to wrap (e.g., AbstractProcessor.process).
-
-    Returns:
-        A callable that delegates to func and logs exceptions at DEBUG level.
-
-    Concurrency:
-        - Intended to run inside worker threads managed by the Pipeline's shared executor.
-          Per-processor ordering is enforced by Inbox slot gating (no reentrancy per instance).
-
-    Error handling:
-        - Exceptions are logged with traceback and re-raised unchanged.
-    """
-
-    @functools.wraps(func)
-    def middleware(*args, **kwargs):
-        try:
-            with timeit(func.__qualname__, logger):
-                return func(*args, **kwargs)
-        except Exception:
-            logger.debug(
-                f"exception calling {func.__qualname__} from thread {threading.current_thread().name}",
-                exc_info=True,
-            )
-            raise
-
-    return middleware
-
-
 def retry(max_attempts):
-    """Decorator that retries a callable up to `max_attempts` times.
-
-    Args:
-        max_attempts: Number of attempts. Last failure is logged at error level and re-raised.
-
-    Returns:
-        A decorator that wraps the target function with retry logic.
-
-    Concurrency:
-        - No internal synchronization; suitable to be used in executor threads.
-
-    Error handling:
-        - Logs warnings for intermediate failures and an error on final failure, then re-raises.
-    """
 
     def decorator_retry(func):
         @functools.wraps(func)
@@ -114,7 +65,7 @@ def retry(max_attempts):
                         )
                         raise
                     logger.warning(
-                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed  failed after {elapsed:.4f}s ... retrying",
+                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} failed after {elapsed:.4f}s ... retrying",
                         exc_info=True,
                     )
 
@@ -124,20 +75,6 @@ def retry(max_attempts):
 
 
 class Context:
-    """Execution context provided to processors while handling an event.
-
-    Responsibilities:
-        - Provide submit() API to emit follow-up events back into the pipeline.
-        - Collect emitted events in-order for possible caching/replay.
-        - Provide a done_callback used by the pipeline to handle accounting and errors.
-
-    Concurrency:
-        - Instances are created per dispatch; used within a worker thread managed by the shared executor.
-          Emissions are thread-safe via Pipeline.submit.
-
-    Error handling:
-        - Exceptions in submit() are surfaced; done_callback logs processor failures.
-    """
 
     def __init__(self, pipeline):
         self.pipeline: Pipeline = pipeline
@@ -233,28 +170,6 @@ class Inbox:
 
 
 class Pipeline:
-    """Event dispatch pipeline.
-
-    Registers processors by inferred interests and dispatches incoming events to the appropriate
-    recipients. Maintains global job accounting and provides an orderly shutdown protocol.
-
-    Args:
-        processors: List of processors whose interests are inferred and registered.
-        strict_interest_inference: When True, disable wildcard delivery. Only explicit matches
-            from interest inference receive events.
-        workspace: Optional directory path for caching archives.
-        max_workers: Maximum threads in the shared executor used for processor work.
-
-    Concurrency and ordering:
-        - A single dispatcher thread drains the ready queue in arrival order.
-        - Work executes on a shared ThreadPoolExecutor; per-processor single-concurrency and ordering
-          are enforced by Inbox slot gating (no reentrancy per processor instance).
-        - Global job accounting (jobs, cond) tracks all queued and executing tasks including
-          nested emissions, enabling graceful shutdown.
-
-    Shutdown:
-        - A special "__POISON__" event is enqueued to terminate the dispatcher after all work drains.
-    """
 
     def __init__(
         self,
@@ -266,7 +181,6 @@ class Pipeline:
         **kwargs,
     ):
         super().__init__(**kwargs)
-        # Global job accounting guarded by a condition variable.
         self.jobs = 0
         self.done = 0
         self.cond = threading.Condition()
@@ -317,19 +231,7 @@ class Pipeline:
 
 
     def run(self):
-        """Run the dispatcher loop until the queue drains, then shut down executors.
 
-        Behavior:
-            - Start a single-thread executor for the dispatcher.
-            - Wait until global jobs drop to zero (all work including nested emissions) to reach quiescence.
-            - Submit "__POISON__" so the dispatcher loop can observe termination.
-            - Wait again for job counter to reach zero, ensuring poison handling and final tasks complete.
-            - Executors exit via context managers upon loop termination.
-
-        Notes:
-            - A special "__POISON__" event is consumed by execute_events(), which breaks its loop.
-            - Progress and termination are reported via the module logger.
-        """
         with (
             ThreadPoolExecutor(1) as main_executor,
             ThreadPoolExecutor(self.max_workers) as task_executor,
@@ -346,7 +248,7 @@ class Pipeline:
 
                 phase = 0
                 noop_diff = 0
-                while not stop:
+                while not stop.is_set():
                     print("phase:", phase)
                     q.put(True)
                     # Wait for all outstanding jobs (including nested emissions) to complete.
@@ -434,12 +336,10 @@ class Pipeline:
 
 
     def increment(self):
-        """Increment global job counter."""
         with self.cond:
             self.jobs += 1
 
     def decrement(self):
-        """Decrement global job counter and notify waiters when it reaches zero."""
         with self.cond:
             self.done += 1
             if self.done >= self.jobs:
@@ -451,21 +351,10 @@ class Pipeline:
 
 
 def parse_pattern(p):
-    """Extract an (event_class_id, event_name) pair from a match-case pattern AST.
 
-    Recognized shapes:
-        - ast.MatchClass with kwd_attrs including "name" and a constant pattern for it.
-        - ast.MatchClass without a name constraint (treated as (ClassName, None)).
-        - Nested AST nodes that wrap a pattern (e.g., ast.AST(pattern=...)).
-
-    Returns:
-        Tuple[str | None, str | None]: (ClassIdentifier, EventName) where either may be None.
-        Returns (None, None) when the pattern cannot be interpreted.
-    """
     import ast
 
     def get_class_identifier(node):
-        """Extract a class identifier from Name or Attribute nodes."""
         match node:
             case ast.Name(id=id):
                 return id
@@ -495,19 +384,7 @@ def parse_pattern(p):
 
 
 def infer_interests(func):
-    """Infer processor interests from the AST of its process() function.
 
-    Expectation:
-        - A top-level match statement over the Event parameter with cases that match on
-          Event class and optionally the 'name' attribute.
-
-    Yields:
-        Tuples of (event_class_id | None, event_name | None) for each case discovered.
-
-    Behavior:
-        - If no recognizable match-case is found, yields (None, None) and logs a warning.
-        - If a case cannot be interpreted, logs a warning and yields (None, None) for that case.
-    """
     import ast
     import textwrap
 
@@ -532,19 +409,6 @@ def infer_interests(func):
 
 
 class AbstractProcessor(abc.ABC):
-    """Base class for processors that handle events.
-
-    Responsibilities:
-        - Declare interests (inferred at construction from process()).
-        - Provide an archive() utility to access the caching backend.
-
-    Concurrency:
-        - Per-processor single-concurrency and ordering are enforced by the Pipeline via Inbox gating.
-          Processor instances do not own executors; work is executed on a shared thread pool.
-
-    Notes:
-        - interests is a frozen set of interest tuples inferred by infer_interests().
-    """
 
     def __init__(self, priority: int = 0):
         self.interests = frozenset(infer_interests(self.process))
@@ -552,31 +416,10 @@ class AbstractProcessor(abc.ABC):
 
     @abc.abstractmethod
     def process(self, context: Context, event: Event):
-        """Handle an incoming event and optionally emit follow-up events via context.submit().
-
-        Ordering:
-            - Invocations are serialized per processor instance.
-
-        Error handling:
-            - Exceptions propagate to the future; the pipeline logs them in done_callback.
-        """
         pass
 
     @functools.cache
     def archive(self, workspace: Path):
-        """Return the klepto archive for this processor instance.
-
-        Args:
-            workspace: The root directory for the archive, or None to disable persistence.
-
-        Returns:
-            A klepto archive object. Uses sql_archive per processor class name when workspace
-            is provided; otherwise a null_archive.
-
-        Notes:
-            - The sql_archive backend persists to a sqlite file named after the class. It stores
-              serialized values and is reused across runs when the same workspace is provided.
-        """
         if workspace is None:
             return klepto.archives.null_archive()
         else:
@@ -617,33 +460,6 @@ def caching(
     *,
     debug: bool = True,
 ):
-    """Decorator to cache and deterministically replay emitted events.
-
-    Key:
-        - Digest = sha256(dill.dumps([class_source, event_json])).
-          Using the processor class' source ties the cache to the exact implementation,
-          ensuring cache invalidation when code changes. Event JSON provides the input key.
-
-    Behavior:
-        - On cache hit: resubmit the archived sequence of emitted events to the pipeline.
-        - On cache miss: run the function, collect context.events in order, and archive the tuple.
-
-    Args:
-        func: The function to decorate (processor.process). When omitted, returns a configured decorator.
-        debug: If True, logs digest values and cache hits at DEBUG level.
-
-    Concurrency:
-        - Safe to use within the single-threaded processor executor; submissions are delegated
-          to the pipeline which handles synchronization.
-
-    Caveats:
-        - Only emitted events are captured. External side effects are not recorded and will
-          not be replayed. Emission order should be deterministic for meaningful replay.
-
-    Archive backend:
-        - Obtained via AbstractProcessor.archive(workspace) which uses a klepto sql_archive
-          when a workspace directory is configured, keyed per processor class.
-    """
 
     def decorator(func):
         @functools.wraps(func)

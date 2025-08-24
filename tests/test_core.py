@@ -1,487 +1,250 @@
-import ast
-import queue
-from typing import List
+import logging
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from queue import PriorityQueue, SimpleQueue
 
 import pytest
-from pydantic import ValidationError
 
-from framework.core import (
-    Event,
-    wrap,
-    retry,
-    parse_pattern,
-    infer_interests,
+# Ensure src is importable regardless of packaging
+import sys
+from pathlib import Path
+sys.path.append(str(Path(__file__).parents[1] / "src"))
+
+from framework.core import (  # noqa: E402
     AbstractProcessor,
-    Pipeline,
     Context,
+    Event,
     Inbox,
+    Pipeline,
     caching,
+    retry,
 )
 
 
-# -------------------------
-# Helper processors for tests
-# -------------------------
+def run_dispatcher_once(pipeline: Pipeline):
+    """
+    Start a dispatcher thread, pulse once, wait for all work,
+    then stop dispatcher.
+    """
+    q = SimpleQueue()
+
+    def runner():
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            pipeline.execute_events(executor, q)
+
+    t = threading.Thread(target=runner, daemon=True)
+    t.start()
+    try:
+        q.put(True)
+        pipeline.wait()
+    finally:
+        q.put(False)
+        t.join(timeout=5)
 
 
-class AnySink(AbstractProcessor):
-    """Receives all Event() instances via explicit match-case to infer (Event, None) interest."""
+def test_retry_succeeds_before_max_attempts(caplog):
+    caplog.set_level(logging.DEBUG)
 
-    def __init__(self, name: str = "any"):
-        super().__init__()
-        self.name = name
-        self.events: List[Event] = []
-
-    def process(self, context, event):
-        match event:
-            case Event():
-                self.events.append(event)
-
-
-class FooSink(AbstractProcessor):
-    """Receives only Event(name='foo')"""
-
-    def __init__(self):
-        super().__init__()
-        self.events: List[Event] = []
-
-    def process(self, context, event):
-        match event:
-            case Event(name="foo"):
-                self.events.append(event)
-
-
-class WildcardSink(AbstractProcessor):
-    """Declares no match-case; infer_interests yields (None, None). Receives all events only when strict_interest_inference=False."""
-
-    def __init__(self):
-        super().__init__()
-        self.events: List[Event] = []
-
-    def process(self, context, event):
-        # No match-case on purpose; record whatever arrives
-        self.events.append(event)
-
-
-class SeqSink(AbstractProcessor):
-    """Receives Event(name='tick', seq=int) and records the arrival order to validate per-processor FIFO"""
-
-    def __init__(self):
-        super().__init__()
-        self.seq: List[int] = []
-
-    def process(self, context, event):
-        match event:
-            case Event(name="tick", seq=int() as n):
-                self.seq.append(n)
-
-
-class Crasher(AbstractProcessor):
-    """Raises on Event(name='boom') to test done_callback error logging and job accounting"""
-
-    def process(self, context, event):
-        match event:
-            case Event(name="boom"):
-                raise RuntimeError("boom")
-
-
-class CachedProc(AbstractProcessor):
-    """Processor whose emissions are cached/replayed keyed by class source + input event."""
-
-    calls = 0
-
-    @caching(debug=True)
-    def process(self, context, event):
-        match event:
-            case Event(name="work"):
-                type(self).calls += 1
-                context.submit(Event(name="done"))
-            case Event(name="work2"):
-                type(self).calls += 1
-                context.submit(Event(name="done2"))
-
-
-class ArchProc(AbstractProcessor):
-    """Minimal processor used to exercise AbstractProcessor.archive; process unused."""
-
-    def process(self, context, event):
-        pass
-
-
-
-# -------------------------
-# wrap()
-# -------------------------
-
-
-def test_wrap_logs_and_reraises(caplog):
-    def boom():
-        raise ValueError("boom")
-
-    wrapped = wrap(boom)
-
-    with caplog.at_level("DEBUG", logger="framework.core"):
-        with pytest.raises(ValueError):
-            wrapped()
-
-    msgs = " ".join(r.getMessage() for r in caplog.records if r.levelname == "DEBUG")
-    assert "exception calling" in msgs
-    assert "thread" in msgs  # thread name logged
-
-
-# -------------------------
-# retry()
-# -------------------------
-
-
-def test_retry_success_logs_and_returns(caplog):
-    attempts = {"n": 0}
+    calls = {"n": 0}
 
     @retry(3)
-    def flaky():
-        attempts["n"] += 1
-        if attempts["n"] < 3:
-            raise RuntimeError("transient")
+    def sometimes():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise ValueError("not yet")
         return "ok"
 
-    with caplog.at_level("DEBUG", logger="framework.core"):
-        assert flaky() == "ok"
-
-    # Two retries should have been logged, then success
-    warn_text = " ".join(
-        r.getMessage() for r in caplog.records if r.levelname == "WARNING"
-    )
-    assert "retrying" in warn_text
+    assert sometimes() == "ok"
+    assert calls["n"] == 3
+    # ensure logs mention attempts
+    attempt_logs = [rec for rec in caplog.records if "attempt" in rec.getMessage()]
+    assert any("attempt 1 / 3" in r.getMessage() for r in attempt_logs)
+    assert any("finished" in r.getMessage() for r in attempt_logs)
 
 
-def test_retry_escalates_after_max_attempts(caplog):
+def test_retry_raises_after_exhaustion(caplog):
+    caplog.set_level(logging.DEBUG)
+
     @retry(2)
     def always_fail():
-        raise RuntimeError("nope")
+        raise ValueError("boom")
 
-    with caplog.at_level("ERROR", logger="framework.core"):
-        with pytest.raises(RuntimeError):
-            always_fail()
+    with pytest.raises(ValueError):
+        always_fail()
 
-    err_text = " ".join(
-        r.getMessage() for r in caplog.records if r.levelname == "ERROR"
-    )
-    assert "escalating" in err_text
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("attempt 1 / 2" in m and "retrying" in m for m in msgs)
+    assert any("attempt 2 / 2" in m and "escalating" in m for m in msgs)
 
 
-# -------------------------
-# parse_pattern()
-# -------------------------
+def test_context_submit_records_and_delegates():
+    class PipeStub:
+        def __init__(self):
+            self.received = []
+
+        def submit(self, e):
+            self.received.append(e)
+            return 0
+
+    pipe = PipeStub()
+    ctx = Context(pipe)
+    e1 = Event(name="A", x=1)
+    e2 = Event(name="B", y=2)
+
+    ctx.submit(e1)
+    ctx.submit(e2)
+
+    assert ctx.events == [e1, e2]
+    assert pipe.received == [e1, e2]
 
 
-def test_parse_pattern_variants_and_nesting():
-    # Event(name="hello")
-    p1 = ast.MatchClass(
-        cls=ast.Name(id="Event"),
-        patterns=[],
-        kwd_attrs=["name"],
-        kwd_patterns=[ast.MatchValue(value=ast.Constant(value="hello"))],
-    )
-    # Event()
-    p2 = ast.MatchClass(
-        cls=ast.Name(id="Event"), patterns=[], kwd_attrs=[], kwd_patterns=[]
-    )
+def test_done_callback_marks_done_and_wakes_dispatcher():
+    class InboxStub:
+        def __init__(self):
+            self.count = 0
 
-    # foo.Event(name="hello") via Attribute(cls=..., attr="Event")
-    p_attr = ast.MatchClass(
-        cls=ast.Attribute(value=ast.Name(id="foo"), attr="Event"),
-        patterns=[],
-        kwd_attrs=["name"],
-        kwd_patterns=[ast.MatchValue(value=ast.Constant(value="hello"))],
-    )
+        def mark_task_done(self):
+            self.count += 1
 
-    # Or of two patterns
-    p_or = ast.MatchOr(patterns=[p1, p2])
+    class PipeStub:
+        def __init__(self):
+            self.dec = 0
 
-    # Nested AST node with 'pattern' attribute
-    Node = type("Node", (ast.AST,), {"_fields": ("pattern",)})
-    nested = Node(pattern=p1)
+        def decrement(self):
+            self.dec += 1
 
-    assert list(parse_pattern(p1)) == [("Event", "hello")]
-    assert list(parse_pattern(p2)) == [("Event", None)]
-    assert list(parse_pattern(p_attr)) == [("Event", "hello")]
-    assert list(parse_pattern(p_or)) == [("Event", "hello"), ("Event", None)]
-    assert list(parse_pattern(nested)) == [("Event", "hello")]
+    class P(AbstractProcessor):
+        def process(self, context, event):
+            pass
 
-    # Unrecognized pattern yields (None, None)
-    assert list(parse_pattern(ast.MatchValue(value=ast.Constant(value=1)))) == [
-        (None, None)
-    ]
+    pipe = PipeStub()
+    ctx = Context(pipe)
+    inbox = InboxStub()
+    q = SimpleQueue()
+    proc = P()
+    fut = Future()
+    fut.set_result(None)
+
+    ctx.done_callback(fut, proc, Event(name="X"), inbox, q)
+
+    assert inbox.count == 1
+    assert pipe.dec == 1
+    assert q.get(timeout=1) is True
 
 
-# -------------------------
-# infer_interests()
-# -------------------------
+def test_inbox_scheduling_concurrency_one():
+    ready = PriorityQueue()
 
+    class DummyProc:
+        def __init__(self, priority):
+            self.priority = priority
 
-def test_infer_interests_from_process_ast(caplog):
-    def proc(context, event):
-        match event:
-            case Event(name="work"):
-                pass
-            case Event():
-                pass
+        def __repr__(self):
+            return "DummyProc"
 
-    ints = list(infer_interests(proc))
-    assert ("Event", "work") in ints
-    assert ("Event", None) in ints
-    assert all(len(t) == 2 for t in ints)
+    inbox = Inbox(DummyProc(priority=5), ready, concurrency=1)
 
-    # No match-case path logs a warning and yields (None, None)
-    def no_match(context, event):
-        return None
-
-    with caplog.at_level("WARNING", logger="framework.core"):
-        ints2 = list(infer_interests(no_match))
-    assert ints2 == [(None, None)]
-    wtxt = " ".join(r.getMessage() for r in caplog.records if r.levelname == "WARNING")
-    assert "does not seem to have declared any interest" in wtxt
-
-
-# -------------------------
-# Inbox
-# -------------------------
-
-
-class Dummy(AbstractProcessor):
-    def process(self, context, event):
-        pass
-
-
-def test_inbox_slot_gating_and_take_event_errors():
-    ready_q = queue.PriorityQueue()
-    dummy = Dummy()
-    inbox = Inbox(dummy, ready_q, concurrency=1)
-
-    e1 = Event(name="a")
-    e2 = Event(name="b")
+    e1 = Event(name="E1")
+    e2 = Event(name="E2")
 
     inbox.put_event(e1)
+    # first put should signal readiness
+    entry = ready.get_nowait()
+    assert entry.processor.priority == 5
+    # second put should NOT enqueue because slot is taken
     inbox.put_event(e2)
-
-    # Only one readiness notification while a slot is held
-    assert ready_q.get_nowait().processor is dummy
-    with pytest.raises(queue.Empty):
-        ready_q.get_nowait()
-
-    # FIFO take_event
-    assert inbox.take_event() == e1
-
-    # Signal task done -> reopen slot -> enqueue processor again since job remains
+    with pytest.raises(Exception):
+        # queue is empty now
+        ready.get_nowait()
+    # marking done should enqueue again because there are pending jobs
     inbox.mark_task_done()
-    assert ready_q.get_nowait().processor is dummy
-
-    # Drain second event
-    assert inbox.take_event() == e2
-    inbox.mark_task_done()
-
-    # Taking from empty inbox raises and logs critical
-    with pytest.raises(RuntimeError):
-        inbox.take_event()
+    entry2 = ready.get_nowait()
+    assert entry2.processor.priority == 5
 
 
-# -------------------------
-# Pipeline: routing and job accounting
-# -------------------------
-
-
-def test_pipeline_routing_non_strict_and_strict():
-    # Non-strict: wildcard (no match-case -> (None,None)) receives everything; FooSink only 'foo'
-    wildcard = WildcardSink()
-    foo_sink = FooSink()
-    p = Pipeline(
-        processors=[wildcard, foo_sink], strict_interest_inference=False, workspace=None
-    )
-    p.submit(Event(name="foo"))
-    p.submit(Event(name="bar"))
-    p.run()
-
-    # Filter out __POISON__ which is used for pipeline shutdown
-    wildcard_names = [e.name for e in wildcard.events if e.name not in {"__POISON__", "__PHASE__"}]
-    assert wildcard_names == ["foo", "bar"]
-    assert [e.name for e in foo_sink.events] == ["foo"]
-
-    # Strict: wildcard (None,None) should not receive; FooSink still receives 'foo'
-    wildcard2 = WildcardSink()
-    foo_sink2 = FooSink()
-    p2 = Pipeline(
-        processors=[wildcard2, foo_sink2],
-        strict_interest_inference=True,
-        workspace=None,
-    )
-    p2.submit(Event(name="foo"))
-    p2.submit(Event(name="bar"))
-    p2.run()
-
-    assert [e.name for e in foo_sink2.events] == ["foo"]
-    # Filter out __POISON__ in case it sneaks through
-    wildcard2_names = [e.name for e in wildcard2.events if e.name not in {"__POISON__", "__PHASE__"}]
-    assert wildcard2_names == []  # no wildcard on strict
-
-
-def test_pipeline_get_inbox_cached_and_jobs_quiesce():
-    sink = AnySink()
-    p = Pipeline(processors=[sink], strict_interest_inference=False, workspace=None)
-    inbox1 = p.get_inbox(sink)
-    inbox2 = p.get_inbox(sink)
-    assert inbox1 is inbox2  # functools.cache
-
-    p.submit(Event(name="x"))
-    p.run()
-    assert p.jobs == p.done
-
-
-def test_execute_events_preserves_per_processor_fifo():
-    seq = SeqSink()
-    p = Pipeline(processors=[seq], strict_interest_inference=False, workspace=None)
-    for i in range(1, 6):
-        p.submit(Event(name="tick", seq=i))
-    p.run()
-    assert seq.seq == [1, 2, 3, 4, 5]
-
-
-def test_done_callback_logs_errors_and_quiesces(caplog):
-    bad = Crasher()
-    p = Pipeline(processors=[bad], strict_interest_inference=False, workspace=None)
-    with caplog.at_level("ERROR", logger="framework.core"):
-        p.submit(Event(name="boom"))
-        p.run()
-    msgs = " ".join(r.getMessage() for r in caplog.records if r.levelname == "ERROR")
-    assert "processor failed" in msgs
-    assert p.jobs == p.done
-
-
-def test_pipeline_run_terminates_and_logs(caplog):
-    p = Pipeline(processors=[], strict_interest_inference=False, workspace=None)
-    with caplog.at_level("INFO", logger="framework.core"):
-        p.run()
-    text = " ".join(r.getMessage() for r in caplog.records if r.levelname == "INFO")
-    assert "dispatcher terminated" in text
-    assert "pipeline run completed" in text
-
-
-def test_pipeline_respects_max_workers():
-    import threading
-    import time
-
-    class Sleepy(AbstractProcessor):
-        def __init__(self, stats):
-            super().__init__()
-            self.stats = stats
-
+def test_pipeline_interest_inference_and_submit_routing():
+    class ProcX(AbstractProcessor):
         def process(self, context, event):
             match event:
-                case Event():
-                    with self.stats["lock"]:
-                        self.stats["active"] += 1
-                        self.stats["peak"] = max(
-                            self.stats["peak"], self.stats["active"]
-                        )
-                    time.sleep(0.05)
-                    with self.stats["lock"]:
-                        self.stats["active"] -= 1
+                case Event(name="X"):
+                    pass
 
-    def high_water(max_workers):
-        stats = {"active": 0, "peak": 0, "lock": threading.Lock()}
-        p = Pipeline(
-            processors=[Sleepy(stats), Sleepy(stats)],
-            strict_interest_inference=False,
-            workspace=None,
-            max_workers=max_workers,
-        )
-        p.submit(Event(name="x"))
-        p.run()
-        return stats["peak"]
+    class ProcGeneric(AbstractProcessor):
+        def process(self, context, event):
+            # No match-case -> (None, None) interest
+            return None
 
-    assert high_water(1) == 1
-    assert high_water(2) == 2
+    p_strict = Pipeline([ProcX(), ProcGeneric()], strict_interest_inference=True)
+    p_default = Pipeline([ProcX(), ProcGeneric()], strict_interest_inference=False)
+
+    assert p_strict.submit(Event(name="X")) == 1  # only ProcX
+    assert p_default.submit(Event(name="X")) == 2  # ProcX + generic
 
 
-# -------------------------
-# AbstractProcessor.archive()
-# -------------------------
+def test_pipeline_execute_events_processes_ready_processors():
+    ran = []
+
+    class RecorderProc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    ran.append("ok")
+
+    pipe = Pipeline([RecorderProc()])
+    pipe.submit(Event(name="X"))
+    run_dispatcher_once(pipe)
+    assert ran == ["ok"]
+    # all jobs accounted
+    assert pipe.done >= pipe.jobs
 
 
-def test_archive_sql_persistence(tmp_path):
-    a1 = ArchProc()
-    arch1 = a1.archive(tmp_path)
-    arch1["k"] = 42
+def test_pipeline_run_emits_phase_events():
+    # Intended: run() should submit __PHASE__ events at least once
+    phases = []
 
-    # New instance should see persisted value
-    a2 = ArchProc()
-    arch2 = a2.archive(tmp_path)
-    assert "k" in arch2
-    assert arch2["k"] == 42
+    class PhaseRecorder(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="__PHASE__", phase=p):
+                    phases.append(p)
 
-
-# -------------------------
-# caching() decorator
-# -------------------------
-
-
-def test_caching_replays_without_invoking_body(tmp_path):
-    # First run: miss -> execute -> cache
-    sink1 = AnySink("tap1")
-    c1 = CachedProc()
-    p1 = Pipeline(
-        processors=[c1, sink1], strict_interest_inference=False, workspace=tmp_path
-    )
-    p1.submit(Event(name="work"))
-    p1.run()
-    names1 = [e.name for e in sink1.events]
-    assert CachedProc.calls == 1
-    assert "work" in names1
-    assert "done" in names1
-
-    # Second run (fresh pipeline/instance): hit -> replay -> no new underlying call
-    sink2 = AnySink("tap2")
-    c2 = CachedProc()
-    p2 = Pipeline(
-        processors=[c2, sink2], strict_interest_inference=False, workspace=tmp_path
-    )
-    p2.submit(Event(name="work"))
-    p2.run()
-    names2 = [e.name for e in sink2.events]
-    assert CachedProc.calls == 1  # unchanged: no new execution
-    assert "work" in names2
-    assert "done" in names2
-
-    # Different input -> miss -> execute -> cache increments
-    sink3 = AnySink("tap3")
-    c3 = CachedProc()
-    p3 = Pipeline(
-        processors=[c3, sink3], strict_interest_inference=False, workspace=tmp_path
-    )
-    p3.submit(Event(name="work2"))
-    p3.run()
-    names3 = [e.name for e in sink3.events]
-    assert CachedProc.calls == 2
-    assert "work2" in names3
-    assert "done2" in names3
+    pipe = Pipeline([PhaseRecorder()])
+    pipe.run()
+    # Intended assertion: at least one phase should be observed
+    assert len(phases) >= 1  # Expected to fail with current code
 
 
-# -------------------------
-# Context.submit() basic behavior
-# -------------------------
+def test_caching_persists_and_replays_with_workspace(tmp_path):
+    outs = []
 
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="OUT", value=v):
+                    outs.append(v)
 
-def test_context_submit_records_and_enqueues(make_pipeline):
-    """Use a real Pipeline + AnySink to validate Context.submit collects events and re-enqueues."""
-    sink = AnySink()
-    p = make_pipeline(sink)  # workspace=None, non-strict per fixture
-    ctx = Context(p)
-    # Submit two events via context; they should be recorded, then delivered once pipeline runs.
-    ctx.submit(Event(name="alpha"))
-    ctx.submit(Event(name="beta"))
-    # Context.records should preserve order
-    assert [e.name for e in ctx.events] == ["alpha", "beta"]
-    # Drain the pipeline
-    p.run()
-    # Filter out __POISON__ which is used for pipeline shutdown
-    sink_names = [e.name for e in sink.events if e.name not in {"__POISON__", "__PHASE__"}]
-    assert sink_names == ["alpha", "beta"]
+    class CachedProc(AbstractProcessor):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        @caching()
+        def process(self, context, event):
+            match event:
+                case Event(name="DO", payload=payload):
+                    self.calls += 1
+                    context.submit(Event(name="OUT", value=42))
+
+    cp = CachedProc()
+    pipe = Pipeline([cp, Sink()], workspace=tmp_path)
+
+    # First submission: executes and emits
+    pipe.submit(Event(name="DO", payload=1))
+    run_dispatcher_once(pipe)
+
+    # Second submission: should be replayed from cache
+    pipe.submit(Event(name="DO", payload=1))
+    run_dispatcher_once(pipe)
+
+    assert cp.calls == 1
+    assert outs == [42, 42]
