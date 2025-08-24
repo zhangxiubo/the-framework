@@ -1,6 +1,6 @@
 import networkx as nx
 
-from framework.core import Pipeline
+from framework.core import Context, Pipeline
 from framework.reactive import Collector, ReactiveBuilder, ReactiveEvent, reactive
 
 
@@ -9,7 +9,7 @@ def test_bfs():
 
     @reactive("n", ["n"])
     class BFSWalker(ReactiveBuilder):
-        def build(self, context, target, node, *args, **kwargs):
+        def build(self, context: Context, node, *args, **kwargs):
             print("visiting", node)
             for n in g.neighbors(node):
                 yield n

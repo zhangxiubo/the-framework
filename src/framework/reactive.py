@@ -6,7 +6,7 @@ import logging
 from pathlib import Path
 import re
 import abc
-from collections import OrderedDict, defaultdict, ChainMap
+from collections import OrderedDict, defaultdict, ChainMap, deque
 from typing import Any, Collection, List
 from collections.abc import Callable, Iterable
 from smart_open import open
@@ -90,35 +90,33 @@ class ReactiveBuilder(AbstractProcessor):
         self,
         provides: str,
         requires: Collection[str],
-        cache: bool = False,
+        persist: bool = False,
         priority=0,
         **kwargs,
     ):
         super().__init__(priority=priority, **kwargs)
         self.provides: str = provides
-        self.matcher = re.compile(self.provides)
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
         self.handlers = {self.new,  self.listen}
-        self.known_targets = set()
-        self.input_store = defaultdict(CustomSet)  # requrie -> artifacts (ingridents)
-        self.persist = cache
+        self.input_store = defaultdict(deque)  # requrie -> artifacts (ingridents)
+        self.persist = persist
 
     @functools.cache
-    def _get_cache(self, target: str, workspace: Path):
+    def _get_cache(self, workspace: Path):
         match self.persist:
             case True:
                 assert workspace is not None
-                return self.archive(workspace.joinpath(target))
+                return self.archive(workspace)
             case False:
                 assert workspace is None
                 return dict()
 
-    def get_cache(self, target, context):
+    def get_cache(self, context):
         match self.persist:
             case True:
-                return self._get_cache(target, context.pipeline.workspace)
+                return self._get_cache(context.pipeline.workspace)
             case False:
-                return self._get_cache(target, None)
+                return self._get_cache(None)
 
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
@@ -131,8 +129,7 @@ class ReactiveBuilder(AbstractProcessor):
             case Event(name="__POISON__") as e:
                 self.on_terminate(context, e)
             case Event(name="__PHASE__", phase=phase) as e:
-                for target in self.known_targets:
-                    self.phase(context, target, phase)
+                self.phase(context, phase)
 
     def publish(self, context: Context, input_target: str, new_artifact: Any):
         """Attempt to build and emit artifacts for all known targets.
@@ -143,24 +140,31 @@ class ReactiveBuilder(AbstractProcessor):
         artifacts in the cache keyed by the combo key. No-op if no known targets yet.
         """
         # immediately tries to trigger builds
-        input_store = ChainMap({input_target: [new_artifact]}, self.input_store)
-        for key in itertools.product(
-            *[input_store[require] for require in self.requires]
-        ):
+        # input_store = ChainMap({input_target: [new_artifact]}, self.input_store)
+        # print(list(zip(*[self.input_store[require][:1] for require in self.requires])))
+
+        for key in list(zip(
+            *[self.input_store[require] for require in self.requires]
+        )):
             skey = deepdiff.DeepHash(key)[key]
-            for target in self.known_targets:
-                if skey not in self.get_cache(target, context):
-                    artifacts = self.build(context, target, *key)
-                    assert isinstance(artifacts, Iterable)
-                    collected = list()
-                    for artifact in artifacts:
-                        context.submit(
-                            ReactiveEvent(
-                                name="built", target=target, artifact=artifact
-                            )
+            if skey not in self.get_cache(context):
+                artifacts = self.build(context, *key)
+                assert isinstance(artifacts, Iterable)
+                collected = list()
+                for artifact in artifacts:
+                    context.submit(
+                        ReactiveEvent(
+                            name="built", target=self.provides, artifact=artifact
                         )
-                        collected.append(artifact)
-                    self.get_cache(target, context)[skey] = collected
+                    )
+                    collected.append(artifact)
+                self.get_cache(context)[skey] = collected
+            for require in self.requires:
+                self.input_store[require].popleft()
+            
+
+            
+            
 
     def new(self, context: Context, event: ReactiveEvent):
         """Handle initial resolve(target) for provides.
@@ -170,9 +174,7 @@ class ReactiveBuilder(AbstractProcessor):
               submit resolve for each require to kick downstream producers, and attempt publish().
         """
         match event:
-            case ReactiveEvent(name="resolve", target=target) if self.matcher.fullmatch(
-                target
-            ):
+            case ReactiveEvent(name="resolve", target=target) if self.provides == target:
                 self.handlers -= {self.new}
                 self.reply(context, event)           
                 self.publish(
@@ -195,16 +197,13 @@ class ReactiveBuilder(AbstractProcessor):
         - Calls publish() to produce any newly available combos.
         """
         match event:
-            case ReactiveEvent(name="resolve", target=target) if self.matcher.fullmatch(
-                target
-            ):
-                self.known_targets.add(target)
+            case ReactiveEvent(name="resolve", target=target) if self.provides == target:
                 # someone is asking for "target"
                 # we should tell them about all the things we know about target
                 # by publishing all the values we have built for target
                 # the values we publish shall be picked up by all who are interested
                 # the initial blanket "resolve-broadcast" hopefully should be brief
-                for artifacts in self.get_cache(target, context).values():
+                for artifacts in self.get_cache(context).values():
                     # retrieve the things we have built for target
                     # build_cache will be a dictionary indexed by target and whose value is another ordered dictionary that maps key -> artifact
                     for artifact in artifacts:
@@ -223,14 +222,14 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent(name="built", target=target, artifact=artifact) if (
                 target in self.requires
             ):
-                self.input_store[target].add(artifact)
+                self.input_store[target].append(artifact)
                 self.publish(context, target, artifact)
 
     @abc.abstractmethod
-    def build(self, context: Context, target: str, *args, **kwargs):
+    def build(self, context: Context, *args, **kwargs):
         pass
 
-    def phase(self, context: Context, target: str, phase: int):
+    def phase(self, context: Context, phase: int):
         pass
 
     def on_terminate(self, context: Context, event: Event):
@@ -240,23 +239,8 @@ class ReactiveBuilder(AbstractProcessor):
 def reactive(
     provides: str,
     requires: List[str],
-    cache: bool = False,
+    persist: bool = False,
 ):
-    """Class decorator to bind provides/requires for ReactiveBuilder subclasses.
-
-    Args:
-        provides: The provided topic name or regex pattern for the reactive builder.
-        requires: A list of prerequisite topic names (duplicates are deduplicated preserving order).
-        cache: When True, enable persistent combo-level caching of emitted built() events keyed by
-               [class source, provides pattern, target, ordered input digests], using the archive
-               from AbstractProcessor.archive(). Resolve events are not cached.
-        **kwargs: Forwarded to the `ReactiveBuilder` constructor (e.g., `build_policy`).
-    Example:
-        @reactive(provides="A", requires=["X", "Y"])
-        class JoinXY(ReactiveBuilder):
-            def build(self, context, target, x, y):
-                yield (x, y)
-    """
 
     def decorator(cls):
         assert issubclass(cls, ReactiveBuilder)
@@ -264,7 +248,7 @@ def reactive(
             cls.__init__,
             provides=provides,
             requires=list(requires),
-            cache=cache,
+            persist=persist,
         )
         return cls
 
@@ -272,46 +256,27 @@ def reactive(
 
 
 class Collector(ReactiveBuilder):
-    """Accumulate built() arguments from multiple topics and emit snapshots on phases.
-
-    - Requires = topics; Provides = forwards_to.
-    - build() records each incoming args tuple and yields nothing.
-    - On each __PHASE__, if the accumulated list changed since last emission, emit a
-      built(forwards_to, artifact=copy_of_values) and update last. Initial last=None
-      ensures at least one emission once values arrive.
-    """
 
     def __init__(self, forwards_to, topics, limit=None):
-        super().__init__(forwards_to, topics, cache=False)
+        super().__init__(forwards_to, topics, persist=False)
         self.values = list()
         self.last = None  # setting last to None gurantees that the collector shall publish at least once during the initial phasing
         self.limit = float("inf") if limit is None else limit
 
-    def build(self, context, target, *args, **kwargs):
-        """Record the received args tuple; do not emit immediately. Emission happens in phase()."""
+    def build(self, context, *args, **kwargs):
         if len(self.values) < self.limit:
             self.values.append(args)
         yield from []
 
-    def phase(self, context, target, phase):
-        """On each phase, emit a snapshot if values changed since last emission."""
+    def phase(self, context, phase):
         if self.values != self.last:
             context.submit(
-                ReactiveEvent(name="built", target=target, artifact=self.values)
+                ReactiveEvent(name="built", target=self.provides, artifact=self.values)
             )
             self.last = list(self.values)
 
 
 class StreamGrouper(ReactiveBuilder):
-    """Group consecutive stream items by key, emitting the previous group on key change.
-
-    - keyfunc: computes the grouping key from the args.
-    - Maintains (lastkey, lastset). When a new key arrives:
-        - If same as lastkey: append args to lastset.
-        - If different: yield (lastkey, lastset) then reset to new key with empty set.
-    - Initial emission yields (None, []) before the first key.
-    - No final flush is performed at end of stream.
-    """
 
     def __init__(
         self,
@@ -319,7 +284,7 @@ class StreamGrouper(ReactiveBuilder):
         requires,
         keyfunc: Callable[..., Any],
     ):
-        super().__init__(provides, requires, cache=False)
+        super().__init__(provides, requires, persist=False)
         self.lastkey = None
         self.lastset = list()
         self.keyfunc = keyfunc
@@ -327,7 +292,6 @@ class StreamGrouper(ReactiveBuilder):
     def build(
         self,
         context,
-        target,
         *args,
     ):
         thiskey = self.keyfunc(*args)
@@ -337,6 +301,13 @@ class StreamGrouper(ReactiveBuilder):
             yield self.lastkey, self.lastset
             self.lastkey = thiskey
             self.lastset = list()
+            self.lastset.append(args)
+
+    def phase(self, context, phase):
+        if self.lastkey is not None:
+            yield self.lastkey, self.lastset
+        self.lastkey = None
+        self.lastset = list()
 
 
 class JsonLSink(ReactiveBuilder):
@@ -348,11 +319,11 @@ class JsonLSink(ReactiveBuilder):
     """
 
     def __init__(self, name: str, filepath: str, compression="infer_from_extension"):
-        super().__init__(name, [name], cache=False, priority=-100)
+        super().__init__(name, [name], persist=False, priority=-100)
         self.filepath = filepath
         self.file = open(self.filepath, "wt", compression=compression)
 
-    def build(self, context, target, item):
+    def build(self, context, item):
         assert isinstance(item, BaseModel)
         self.file.writelines((item.model_dump_json(), "\n"))
         self.file.flush()
@@ -372,7 +343,7 @@ class JsonLSource(ReactiveBuilder):
         limit=None,
         compression="infer_from_extension",
     ):
-        super().__init__(name, [], cache=False, priority=100)
+        super().__init__(name, [], persist=False, priority=100)
         self.filepath = filepath
         assert issubclass(itemtype, BaseModel)
         self.itemtype = itemtype
@@ -382,7 +353,6 @@ class JsonLSource(ReactiveBuilder):
     def build(
         self,
         context,
-        target,
     ):
         for i, line in enumerate(self.file):
             if i < self.limit:
