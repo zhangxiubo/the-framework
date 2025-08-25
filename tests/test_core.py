@@ -248,3 +248,126 @@ def test_caching_persists_and_replays_with_workspace(tmp_path):
 
     assert cp.calls == 1
     assert outs == [42, 42]
+def test_infer_interests_match_or_routing():
+    ran = []
+
+    class OrProc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="A") | Event(name="B"):
+                    ran.append(event.name)
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            pass
+
+    p = Pipeline([OrProc(), Sink()], strict_interest_inference=True)
+    p.submit(Event(name="A"))
+    p.submit(Event(name="B"))
+    run_dispatcher_once(p)
+    assert ran == ["A", "B"]
+
+
+def test_inbox_take_event_empty_raises():
+    from queue import PriorityQueue
+
+    class Proc:
+        def __init__(self):
+            self.priority = 0
+        def __repr__(self):
+            return "Proc"
+
+    inbox = Inbox(Proc(), PriorityQueue(), concurrency=1)
+    import pytest
+    with pytest.raises(RuntimeError):
+        inbox.take_event()
+
+
+def test_timeit_logs_debug(caplog):
+    import logging
+    from framework.core import timeit as timeit_ctx
+
+    logger = logging.getLogger("framework.core.tests.timeit")
+    caplog.set_level(logging.DEBUG, logger=logger.name)
+
+    with timeit_ctx("unit-test-block", logger):
+        pass
+
+    msgs = [r.getMessage() for r in caplog.records if r.name == logger.name]
+    assert any("unit-test-block finished after" in m for m in msgs)
+
+
+def test_caching_no_workspace_no_replay():
+    outs = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="OUT", value=v):
+                    outs.append(v)
+
+    class CachedNoWS(AbstractProcessor):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        @caching()
+        def process(self, context, event):
+            match event:
+                case Event(name="IN", data=d):
+                    self.calls += 1
+                    context.submit(Event(name="OUT", value=d * 2))
+
+    proc = CachedNoWS()
+    p = Pipeline([proc, Sink()])  # workspace=None -> no replay
+    p.submit(Event(name="IN", data=1))
+    run_dispatcher_once(p)
+    p.submit(Event(name="IN", data=1))
+    run_dispatcher_once(p)
+
+    assert proc.calls == 1
+    assert outs == [2, 2]
+
+
+def test_caching_exception_then_replay(tmp_path):
+    outs = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="OUT", value=v):
+                    outs.append(v)
+
+    class SometimesFails(AbstractProcessor):
+        def __init__(self):
+            super().__init__()
+            self.calls = 0
+
+        @caching()
+        def process(self, context, event):
+            match event:
+                case Event(name="TRIGGER", key=k):
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise RuntimeError("first attempt fails")
+                    context.submit(Event(name="OUT", value=99))
+
+    proc = SometimesFails()
+    p = Pipeline([proc, Sink()], workspace=tmp_path)
+
+    # 1st call: fails, no cache
+    import pytest
+    with pytest.raises(RuntimeError):
+        # submit+dispatcher to surface exception via done_callback logging; we directly invoke process to raise in test
+        proc.process(Context(p), Event(name="TRIGGER", key="same"))  # raise directly
+
+    # 2nd call: success and caches events
+    p.submit(Event(name="TRIGGER", key="same"))
+    run_dispatcher_once(p)
+
+    # 3rd call: should replay, not execute process
+    p.submit(Event(name="TRIGGER", key="same"))
+    run_dispatcher_once(p)
+
+    assert proc.calls == 2  # third call replayed
+    assert outs == [99, 99]

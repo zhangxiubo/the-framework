@@ -195,3 +195,134 @@ def test_jsonlsource_build_yields_items_direct_call(tmp_path):
     src = JsonLSource(name="X", filepath=str(p), itemtype=Item, limit=2)
     items = list(src.build(context=None))
     assert [i.a for i in items] == [1, 2]
+def test_listen_ignores_non_required_targets():
+    seen = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case ReactiveEvent(name="built", target="Y", artifact=a):
+                    seen.append(a)
+
+    class Bldr(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X"], persist=False)
+            self.build_calls = 0
+
+        def build(self, context, *args, **kwargs):
+            self.build_calls += 1
+            # if called, emit something (should not be called for unrelated targets)
+            yield 999
+
+    b = Bldr()
+    pipe = Pipeline([b, Sink()])
+
+    # send built for unrelated target; builder should ignore it
+    pipe.submit(ReactiveEvent(name="built", target="Z", artifact=1))
+    run_dispatcher_once(pipe)
+
+    assert b.build_calls == 0
+    assert seen == []
+
+
+def test_get_cache_memoization_persist_false():
+    # get_cache should return the same dict instance each time for persist=False
+    class Bldr(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X"], persist=False)
+        def build(self, context, *args, **kwargs):
+            yield from []
+
+    from framework.core import Context
+    p = Pipeline([Bldr()])
+    b = p.processors[(None, None)].pop() if (None, None) in p.processors else list(p.processors.values())[0].pop()
+    # The above retrieves the single builder instance from the pipeline's registry
+    ctx = Context(p)
+
+    c1 = b.get_cache(ctx)
+    c2 = b.get_cache(ctx)
+    assert c1 is c2
+    assert isinstance(c1, dict)
+
+
+def test_get_cache_memoization_persist_true(tmp_path):
+    # get_cache should return the same archive object each time for persist=True
+    class Bldr(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X"], persist=True)
+        def build(self, context, *args, **kwargs):
+            yield from []
+
+    from framework.core import Context
+    p = Pipeline([Bldr()], workspace=tmp_path)
+    # retrieve the single builder instance
+    b = next(iter(next(iter(p.processors.values()))))
+    ctx = Context(p)
+
+    c1 = b.get_cache(ctx)
+    c2 = b.get_cache(ctx)
+    assert c1 is c2
+    # klepto archive behaves like a mapping
+    assert hasattr(c1, "__contains__") and hasattr(c1, "__getitem__")
+
+
+def test_stream_grouper_multiple_transitions_without_phase_flush():
+    seen = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case ReactiveEvent(name="built", target="G", artifact=artifact):
+                    if artifact[0] is not None:
+                        seen.append(artifact)
+
+    g = StreamGrouper(provides="G", requires=["X"], keyfunc=lambda x: x // 10)
+    pipe = Pipeline([g, Sink()])
+
+    # keys: 0, 1, 1, 2, 2 -> emissions on changes: (0, [(5,)]), (1, [(12,), (13,)])
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=5))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=12))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=13))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=27))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=28))
+    run_dispatcher_once(pipe)
+
+    # The first emission is for key None (ignored), then key changes to 1 -> emits key 0 group
+    # Next key change to 2 -> emits key 1 group
+    assert seen == [
+        (0, [(5,)]),
+        (1, [(12,), (13,)]),
+    ]
+
+
+def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
+    seen = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case ReactiveEvent(name="built", target="Y", artifact=a):
+                    seen.append(a)
+
+    class Bldr(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X"], persist=True)
+        def build(self, context, x):
+            # build emits x * 10
+            yield x * 10
+
+    b = Bldr()
+    pipe = Pipeline([b, Sink()], workspace=tmp_path)
+
+    # first, feed X -> triggers build and caches result
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=2))
+    run_dispatcher_once(pipe)
+
+    assert seen == [20]
+
+    # later, a resolve for Y should replay cached artifacts via reply()
+    pipe.submit(ReactiveEvent(name="resolve", target="Y"))
+    run_dispatcher_once(pipe)
+
+    # should replay the cached 20 again (in addition to the original)
+    assert seen == [20, 20]
