@@ -3,11 +3,12 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import SimpleQueue
 
 import pytest
-from pydantic import BaseModel
+
 
 # Ensure src is importable regardless of packaging
 import sys
 from pathlib import Path
+
 sys.path.append(str(Path(__file__).parents[1] / "src"))
 
 from framework.core import AbstractProcessor, Event, Pipeline  # noqa: E402
@@ -16,8 +17,6 @@ from framework.reactive import (  # noqa: E402
     ReactiveEvent,
     StreamGrouper,
     Collector,
-    JsonLSink,
-    JsonLSource,
 )
 
 
@@ -131,7 +130,9 @@ def test_stream_grouper_flushes_trailing_group_on_phase():
     run_dispatcher_once(pipe)
 
     # Intended: trailing group (3, [(31,), (32,)]) emitted
-    assert seen == [(3, [(31,), (32,)])]  # Expected to fail; phase() yields instead of submitting
+    assert seen == [
+        (3, [(31,), (32,)])
+    ]  # Expected to fail; phase() yields instead of submitting
 
 
 def test_collector_emits_on_phase_when_changed():
@@ -166,35 +167,6 @@ def test_collector_emits_on_phase_when_changed():
     assert seen == [[(7,)], [(7,), (8,)]]
 
 
-def test_jsonlsink_writes_and_closes_on_poison(tmp_path):
-    class Item(BaseModel):
-        a: int
-
-    out_path = tmp_path / "out.jsonl"
-    sink = JsonLSink(name="X", filepath=str(out_path))
-    pipe = Pipeline([sink])
-
-    pipe.submit(ReactiveEvent(name="built", target="X", artifact=Item(a=1)))
-    run_dispatcher_once(pipe)
-
-    # send poison to trigger on_terminate (close)
-    pipe.submit(Event(name="__POISON__"))
-    run_dispatcher_once(pipe)
-
-    text = out_path.read_text().strip().splitlines()
-    assert text == ['{"a":1}']
-
-
-def test_jsonlsource_build_yields_items_direct_call(tmp_path):
-    class Item(BaseModel):
-        a: int
-
-    p = tmp_path / "in.jsonl"
-    p.write_text('{"a":1}\n{"a":2}\n{"a":3}\n')
-
-    src = JsonLSource(name="X", filepath=str(p), itemtype=Item, limit=2)
-    items = list(src.build(context=None))
-    assert [i.a for i in items] == [1, 2]
 def test_listen_ignores_non_required_targets():
     seen = []
 
@@ -230,12 +202,18 @@ def test_get_cache_memoization_persist_false():
     class Bldr(ReactiveBuilder):
         def __init__(self):
             super().__init__(provides="Y", requires=["X"], persist=False)
+
         def build(self, context, *args, **kwargs):
             yield from []
 
     from framework.core import Context
+
     p = Pipeline([Bldr()])
-    b = p.processors[(None, None)].pop() if (None, None) in p.processors else list(p.processors.values())[0].pop()
+    b = (
+        p.processors[(None, None)].pop()
+        if (None, None) in p.processors
+        else list(p.processors.values())[0].pop()
+    )
     # The above retrieves the single builder instance from the pipeline's registry
     ctx = Context(p)
 
@@ -250,10 +228,12 @@ def test_get_cache_memoization_persist_true(tmp_path):
     class Bldr(ReactiveBuilder):
         def __init__(self):
             super().__init__(provides="Y", requires=["X"], persist=True)
+
         def build(self, context, *args, **kwargs):
             yield from []
 
     from framework.core import Context
+
     p = Pipeline([Bldr()], workspace=tmp_path)
     # retrieve the single builder instance
     b = next(iter(next(iter(p.processors.values()))))
@@ -307,6 +287,7 @@ def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
     class Bldr(ReactiveBuilder):
         def __init__(self):
             super().__init__(provides="Y", requires=["X"], persist=True)
+
         def build(self, context, x):
             # build emits x * 10
             yield x * 10

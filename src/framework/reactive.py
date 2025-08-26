@@ -7,10 +7,8 @@ import abc
 from collections import OrderedDict, defaultdict, deque
 from typing import Any, Collection, List
 from collections.abc import Callable, Iterable
-from smart_open import open
 
 import deepdiff
-from pydantic import BaseModel
 
 from .core import AbstractProcessor, Context, Event
 
@@ -71,7 +69,7 @@ class ReactiveBuilder(AbstractProcessor):
         iter = [tuple()]
         if len(self.requires) > 0:
             iter = list(zip(*[self.input_store[require] for require in self.requires]))
-        
+
         for key in iter:
             skey = deepdiff.DeepHash(key)[key]
             if skey not in self.get_cache(context):
@@ -178,7 +176,9 @@ class Collector(ReactiveBuilder):
     def phase(self, context, phase):
         if self.values != self.last:
             context.submit(
-                ReactiveEvent(name="built", target=self.provides, artifact=list(self.values))
+                ReactiveEvent(
+                    name="built", target=self.provides, artifact=list(self.values)
+                )
             )
             self.last = list(self.values)
 
@@ -221,47 +221,3 @@ class StreamGrouper(ReactiveBuilder):
         self.lastkey = None
         self.lastset = list()
 
-
-class JsonLSink(ReactiveBuilder):
-    def __init__(self, name: str, filepath: str, compression="infer_from_extension"):
-        super().__init__(name, [name], persist=False, priority=-100)
-        self.filepath = filepath
-        self.file = open(self.filepath, "wt", compression=compression)
-
-    def build(self, context, item):
-        assert isinstance(item, BaseModel)
-        self.file.writelines((item.model_dump_json(), "\n"))
-        self.file.flush()
-        yield from []
-
-    def on_terminate(self, context, event):
-        """Close the underlying file on pipeline termination (__POISON__)."""
-        self.file.close()
-
-
-class JsonLSource(ReactiveBuilder):
-    def __init__(
-        self,
-        name: str,
-        filepath: str,
-        itemtype,
-        limit=None,
-        compression="infer_from_extension",
-    ):
-        super().__init__(name, [], persist=False, priority=100)
-        self.filepath = filepath
-        assert issubclass(itemtype, BaseModel)
-        self.itemtype = itemtype
-        self.limit = float("inf") if limit is None else limit
-        self.file = open(self.filepath, "rt", compression=compression)
-
-    def build(
-        self,
-        context,
-    ):
-        for i, line in enumerate(self.file):
-            if i < self.limit:
-                yield self.itemtype.model_validate_json(line)
-
-    def on_terminate(self, context, event):
-        self.file.close()

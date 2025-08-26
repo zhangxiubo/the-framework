@@ -12,7 +12,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from queue import Empty, PriorityQueue, Queue, SimpleQueue
 import time
-from typing import List
+from typing import List, Optional
 
 import deepdiff
 
@@ -419,17 +419,22 @@ class AbstractProcessor(abc.ABC):
         pass
 
     @functools.cache
-    def archive(self, workspace: Path):
+    def archive(self, workspace: Path, suffix: Optional[str] = None): 
+
         if workspace is None:
             return klepto.archives.null_archive()
         else:
-            source_hash = hashlib.sha256(
-                get_source(self.__class__).encode()
-            ).hexdigest()
-            path = workspace.joinpath(self.__class__.__name__)
-            path.mkdir(parents=True, exist_ok=True)
+            if suffix is None:
+                source_hash = hashlib.sha256(
+                    get_source(self.__class__).encode()
+                ).hexdigest()
+                path = workspace.joinpath(self.__class__.__name__)
+                path.mkdir(parents=True, exist_ok=True)
+                path = path.joinpath(source_hash)
+            else:
+                path = workspace.joinpath(suffix)
             return klepto.archives.sql_archive(
-                name=f"sqlite:///{path.joinpath(source_hash)}.sqlite",
+                name=f"sqlite:///{path}.sqlite",
                 cached=False,
                 serialized=True,
             )

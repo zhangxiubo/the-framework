@@ -9,7 +9,6 @@ authors = [
 dependencies = [
     "deepdiff>=8.6.0",
     "klepto>=0.2.7",
-    "pydantic>=2.11.7",
     "smart-open>=7.3.0.post1",
     "sqlalchemy>=2.0.42",
 ]
