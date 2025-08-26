@@ -61,9 +61,14 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent() as e:
                 self._process(context, e)
             case Event(name="__POISON__") as e:
-                self.on_terminate(context, e)
+                self.on_terminate()
             case Event(name="__PHASE__", phase=phase) as e:
-                self.phase(context, phase)
+                for artifact in self.phase(context, phase):
+                    context.submit(
+                        ReactiveEvent(
+                            name="built", target=self.provides, artifact=artifact
+                        )
+                    )
 
     def publish(self, context: Context, input_target: str, new_artifact: Any):
         iter = [tuple()]
@@ -139,7 +144,7 @@ class ReactiveBuilder(AbstractProcessor):
     def phase(self, context: Context, phase: int):
         pass
 
-    def on_terminate(self, context: Context, event: Event):
+    def on_terminate(self):
         pass
 
 
