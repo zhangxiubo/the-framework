@@ -142,7 +142,7 @@ class ReactiveBuilder(AbstractProcessor):
         pass
 
     def phase(self, context: Context, phase: int):
-        pass
+        return tuple()
 
     def on_terminate(self):
         pass
@@ -180,11 +180,7 @@ class Collector(ReactiveBuilder):
 
     def phase(self, context, phase):
         if self.values != self.last:
-            context.submit(
-                ReactiveEvent(
-                    name="built", target=self.provides, artifact=list(self.values)
-                )
-            )
+            yield list(self.values)
             self.last = list(self.values)
 
 
@@ -216,13 +212,7 @@ class StreamGrouper(ReactiveBuilder):
 
     def phase(self, context, phase):
         if self.lastkey is not None:
-            context.submit(
-                ReactiveEvent(
-                    name="built",
-                    target=self.provides,
-                    artifact=(self.lastkey, self.lastset),
-                )
-            )
+            yield (self.lastkey, self.lastset)
         self.lastkey = None
         self.lastset = list()
 
