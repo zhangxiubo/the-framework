@@ -121,7 +121,7 @@ class ProcessEntry:
 
 class Inbox:
     def __init__(
-        self, processor: "AbstractProcessor", ready_queue: Queue, concurrency: int = 1
+        self, processor: "AbstractProcessor", ready_queue: PriorityQueue[ProcessEntry], concurrency: int = 1
     ):
         self.processor = processor
         self.events: SimpleQueue = SimpleQueue()
@@ -428,11 +428,6 @@ class AbstractProcessor(abc.ABC):
             else:
                 path = workspace.joinpath(suffix)
             return SqliteDict(filename=f"{path}.sqlite", encode=dill.dumps, decode=dill.loads, autocommit=True)
-            # return klepto.archives.sql_archive(
-            #     name=f"sqlite:///{path}.sqlite",
-            #     cached=False,
-            #     serialized=True,
-            # )
 
 
 def get_source(obj) -> str:
