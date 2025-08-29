@@ -23,4 +23,4 @@ def test_bfs():
     pipeline.submit(ReactiveEvent(name="resolve", target="ns"))
     pipeline.run()
 
-    assert [n for n, *_ in collector.values] == list(nx.bfs_tree(g, source=0))
+    assert [n for n, *_ in collector.values()] == list(nx.bfs_tree(g, source=0))

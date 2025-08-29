@@ -8,9 +8,9 @@ authors = [
 ]
 dependencies = [
     "deepdiff>=8.6.0",
-    "klepto>=0.2.7",
+    "dill>=0.4.0",
     "smart-open>=7.3.0.post1",
-    "sqlalchemy>=2.0.42",
+    "sqlitedict>=2.1.0",
 ]
 classifiers = [
     "Programming Language :: Python :: 3",

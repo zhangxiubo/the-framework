@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import functools
+import itertools
 import logging
 from pathlib import Path
 import abc
@@ -10,7 +11,7 @@ from collections.abc import Callable, Iterable
 
 import deepdiff
 
-from .core import AbstractProcessor, Context, Event
+from .core import AbstractProcessor, Context, Event, timeit
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +28,7 @@ class ReactiveBuilder(AbstractProcessor):
         persist: bool = False,
         priority=0,
         **kwargs,
+        # todo: optionally allow the setting of a name argument and use it to distinguish the cache store for different instances of the same ReactiveBuilder subclass
     ):
         super().__init__(priority=priority, **kwargs)
         self.provides: str = provides
@@ -39,7 +41,6 @@ class ReactiveBuilder(AbstractProcessor):
     def _get_cache(self, workspace: Path):
         match self.persist:
             case True:
-                assert workspace is not None
                 return self.archive(workspace)
             case False:
                 assert workspace is None
@@ -70,7 +71,7 @@ class ReactiveBuilder(AbstractProcessor):
                         )
                     )
 
-    def publish(self, context: Context, input_target: str, new_artifact: Any):
+    def publish(self, context: Context):
         iter = [tuple()]
         if len(self.requires) > 0:
             iter = list(zip(*[self.input_store[require] for require in self.requires]))
@@ -78,17 +79,18 @@ class ReactiveBuilder(AbstractProcessor):
         for key in iter:
             skey = deepdiff.DeepHash(key)[key]
             if skey not in self.get_cache(context):
-                artifacts = self.build(context, *key)
-                assert isinstance(artifacts, Iterable)
-                collected = list()
-                for artifact in artifacts:
-                    context.submit(
-                        ReactiveEvent(
-                            name="built", target=self.provides, artifact=artifact
+                with timeit(self.build.__qualname__, logger=logger):
+                    artifacts = self.build(context, *key)
+                    assert isinstance(artifacts, Iterable)
+                    collected = list()
+                    for artifact in artifacts:
+                        context.submit(
+                            ReactiveEvent(
+                                name="built", target=self.provides, artifact=artifact
+                            )
                         )
-                    )
-                    collected.append(artifact)
-                self.get_cache(context)[skey] = collected
+                        collected.append(artifact)
+                    self.get_cache(context)[skey] = collected
             for require in self.requires:
                 self.input_store[require].popleft()
 
@@ -97,10 +99,10 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent(name="resolve", target=target) if (
                 self.provides == target
             ):
-                self.handlers -= {self.new}
+                self.handlers -= {self.new, self.listen}
                 self.reply(context, event)
-                self.publish(context, None, None)
-                self.handlers |= {self.reply}
+                self.publish(context)
+                self.handlers |= {self.reply, self.react}
                 for require in self.requires:
                     # kicks-off downstream tasks
                     context.submit(ReactiveEvent(name="resolve", target=require))
@@ -135,7 +137,14 @@ class ReactiveBuilder(AbstractProcessor):
                 target in self.requires
             ):
                 self.input_store[target].append(artifact)
-                self.publish(context, target, artifact)
+
+    def react(self, context: Context, event: ReactiveEvent):
+        match event:
+            case ReactiveEvent(name="built", target=target, artifact=artifact) if (
+                target in self.requires
+            ):
+                self.input_store[target].append(artifact)
+                self.publish(context)
 
     @abc.abstractmethod
     def build(self, context: Context, *args, **kwargs):
@@ -169,19 +178,42 @@ def reactive(
 class Collector(ReactiveBuilder):
     def __init__(self, forwards_to, topics, limit=None):
         super().__init__(forwards_to, topics, persist=False)
-        self.values = list()
-        self.last = None  # setting last to None gurantees that the collector shall publish at least once during the initial phasing
+        self.current_batch = list()
+        self.past_batches = list()
         self.limit = float("inf") if limit is None else limit
 
     def build(self, context, *args, **kwargs):
-        if len(self.values) < self.limit:
-            self.values.append(args)
+        if len(self.current_batch) < self.limit:
+            self.current_batch.append(args)
         yield from []
 
     def phase(self, context, phase):
-        if self.values != self.last:
-            yield list(self.values)
-            self.last = list(self.values)
+        self.past_batches.append(self.current_batch)
+        if self.current_batch:
+            yield self.current_batch
+        self.current_batch = list()
+
+    def values(self):
+        return itertools.chain.from_iterable(self.past_batches + [self.current_batch])
+
+
+class Grouper(ReactiveBuilder):
+    def __init__(self, forwards_to, topics, keyfunc: Callable[..., Any]):
+        super().__init__(forwards_to, topics, persist=False)
+        self.keyfunc = keyfunc
+        self.store = defaultdict(list)
+        self.last = dict()
+
+    def build(self, context, *args):
+        key = self.keyfunc(*args)
+        self.store[key].append(args)
+
+    def phase(self, context, phase):
+        self.last = self.store.copy()
+        self.store.clear()
+        if self.last:
+            for key, group in self.last.items():
+                yield key, group
 
 
 class StreamGrouper(ReactiveBuilder):
@@ -215,4 +247,3 @@ class StreamGrouper(ReactiveBuilder):
             yield (self.lastkey, self.lastset)
         self.lastkey = None
         self.lastset = list()
-

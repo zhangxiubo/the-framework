@@ -59,7 +59,6 @@ def test_retry_succeeds_before_max_attempts(caplog):
     # ensure logs mention attempts
     attempt_logs = [rec for rec in caplog.records if "attempt" in rec.getMessage()]
     assert any("attempt 1 / 3" in r.getMessage() for r in attempt_logs)
-    assert any("finished" in r.getMessage() for r in attempt_logs)
 
 
 def test_retry_raises_after_exhaustion(caplog):

@@ -105,6 +105,7 @@ def test_stream_grouper_emits_previous_group_on_key_change():
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=11))
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=12))
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=25))
+    pipe.submit(ReactiveEvent(name="resolve", target="G"))
     run_dispatcher_once(pipe)
 
     assert seen == [(1, [(11,), (12,)])]
@@ -125,6 +126,7 @@ def test_stream_grouper_flushes_trailing_group_on_phase():
 
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=31))
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=32))
+    pipe.submit(ReactiveEvent(name="resolve", target="G"))
     # phase should flush trailing group
     pipe.submit(Event(name="__PHASE__", phase=1))
     run_dispatcher_once(pipe)
@@ -148,6 +150,8 @@ def test_collector_emits_on_phase_when_changed():
     pipe = Pipeline([col, Sink()])
 
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=7))
+    pipe.submit(ReactiveEvent(name="resolve", target="COL"))
+
     pipe.submit(Event(name="__PHASE__", phase=1))
     run_dispatcher_once(pipe, pulses=2)
 
@@ -164,7 +168,7 @@ def test_collector_emits_on_phase_when_changed():
     pipe.submit(Event(name="__PHASE__", phase=3))
     run_dispatcher_once(pipe, pulses=2)
 
-    assert seen == [[(7,)], [(7,), (8,)]]
+    assert seen == [[(7,)], [(8,)]]
 
 
 def test_listen_ignores_non_required_targets():
@@ -265,6 +269,7 @@ def test_stream_grouper_multiple_transitions_without_phase_flush():
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=13))
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=27))
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=28))
+    pipe.submit(ReactiveEvent(name="resolve", target="G"))
     run_dispatcher_once(pipe)
 
     # The first emission is for key None (ignored), then key changes to 1 -> emits key 0 group
@@ -297,13 +302,13 @@ def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
 
     # first, feed X -> triggers build and caches result
     pipe.submit(ReactiveEvent(name="built", target="X", artifact=2))
+
     run_dispatcher_once(pipe)
 
-    assert seen == [20]
+    assert seen == []
 
-    # later, a resolve for Y should replay cached artifacts via reply()
+    # later, a resolve for Y should replay c    ached artifacts via reply()
     pipe.submit(ReactiveEvent(name="resolve", target="Y"))
     run_dispatcher_once(pipe)
 
-    # should replay the cached 20 again (in addition to the original)
-    assert seen == [20, 20]
+    assert seen == [20]

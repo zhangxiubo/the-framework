@@ -1,23 +1,21 @@
 import abc
-from contextlib import contextmanager
-from dataclasses import dataclass, field
 import functools
-
 import hashlib
 import inspect
 import logging
 import threading
+import time
 from collections import defaultdict
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextlib import contextmanager
+from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, PriorityQueue, Queue, SimpleQueue
-import time
 from typing import List, Optional
 
 import deepdiff
-
-import klepto
-
+import dill
+from sqlitedict import SqliteDict
 
 logger = logging.getLogger(__name__)
 
@@ -29,7 +27,7 @@ class Event:
 
 
 @contextmanager
-def timeit(name, logger):
+def timeit(name, logger: logging.Logger):
     start = time.perf_counter()
     try:
         yield
@@ -49,12 +47,7 @@ def retry(max_attempts):
                     f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} began"
                 )
                 try:
-                    result = func(*args, **kwargs)
-                    elapsed = time.perf_counter() - start
-                    logger.debug(
-                        f"attempt {attempt + 1} / {max_attempts} at {func.__qualname__} finished in {elapsed:.4f}s"
-                    )
-                    return result
+                    return func(*args, **kwargs)
                 except Exception:
                     elapsed = time.perf_counter() - start
                     is_last_attempt = attempt >= max_attempts - 1
@@ -418,26 +411,28 @@ class AbstractProcessor(abc.ABC):
     def process(self, context: Context, event: Event):
         pass
 
+    @classmethod
     @functools.cache
-    def archive(self, workspace: Path, suffix: Optional[str] = None): 
+    def archive(cls, workspace: Path, suffix: Optional[str] = None):
 
         if workspace is None:
-            return klepto.archives.null_archive()
+            return SqliteDict(filename=f":memory:", encode=dill.dumps, decode=dill.loads, autocommit=True)
         else:
             if suffix is None:
                 source_hash = hashlib.sha256(
-                    get_source(self.__class__).encode()
+                    get_source(cls).encode()
                 ).hexdigest()
-                path = workspace.joinpath(self.__class__.__name__)
+                path = workspace.joinpath(cls.__name__)
                 path.mkdir(parents=True, exist_ok=True)
                 path = path.joinpath(source_hash)
             else:
                 path = workspace.joinpath(suffix)
-            return klepto.archives.sql_archive(
-                name=f"sqlite:///{path}.sqlite",
-                cached=False,
-                serialized=True,
-            )
+            return SqliteDict(filename=f"{path}.sqlite", encode=dill.dumps, decode=dill.loads, autocommit=True)
+            # return klepto.archives.sql_archive(
+            #     name=f"sqlite:///{path}.sqlite",
+            #     cached=False,
+            #     serialized=True,
+            # )
 
 
 def get_source(obj) -> str:
