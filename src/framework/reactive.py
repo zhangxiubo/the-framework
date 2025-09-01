@@ -62,7 +62,7 @@ class ReactiveBuilder(AbstractProcessor):
             case ReactiveEvent() as e:
                 self._process(context, e)
             case Event(name="__POISON__") as e:
-                self.on_terminate()
+                self.on_terminate(context)
             case Event(name="__PHASE__", phase=phase) as e:
                 for artifact in self.phase(context, phase):
                     context.submit(
@@ -153,7 +153,7 @@ class ReactiveBuilder(AbstractProcessor):
     def phase(self, context: Context, phase: int):
         return tuple()
 
-    def on_terminate(self):
+    def on_terminate(self, context: Context):
         pass
 
 

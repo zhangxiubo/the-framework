@@ -6,7 +6,7 @@ import logging
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +37,6 @@ def timeit(name, logger: logging.Logger):
 
 
 def retry(max_attempts):
-
     def decorator_retry(func):
         @functools.wraps(func)
         def wrapper(*args, **kwargs):
@@ -68,7 +67,6 @@ def retry(max_attempts):
 
 
 class Context:
-
     def __init__(self, pipeline):
         self.pipeline: Pipeline = pipeline
         self.events = []
@@ -104,6 +102,10 @@ class Context:
                     f"processor failed: {processor} on event {event.__class__.__name__}, name: {event.name}",
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+        except CancelledError as e:
+            logger.info(
+                f"processor cancelled: {processor} on event {event.__class__.__name__}, name: {event.name}",
+            )
         finally:
             inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
@@ -121,7 +123,10 @@ class ProcessEntry:
 
 class Inbox:
     def __init__(
-        self, processor: "AbstractProcessor", ready_queue: PriorityQueue[ProcessEntry], concurrency: int = 1
+        self,
+        processor: "AbstractProcessor",
+        ready_queue: PriorityQueue[ProcessEntry],
+        concurrency: int = 1,
     ):
         self.processor = processor
         self.events: SimpleQueue = SimpleQueue()
@@ -161,15 +166,13 @@ class Inbox:
                 )
 
 
-
 class Pipeline:
-
     def __init__(
         self,
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
         workspace=None,
-        max_workers=4,
+        max_workers=16,
         config=None,
         **kwargs,
     ):
@@ -200,7 +203,6 @@ class Pipeline:
             logger.debug(f"registering interest for {processor}: {interest}")
             self.processors[interest].add(processor)
 
-
     @contextmanager
     def interrupt_handled(
         self,
@@ -222,16 +224,13 @@ class Pipeline:
         finally:
             signal.signal(signal.SIGINT, old_handler)
 
-
     def run(self):
-
         with (
             ThreadPoolExecutor(1) as main_executor,
             ThreadPoolExecutor(self.max_workers) as task_executor,
         ):
             q = SimpleQueue()
             with self.interrupt_handled(task_executor):
-
                 stop = threading.Event()
                 with self.cond:
                     last_jobs = self.jobs
@@ -317,16 +316,15 @@ class Pipeline:
                             q=q,
                         )
                         future = executor.submit(processor.process, context, event)
-                        future.add_done_callback(
-                            callback
-                        )
+                        future.add_done_callback(callback)
                 except Empty:
                     continue
                 except Exception as e:
                     f = Future()
                     f.set_exception(e)
-                    callback(f)  # manually invoke the call back function to ensure integrity of job counting 
-
+                    callback(
+                        f
+                    )  # manually invoke the call back function to ensure integrity of job counting
 
     def increment(self):
         with self.cond:
@@ -344,7 +342,6 @@ class Pipeline:
 
 
 def parse_pattern(p):
-
     import ast
 
     def get_class_identifier(node):
@@ -377,7 +374,6 @@ def parse_pattern(p):
 
 
 def infer_interests(func):
-
     import ast
     import textwrap
 
@@ -402,7 +398,6 @@ def infer_interests(func):
 
 
 class AbstractProcessor(abc.ABC):
-
     def __init__(self, priority: int = 0):
         self.interests = frozenset(infer_interests(self.process))
         self.priority = priority
@@ -414,20 +409,29 @@ class AbstractProcessor(abc.ABC):
     @classmethod
     @functools.cache
     def archive(cls, workspace: Path, suffix: Optional[str] = None):
-
         if workspace is None:
-            return SqliteDict(filename=f":memory:", encode=dill.dumps, decode=dill.loads, autocommit=True)
+            return SqliteDict(
+                filename=f":memory:",
+                encode=dill.dumps,
+                decode=dill.loads,
+                autocommit=True,
+                journal_mode="WAL",
+            )
         else:
             if suffix is None:
-                source_hash = hashlib.sha256(
-                    get_source(cls).encode()
-                ).hexdigest()
+                source_hash = hashlib.sha256(get_source(cls).encode()).hexdigest()
                 path = workspace.joinpath(cls.__name__)
                 path.mkdir(parents=True, exist_ok=True)
                 path = path.joinpath(source_hash)
             else:
                 path = workspace.joinpath(suffix)
-            return SqliteDict(filename=f"{path}.sqlite", encode=dill.dumps, decode=dill.loads, autocommit=True)
+            return SqliteDict(
+                filename=f"{path}.sqlite",
+                encode=dill.dumps,
+                decode=dill.loads,
+                autocommit=True,
+                journal_mode="WAL",
+            )
 
 
 def get_source(obj) -> str:
@@ -455,7 +459,6 @@ def caching(
     *,
     debug: bool = True,
 ):
-
     def decorator(func):
         @functools.wraps(func)
         def wrapper(
