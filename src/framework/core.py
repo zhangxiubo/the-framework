@@ -97,11 +97,17 @@ class Context:
         """
         try:
             exc = future.exception()
-            if exc is not None:
-                logger.error(
-                    f"processor failed: {processor} on event {event.__class__.__name__}, name: {event.name}",
-                    exc_info=(type(exc), exc, exc.__traceback__),
-                )
+            match exc:
+                case None:
+                    pass
+                case RuntimeError() as re if str(re) == 'cannot schedule new futures after shutdown':
+                    # logger.debug(f'scheduling skipped: {processor} on event {event.__class__.__name__} skipped due to executor having been shut down')
+                    pass
+                case _:
+                    logger.error(
+                        f"processor failed: {processor} on event {event.__class__.__name__}, name: {event.name}",
+                        exc_info=(type(exc), exc, exc.__traceback__),
+                    )
         except CancelledError as e:
             logger.info(
                 f"processor cancelled: {processor} on event {event.__class__.__name__}, name: {event.name}",
