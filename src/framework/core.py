@@ -178,7 +178,7 @@ class Pipeline:
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
         workspace=None,
-        max_workers=16,
+        max_workers=None,
         config=None,
         **kwargs,
     ):
@@ -188,7 +188,7 @@ class Pipeline:
         self.cond = threading.Condition()
         self.rdyq = PriorityQueue()
         self.strict_interest_inference = strict_interest_inference
-        self.max_workers = max_workers
+        self.max_workers = len(processors) if max_workers is None else max_workers
         self.config = dict() if config is None else config.copy()
 
         self.processors = defaultdict(set)
