@@ -157,7 +157,6 @@ class ReactiveBuilder(AbstractProcessor):
         """
         Overriding processors should call super().on_terminate(context) to ensure cache stores are properly closed.
         """
-        logger.debug(f'invoking on_terminate: {self.__class__.__qualname__}', )
         if self.persist:
             self.archive(context.pipeline.workspace).close()
         pass
