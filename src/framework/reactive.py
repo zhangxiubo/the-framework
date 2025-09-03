@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import abc
 import functools
 import itertools
 import logging
-from pathlib import Path
-import abc
 from collections import OrderedDict, defaultdict, deque
-from typing import Any, Collection, List
 from collections.abc import Callable, Iterable
+from pathlib import Path
+from typing import Any, Collection, List
 
 import deepdiff
 
@@ -44,7 +44,7 @@ class ReactiveBuilder(AbstractProcessor):
                 return self.archive(workspace)
             case False:
                 assert workspace is None
-                return dict()
+                return self.archive(workspace)
 
     def get_cache(self, context):
         match self.persist:
@@ -154,6 +154,12 @@ class ReactiveBuilder(AbstractProcessor):
         return tuple()
 
     def on_terminate(self, context: Context):
+        """
+        Overriding processors should call super().on_terminate(context) to ensure cache stores are properly closed.
+        """
+        logger.debug(f'invoking on_terminate: {self.__class__.__qualname__}', )
+        if self.persist:
+            self.archive(context.pipeline.workspace).close()
         pass
 
 

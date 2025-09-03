@@ -100,7 +100,9 @@ class Context:
             match exc:
                 case None:
                     pass
-                case RuntimeError() as re if str(re) == 'cannot schedule new futures after shutdown':
+                case RuntimeError() as re if (
+                    str(re) == "cannot schedule new futures after shutdown"
+                ):
                     # logger.debug(f'scheduling skipped: {processor} on event {event.__class__.__name__} skipped due to executor having been shut down')
                     pass
                 case _:
@@ -177,7 +179,7 @@ class Pipeline:
         self,
         processors: List["AbstractProcessor"],
         strict_interest_inference=False,
-        workspace=None,
+        workspace: Optional[str | Path] = None,
         max_workers=None,
         config=None,
         **kwargs,
@@ -414,7 +416,9 @@ class AbstractProcessor(abc.ABC):
 
     @classmethod
     @functools.cache
-    def archive(cls, workspace: Path, suffix: Optional[str] = None):
+    def archive(
+        cls, workspace: Path, suffix: Optional[str] = None, read_only: bool = False
+    ):
         if workspace is None:
             return SqliteDict(
                 filename=f":memory:",
@@ -422,6 +426,7 @@ class AbstractProcessor(abc.ABC):
                 decode=dill.loads,
                 autocommit=True,
                 journal_mode="WAL",
+                flag='r' if read_only else 'c',
             )
         else:
             if suffix is None:
@@ -437,6 +442,7 @@ class AbstractProcessor(abc.ABC):
                 decode=dill.loads,
                 autocommit=True,
                 journal_mode="WAL",
+                flag='r' if read_only else 'c',
             )
 
 
