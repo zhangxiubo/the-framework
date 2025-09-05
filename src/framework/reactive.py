@@ -39,12 +39,7 @@ class ReactiveBuilder(AbstractProcessor):
 
     @functools.cache
     def _get_cache(self, workspace: Path):
-        match self.persist:
-            case True:
-                return self.archive(workspace)
-            case False:
-                assert workspace is None
-                return self.archive(workspace)
+        return self.archive(workspace)
 
     def get_cache(self, context):
         match self.persist:

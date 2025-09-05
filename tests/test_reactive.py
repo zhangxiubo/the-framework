@@ -1,6 +1,7 @@
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from queue import SimpleQueue
+from typing import MutableMapping
 
 import pytest
 
@@ -224,7 +225,7 @@ def test_get_cache_memoization_persist_false():
     c1 = b.get_cache(ctx)
     c2 = b.get_cache(ctx)
     assert c1 is c2
-    assert isinstance(c1, dict)
+    assert isinstance(c1, MutableMapping)
 
 
 def test_get_cache_memoization_persist_true(tmp_path):

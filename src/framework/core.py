@@ -5,10 +5,11 @@ import inspect
 import logging
 import threading
 import time
-from collections import defaultdict
+from collections import defaultdict, UserDict
 from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from linecache import cache
 from pathlib import Path
 from queue import Empty, PriorityQueue, Queue, SimpleQueue
 from typing import List, Optional
@@ -25,6 +26,11 @@ class Event:
         self.name: str = name
         self.__dict__.update(kwargs)
 
+
+class DummyCache(UserDict):
+
+    def close(self):
+        self.clear()
 
 @contextmanager
 def timeit(name, logger: logging.Logger):
@@ -414,36 +420,35 @@ class AbstractProcessor(abc.ABC):
     def process(self, context: Context, event: Event):
         pass
 
+    @functools.cache  # so that we return the same cache/store/archive object even if workspace is None
+    def archive(self, workspace: Path, suffix: Optional[str] = None, read_only: bool = False):
+        match workspace:
+            case None:
+                return DummyCache()
+            case _:
+                return self._archive(workspace, suffix, read_only)
+
     @classmethod
     @functools.cache
-    def archive(
+    def _archive(
         cls, workspace: Path, suffix: Optional[str] = None, read_only: bool = False
     ):
-        if workspace is None:
-            return SqliteDict(
-                filename=f":memory:",
-                encode=dill.dumps,
-                decode=dill.loads,
-                autocommit=True,
-                journal_mode="WAL",
-                flag='r' if read_only else 'c',
-            )
+        assert workspace is not None
+        if suffix is None:
+            source_hash = hashlib.sha256(get_source(cls).encode()).hexdigest()
+            path = workspace.joinpath(cls.__name__)
+            path.mkdir(parents=True, exist_ok=True)
+            path = path.joinpath(source_hash)
         else:
-            if suffix is None:
-                source_hash = hashlib.sha256(get_source(cls).encode()).hexdigest()
-                path = workspace.joinpath(cls.__name__)
-                path.mkdir(parents=True, exist_ok=True)
-                path = path.joinpath(source_hash)
-            else:
-                path = workspace.joinpath(suffix)
-            return SqliteDict(
-                filename=f"{path}.sqlite",
-                encode=dill.dumps,
-                decode=dill.loads,
-                autocommit=True,
-                journal_mode="WAL",
-                flag='r' if read_only else 'c',
-            )
+            path = workspace.joinpath(suffix)
+        return SqliteDict(
+            filename=f"{path}.sqlite",
+            encode=dill.dumps,
+            decode=dill.loads,
+            autocommit=True,
+            journal_mode="WAL",
+            flag='r' if read_only else 'c',
+        )
 
 
 def get_source(obj) -> str:
