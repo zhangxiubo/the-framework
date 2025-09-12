@@ -4,6 +4,8 @@ import abc
 import functools
 import itertools
 import logging
+import random
+import heapq
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable
 from pathlib import Path
@@ -11,7 +13,7 @@ from typing import Any, Collection, List
 
 import deepdiff
 
-from .core import AbstractProcessor, Context, Event, timeit
+from .core import AbstractProcessor, Context, Event, timeit, NoOpCache
 
 logger = logging.getLogger(__name__)
 
@@ -26,27 +28,20 @@ class ReactiveBuilder(AbstractProcessor):
         provides: str,
         requires: Collection[str],
         persist: bool = False,
-        priority=0,
+        name: Optional[str] = None,
+        priority: int = 0,
         **kwargs,
         # todo: optionally allow the setting of a name argument and use it to distinguish the cache store for different instances of the same ReactiveBuilder subclass
     ):
-        super().__init__(priority=priority, **kwargs)
+        super().__init__(
+            priority=priority,
+            **kwargs,
+        )
         self.provides: str = provides
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))
         self.handlers = {self.new, self.listen}
         self.input_store = defaultdict(deque)  # requrie -> artifacts (ingridents)
         self.persist = persist
-
-    @functools.cache
-    def _get_cache(self, workspace: Path):
-        return self.archive(workspace)
-
-    def get_cache(self, context):
-        match self.persist:
-            case True:
-                return self._get_cache(context.pipeline.workspace)
-            case False:
-                return self._get_cache(None)
 
     def _process(self, context: Context, event: ReactiveEvent):
         for handler in list(self.handlers):
@@ -73,7 +68,8 @@ class ReactiveBuilder(AbstractProcessor):
 
         for key in iter:
             skey = deepdiff.DeepHash(key)[key]
-            if skey not in self.get_cache(context):
+            archive = self.get_cache(context)
+            if skey not in archive:
                 with timeit(self.build.__qualname__, logger=logger):
                     artifacts = self.build(context, *key)
                     assert isinstance(artifacts, Iterable)
@@ -85,7 +81,7 @@ class ReactiveBuilder(AbstractProcessor):
                             )
                         )
                         collected.append(artifact)
-                    self.get_cache(context)[skey] = collected
+                    archive[skey] = collected
             for require in self.requires:
                 self.input_store[require].popleft()
 
@@ -152,9 +148,18 @@ class ReactiveBuilder(AbstractProcessor):
         """
         Overriding processors should call super().on_terminate(context) to ensure cache stores are properly closed.
         """
+        self.get_cache(context).close()
+
+
+    def get_cache(self, context: Context):
         if self.persist:
-            self.archive(context.pipeline.workspace).close()
-        pass
+            return context.pipeline.archive(self.signature())
+        else:
+            return self.get_noop_cache()
+
+    @functools.cache
+    def get_noop_cache(self):
+        return NoOpCache()
 
 
 def reactive(
@@ -222,8 +227,9 @@ class StreamGrouper(ReactiveBuilder):
         provides,
         requires,
         keyfunc: Callable[..., Any],
+        **kwargs,
     ):
-        super().__init__(provides, requires, persist=False)
+        super().__init__(provides, requires, persist=False, **kwargs)
         self.lastkey = None
         self.lastset = list()
         self.keyfunc = keyfunc
@@ -247,3 +253,42 @@ class StreamGrouper(ReactiveBuilder):
             yield (self.lastkey, self.lastset)
         self.lastkey = None
         self.lastset = list()
+
+
+class StreamSampler(ReactiveBuilder):
+    def __init__(self, provides, requires, probability: float, seed=42, **kwargs):
+        super().__init__(provides, requires, **kwargs)
+        self.probability = probability
+        self.seed = seed
+        self.random = random.Random(seed)
+
+    def build(
+        self,
+        context,
+        *args,
+    ):
+        if random.random() > self.probability:
+            yield args
+
+
+class ReservoirSampler(ReactiveBuilder):
+    def __init__(self, provides, requires, size: int, seed=42, **kwargs):
+        super().__init__(provides, requires, **kwargs)
+        self.size = size
+        self.seed = seed
+        self.random = random.Random(seed)
+        self.heap = []
+
+    def build(
+        self,
+        context: Context,
+        *args,
+    ):
+        heapq.heappush(self.heap, (self.random.random(), args))
+        if len(self.heap) > self.size:
+            heapq.heappop(self.heap)
+        yield from []
+
+    def phase(self, context, phase):
+        for priority, item in self.heap:
+            yield item

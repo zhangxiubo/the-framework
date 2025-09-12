@@ -27,10 +27,11 @@ class Event:
         self.__dict__.update(kwargs)
 
 
-class DummyCache(UserDict):
+class NoOpCache(UserDict):
 
     def close(self):
         self.clear()
+
 
 @contextmanager
 def timeit(name, logger: logging.Logger):
@@ -77,13 +78,13 @@ class Context:
         self.pipeline: Pipeline = pipeline
         self.events = []
 
-    def submit(self, event: Event):
-        """Emit a new event back into the pipeline and record it for caching."""
+    def submit(self, event: Event) -> int:
+        """Emit a new event back into the pipeline and record it for caching. Returns the number of recipients that have registered interest of the event."""
         try:
             self.events.append(
                 event
             )  # Maintain emission order for deterministic replay.
-            self.pipeline.submit(event)
+            return self.pipeline.submit(event)
         except Exception:
             logger.exception("failed to submit event %s", event)
             raise
@@ -354,6 +355,22 @@ class Pipeline:
         with self.cond:
             self.cond.wait_for(lambda: self.done >= self.jobs)
 
+    @functools.cache
+    def archive(self, suffix: Optional[str], read_only: bool = False):
+        if self.workspace is None:
+            return NoOpCache()
+        else:
+            path = self.workspace.joinpath(suffix)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            return SqliteDict(
+                filename=f"{path}.sqlite",
+                encode=dill.dumps,
+                decode=dill.loads,
+                autocommit=True,
+                journal_mode="WAL",
+                flag="r" if read_only else "c",
+            )
+
 
 def parse_pattern(p):
     import ast
@@ -412,43 +429,19 @@ def infer_interests(func):
 
 
 class AbstractProcessor(abc.ABC):
-    def __init__(self, priority: int = 0):
+
+    def __init__(self, name: Optional[str] = None, priority: int = 0):
         self.interests = frozenset(infer_interests(self.process))
+        self.name = self.__class__.__name__ if name is None else name
         self.priority = priority
 
     @abc.abstractmethod
     def process(self, context: Context, event: Event):
         pass
 
-    @functools.cache  # so that we return the same cache/store/archive object even if workspace is None
-    def archive(self, workspace: Path, suffix: Optional[str] = None, read_only: bool = False):
-        match workspace:
-            case None:
-                return DummyCache()
-            case _:
-                return self._archive(workspace, suffix, read_only)
-
-    @classmethod
     @functools.cache
-    def _archive(
-        cls, workspace: Path, suffix: Optional[str] = None, read_only: bool = False
-    ):
-        assert workspace is not None
-        if suffix is None:
-            source_hash = hashlib.sha256(get_source(cls).encode()).hexdigest()
-            path = workspace.joinpath(cls.__name__)
-            path.mkdir(parents=True, exist_ok=True)
-            path = path.joinpath(source_hash)
-        else:
-            path = workspace.joinpath(suffix)
-        return SqliteDict(
-            filename=f"{path}.sqlite",
-            encode=dill.dumps,
-            decode=dill.loads,
-            autocommit=True,
-            journal_mode="WAL",
-            flag='r' if read_only else 'c',
-        )
+    def signature(self):
+        return str(Path(self.name, hashlib.sha256(get_source(self.__class__).encode()).hexdigest()))
 
 
 def get_source(obj) -> str:
@@ -493,7 +486,7 @@ def caching(
                 if debug:
                     logger.debug("digest %s", digest)
 
-                archive = self.archive(context.pipeline.workspace)
+                archive = context.pipeline.archive(self.name)
 
                 if digest in archive:
                     # Cache hit: replay archived events

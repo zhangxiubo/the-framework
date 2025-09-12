@@ -222,8 +222,8 @@ def test_get_cache_memoization_persist_false():
     # The above retrieves the single builder instance from the pipeline's registry
     ctx = Context(p)
 
-    c1 = b.get_cache(ctx)
-    c2 = b.get_cache(ctx)
+    c1 = ctx.pipeline.archive(b.signature())
+    c2 = ctx.pipeline.archive(b.signature())
     assert c1 is c2
     assert isinstance(c1, MutableMapping)
 
@@ -244,8 +244,8 @@ def test_get_cache_memoization_persist_true(tmp_path):
     b = next(iter(next(iter(p.processors.values()))))
     ctx = Context(p)
 
-    c1 = b.get_cache(ctx)
-    c2 = b.get_cache(ctx)
+    c1 = ctx.pipeline.archive(b.signature())
+    c2 = ctx.pipeline.archive(b.signature())
     assert c1 is c2
     # klepto archive behaves like a mapping
     assert hasattr(c1, "__contains__") and hasattr(c1, "__getitem__")
