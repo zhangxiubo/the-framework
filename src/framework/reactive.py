@@ -290,5 +290,6 @@ class ReservoirSampler(ReactiveBuilder):
         yield from []
 
     def phase(self, context, phase):
-        for priority, item in self.heap:
+        while self.heap:
+            _, item = heapq.heappop(self.heap)
             yield item

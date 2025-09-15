@@ -28,19 +28,19 @@ class Event:
 
 
 class NoOpCache(UserDict):
-
     def close(self):
         self.clear()
 
 
 @contextmanager
-def timeit(name, logger: logging.Logger):
+def timeit(name, logger: logging.Logger, logging_threshold: float = 5.0):
     start = time.perf_counter()
     try:
         yield
     finally:
         end = time.perf_counter()
-        logger.debug(f"{name} finished after {end - start:.4f} seconds")
+        if (delta := end - start) > logging_threshold:
+            logger.debug(f"{name} finished after {delta:.4f} seconds")
 
 
 def retry(max_attempts):
@@ -254,20 +254,23 @@ class Pipeline:
                 main_executor.submit(self.execute_events, task_executor, q)
 
                 phase = 0
-                noop_diff = 0
+                idle_jobs_increment = 0
                 while not stop.is_set():
-                    print("phase:", phase)
+                    logger.info(f"starting phase: {phase:02d}")
+                    start = time.perf_counter()
                     q.put(True)
                     # Wait for all outstanding jobs (including nested emissions) to complete.
                     self.wait()
 
                     with self.cond:
-                        if self.jobs == (last_jobs + noop_diff):
+                        if self.jobs == (last_jobs + idle_jobs_increment):
+                            # this means that no other new jobs were launched.
                             stop.set()
                         last_jobs = self.jobs
-
+                    end = time.perf_counter()
+                    logger.info(f"ending phase: {phase:02d}; elapsed time: {end - start:.4f} seconds")
                     phase += 1
-                    noop_diff = self.submit(Event(name="__PHASE__", phase=phase)) + 1
+                    idle_jobs_increment = self.submit(Event(name="__PHASE__", phase=phase)) + 1  # the expected increment in jobs count when no other jobs are launched by the processors.
                 else:
                     q.put(True)
                     self.wait()  # wait for the phasing-spawned events to finish
@@ -429,7 +432,6 @@ def infer_interests(func):
 
 
 class AbstractProcessor(abc.ABC):
-
     def __init__(self, name: Optional[str] = None, priority: int = 0):
         self.interests = frozenset(infer_interests(self.process))
         self.name = self.__class__.__name__ if name is None else name
@@ -441,7 +443,12 @@ class AbstractProcessor(abc.ABC):
 
     @functools.cache
     def signature(self):
-        return str(Path(self.name, hashlib.sha256(get_source(self.__class__).encode()).hexdigest()))
+        return str(
+            Path(
+                self.name,
+                hashlib.sha256(get_source(self.__class__).encode()).hexdigest(),
+            )
+        )
 
 
 def get_source(obj) -> str:
