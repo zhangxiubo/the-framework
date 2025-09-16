@@ -8,7 +8,6 @@ import random
 import heapq
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable
-from pathlib import Path
 from typing import Any, Collection, List
 
 import deepdiff

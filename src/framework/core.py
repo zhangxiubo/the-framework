@@ -9,7 +9,6 @@ from collections import defaultdict, UserDict
 from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from linecache import cache
 from pathlib import Path
 from queue import Empty, PriorityQueue, Queue, SimpleQueue
 from typing import List, Optional
