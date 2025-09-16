@@ -230,7 +230,7 @@ def test_caching_persists_and_replays_with_workspace(tmp_path):
         @caching()
         def process(self, context, event):
             match event:
-                case Event(name="DO", payload=payload):
+                case Event(name="DO", ):
                     self.calls += 1
                     context.submit(Event(name="OUT", value=42))
 
@@ -345,7 +345,7 @@ def test_caching_exception_then_replay(tmp_path):
         @caching()
         def process(self, context, event):
             match event:
-                case Event(name="TRIGGER", key=k):
+                case Event(name="TRIGGER", ):
                     self.calls += 1
                     if self.calls == 1:
                         raise RuntimeError("first attempt fails")

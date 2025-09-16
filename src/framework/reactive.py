@@ -8,7 +8,7 @@ import random
 import heapq
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable
-from typing import Any, Collection, List
+from typing import Any, Collection, List, Optional
 
 import deepdiff
 
@@ -34,7 +34,7 @@ class ReactiveBuilder(AbstractProcessor):
     ):
         super().__init__(
             priority=priority,
-            **kwargs,
+            name=name,
         )
         self.provides: str = provides
         self.requires: List[str] = list(OrderedDict.fromkeys(requires))

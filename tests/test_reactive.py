@@ -3,8 +3,6 @@ from concurrent.futures import ThreadPoolExecutor
 from queue import SimpleQueue
 from typing import MutableMapping
 
-import pytest
-
 
 # Ensure src is importable regardless of packaging
 import sys

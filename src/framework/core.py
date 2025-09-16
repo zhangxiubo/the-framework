@@ -10,7 +10,7 @@ from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Empty, PriorityQueue, Queue, SimpleQueue
+from queue import Empty, PriorityQueue, SimpleQueue
 from typing import List, Optional
 
 import deepdiff
@@ -116,7 +116,7 @@ class Context:
                         f"processor failed: {processor} on event {event.__class__.__name__}, name: {event.name}",
                         exc_info=(type(exc), exc, exc.__traceback__),
                     )
-        except CancelledError as e:
+        except CancelledError:
             logger.info(
                 f"processor cancelled: {processor} on event {event.__class__.__name__}, name: {event.name}",
             )
