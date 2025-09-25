@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import deepdiff
 import dill
-from sqlitedict import SqliteDict
+from rocksdict import Rdict, WriteOptions
 
 logger = logging.getLogger(__name__)
 
@@ -358,20 +358,21 @@ class Pipeline:
             self.cond.wait_for(lambda: self.done >= self.jobs)
 
     @functools.cache
-    def archive(self, suffix: Optional[str], read_only: bool = False):
+    def archive(self, suffix: Optional[str]):
         if self.workspace is None:
             return NoOpCache()
         else:
             path = self.workspace.joinpath(suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
-            return SqliteDict(
-                filename=f"{path}.sqlite",
-                encode=dill.dumps,
-                decode=dill.loads,
-                autocommit=True,
-                journal_mode="WAL",
-                flag="r" if read_only else "c",
+            rdict = Rdict(
+                str(path)
             )
+            rdict.set_dumps(dill.dumps)
+            rdict.set_loads(dill.loads)
+            wo = WriteOptions()
+            wo.sync = True
+            rdict.set_write_options(write_opt=wo)
+            return rdict
 
 
 def parse_pattern(p):
