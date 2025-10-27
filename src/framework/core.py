@@ -7,7 +7,7 @@ import threading
 import time
 from collections import defaultdict, UserDict
 from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
-from contextlib import contextmanager
+from contextlib import contextmanager, AbstractContextManager
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, PriorityQueue, SimpleQueue
@@ -16,6 +16,7 @@ from typing import List, Optional
 import deepdiff
 import dill
 from rocksdict import Rdict, WriteOptions
+from rocksdict.rocksdict import AccessType
 
 logger = logging.getLogger(__name__)
 
@@ -26,9 +27,29 @@ class Event:
         self.__dict__.update(kwargs)
 
 
-class NoOpCache(UserDict):
+class InMemCache(UserDict):
     def close(self):
         self.clear()
+
+    def flush_wal(self, *args, **kwargs):
+        pass
+
+    def flush(self, *args, **kwargs):
+        pass
+
+class NoOpCache(UserDict):
+
+    def close(self):
+        self.clear()
+
+    def __setitem__(self, key, value):
+        pass # do nothing
+
+    def flush_wal(self, *args, **kwargs):
+        pass
+
+    def flush(self, *args, **kwargs):
+        pass
 
 
 @contextmanager
@@ -180,6 +201,53 @@ class Inbox:
                 )
 
 
+
+import signal
+import sys
+import blinker
+import os
+
+interrupted = blinker.signal("interrupted")
+
+def chain_signal_handler(sig, new_handler):
+    old_handler = signal.getsignal(sig)
+
+    @functools.wraps(new_handler)
+    def chained_handler(*args, **kwargs):
+        new_handler(*args, **kwargs)
+        if callable(old_handler):
+            old_handler(*args, **kwargs)
+
+    signal.signal(sig, chained_handler)
+
+def pipeline_handler(signum, frame):
+    logging.info("propagating executor shutdown events...", file=sys.stderr)
+    try:
+        interrupted.send()
+    except Exception as e:
+        print(e, file=sys.stderr)
+        raise e
+
+chain_signal_handler(signal.SIGINT, pipeline_handler)
+
+class InterruptHandler(AbstractContextManager):
+
+    def __init__(self, executor: ThreadPoolExecutor):
+        self.executor: ThreadPoolExecutor = executor
+
+    def handler(self, sender):
+        logger.info("shutting down task executor...")
+        self.executor.shutdown(wait=True, cancel_futures=True)
+
+    def __enter__(self):
+        interrupted.connect(self.handler)
+        return self
+
+    def __exit__(self, typ, value, traceback):
+        interrupted.disconnect(self.handler)
+        return False
+
+
 class Pipeline:
     def __init__(
         self,
@@ -195,6 +263,7 @@ class Pipeline:
         self.done = 0
         self.cond = threading.Condition()
         self.rdyq = PriorityQueue()
+        self.q = SimpleQueue()
         self.strict_interest_inference = strict_interest_inference
         self.max_workers = len(processors) if max_workers is None else max_workers
         self.config = dict() if config is None else config.copy()
@@ -217,131 +286,126 @@ class Pipeline:
             logger.debug(f"registering interest for {processor}: {interest}")
             self.processors[interest].add(processor)
 
-    @contextmanager
-    def interrupt_handled(
-        self,
-        executor: ThreadPoolExecutor,
-    ):
-        import signal
-        import sys
-
-        old_handler = signal.getsignal(signal.SIGINT)
-
-        def handler(signum, frame):
-            print("main pipeline executor shutting down...", file=sys.stderr)
-            signal.signal(signal.SIGINT, signal.SIG_DFL)
-            executor.shutdown(cancel_futures=True, wait=False)
-
-        signal.signal(signal.SIGINT, handler)
-        try:
-            yield
-        finally:
-            signal.signal(signal.SIGINT, old_handler)
-
     def run(self):
         with (
             ThreadPoolExecutor(1) as main_executor,
-            ThreadPoolExecutor(self.max_workers) as task_executor,
         ):
-            q = SimpleQueue()
-            with self.interrupt_handled(task_executor):
-                stop = threading.Event()
+            q = self.q
+
+            aborting = threading.Event()
+            with self.cond:
+                last_jobs = self.jobs
+                aborting.clear()
+
+            main_executor.submit(self.execute_events, q)
+
+            phase = 0
+            idle_jobs_increment = 0
+            while not aborting.is_set():
+                logger.info(f"starting phase: {phase:02d}")
+                start = time.perf_counter()
+                q.put(True)
+                # Wait for all outstanding jobs (including nested emissions) to complete.
+                self.wait()
+
                 with self.cond:
+                    if self.jobs <= (last_jobs + idle_jobs_increment):
+                        # this means that no other new jobs were launched during this phase.
+                        # proceed to abort
+                        aborting.set()
                     last_jobs = self.jobs
-                    stop.clear()
+                end = time.perf_counter()
+                logger.info(f"ending phase: {phase:02d}; elapsed time: {end - start:.4f} seconds")
+                phase += 1
 
-                main_executor.submit(self.execute_events, task_executor, q)
+                # let the current task executor finish, then immediately launch a task executor for the next phase
+                q.put(False)
+                main_executor.submit(self.execute_events, q)
 
-                phase = 0
-                idle_jobs_increment = 0
-                while not stop.is_set():
-                    logger.info(f"starting phase: {phase:02d}")
-                    start = time.perf_counter()
-                    q.put(True)
-                    # Wait for all outstanding jobs (including nested emissions) to complete.
-                    self.wait()
+                idle_jobs_increment = self.submit(Event(name="__PHASE__", phase=phase)) + 1  # the expected increment in jobs count when no other jobs are launched by the processors.
+            else:
+                q.put(True)
+                self.wait()  # wait for the phasing-spawned events to finish
 
-                    with self.cond:
-                        if self.jobs == (last_jobs + idle_jobs_increment):
-                            # this means that no other new jobs were launched.
-                            stop.set()
-                        last_jobs = self.jobs
-                    end = time.perf_counter()
-                    logger.info(f"ending phase: {phase:02d}; elapsed time: {end - start:.4f} seconds")
-                    phase += 1
-                    idle_jobs_increment = self.submit(Event(name="__PHASE__", phase=phase)) + 1  # the expected increment in jobs count when no other jobs are launched by the processors.
-                else:
-                    q.put(True)
-                    self.wait()  # wait for the phasing-spawned events to finish
+                # final phase
+                logger.info("processing done; proceeding to shutdown phase")
 
-                    # final phase
-                    logger.info("processing done; proceeding to shutdown phase")
+                q.put(False)
+                main_executor.submit(self.execute_events, q)
 
-                    # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-                    self.submit(Event(name="__POISON__"))
+                # Submit poison-pill so the dispatcher can exit its blocking queue loop.
+                self.submit(Event(name="__POISON__"))
 
-                    # Wake dispatcher to process the poison if it is currently waiting on q.get()
-                    # with an empty ready queue.
-                    q.put(True)
+                # Wake dispatcher to process the poison if it is currently waiting on q.get()
+                # with an empty ready queue.
+                q.put(True)
 
-                    # Wait until the poison event is processed and the dispatcher exits.
-                    self.wait()
+                # Wait until the poison event is processed and the dispatcher exits.
+                self.wait()
 
-                    q.put(False)
+                q.put(False)
 
-                    logger.info("dispatcher terminated")
+                logger.info("dispatcher terminated")
 
         logger.info("pipeline run completed")
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
-        self.increment()
         recipients = set()
-
-        # Collect all relevant recipients
-        if not self.strict_interest_inference:
-            recipients |= self.processors.get((None, None), set())
-
-        event_class = event.__class__.__name__
-        recipients |= self.processors.get((event_class, None), set())
-        recipients |= self.processors.get((event_class, event.name), set())
-
-        for processor in recipients:
+        try:
             self.increment()
-            inbox = self.get_inbox(processor)
-            inbox.put_event(event)
-        self.decrement()
-        return len(recipients)
+            # Collect all relevant recipients
+            if not self.strict_interest_inference:
+                recipients |= self.processors.get((None, None), set())
 
-    def execute_events(self, executor: ThreadPoolExecutor, q: SimpleQueue):
-        with executor:
-            # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
-            while q.get():
-                try:
-                    # Drain all ready processors without blocking on an empty ready queue.
-                    while entry := self.rdyq.get_nowait():
-                        processor = entry.processor
-                        # One of the processors indicated readiness (has an event and an available slot).
-                        inbox: Inbox = self.get_inbox(processor)
-                        event: Event = inbox.take_event()
-                        context = Context(self)
-                        callback = functools.partial(
-                            context.done_callback,
-                            processor=processor,
-                            event=event,
-                            inbox=inbox,
-                            q=q,
-                        )
-                        future = executor.submit(processor.process, context, event)
-                        future.add_done_callback(callback)
-                except Empty:
-                    continue
-                except Exception as e:
-                    f = Future()
-                    f.set_exception(e)
-                    callback(
-                        f
-                    )  # manually invoke the call back function to ensure integrity of job counting
+            event_class = event.__class__.__name__
+            recipients |= self.processors.get((event_class, None), set())
+            recipients |= self.processors.get((event_class, event.name), set())
+
+            for processor in recipients:
+                self.increment()
+                inbox = self.get_inbox(processor)
+                inbox.put_event(event)
+            self.decrement()
+            return len(recipients)
+        finally:
+            if recipients:
+                self.q.put(True)  # force a tick; otherwise the pipeline will only tick upon task completion
+
+
+    def execute_events(self, q: SimpleQueue):
+        with ThreadPoolExecutor(self.max_workers) as executor:
+            with InterruptHandler( executor, ):
+
+                # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
+                while q.get():
+                    try:
+                        # Drain all ready processors without blocking on an empty ready queue.
+                        while entry := self.rdyq.get_nowait():
+                            processor = entry.processor
+                            # One of the processors indicated readiness (has an event and an available slot).
+                            inbox: Inbox = self.get_inbox(processor)
+                            event: Event = inbox.take_event()
+                            context = Context(self)
+                            callback = functools.partial(
+                                context.done_callback,
+                                processor=processor,
+                                event=event,
+                                inbox=inbox,
+                                q=q,
+                            )
+                            future = executor.submit(processor.process, context, event)
+                            future.add_done_callback(callback)
+                    except Empty:
+                        continue
+                    except Exception as e:
+                        f = Future()
+                        f.set_exception(e)
+                        callback(
+                            f
+                        )  # manually invoke the call back function to ensure integrity of job counting
+
+
 
     def increment(self):
         with self.cond:
@@ -355,17 +419,21 @@ class Pipeline:
 
     def wait(self):
         with self.cond:
-            self.cond.wait_for(lambda: self.done >= self.jobs)
+            try:
+                self.cond.wait_for(lambda: self.done >= self.jobs)
+            except KeyboardInterrupt:
+                self.done = self.jobs
+                pass
 
     @functools.cache
     def archive(self, suffix: Optional[str]):
         if self.workspace is None:
-            return NoOpCache()
+            return InMemCache()
         else:
             path = self.workspace.joinpath(suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
             rdict = Rdict(
-                str(path)
+                str(path),
             )
             rdict.set_dumps(dill.dumps)
             rdict.set_loads(dill.loads)
@@ -373,7 +441,6 @@ class Pipeline:
             wo.sync = True
             rdict.set_write_options(write_opt=wo)
             return rdict
-
 
 def parse_pattern(p):
     import ast

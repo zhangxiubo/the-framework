@@ -11,6 +11,7 @@ from collections.abc import Callable, Iterable
 from typing import Any, Collection, List, Optional
 
 import deepdiff
+from framework.core import InMemCache
 
 from .core import AbstractProcessor, Context, Event, timeit, NoOpCache
 
@@ -97,7 +98,6 @@ class ReactiveBuilder(AbstractProcessor):
                     # kicks-off downstream tasks
                     context.submit(ReactiveEvent(name="resolve", target=require))
 
-        pass
 
     def reply(self, context: Context, event: ReactiveEvent):
         match event:
@@ -147,7 +147,7 @@ class ReactiveBuilder(AbstractProcessor):
         """
         Overriding processors should call super().on_terminate(context) to ensure cache stores are properly closed.
         """
-        self.get_cache(context).close()
+        self.get_cache(context).flush_wal(sync=True)
 
 
     def get_cache(self, context: Context):
@@ -158,7 +158,7 @@ class ReactiveBuilder(AbstractProcessor):
 
     @functools.cache
     def get_noop_cache(self):
-        return NoOpCache()
+        return InMemCache()
 
 
 def reactive(
