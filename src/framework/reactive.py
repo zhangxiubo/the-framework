@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import re
 import functools
 import itertools
 import logging
@@ -38,7 +39,8 @@ class ReactiveBuilder(AbstractProcessor):
             name=name,
         )
         self.provides: str = provides
-        self.requires: List[str] = list(OrderedDict.fromkeys(requires))
+        self.ops = [(lambda x: (*x,)) if r.startswith('*') else (lambda x: (x,)) for r in requires]
+        self.requires: List[str] = list(OrderedDict.fromkeys([re.sub(r'^\*', '', r) for r in requires]))
         self.handlers = {self.new, self.listen}
         self.input_store = defaultdict(deque)  # requrie -> artifacts (ingridents)
         self.persist = persist
@@ -62,16 +64,16 @@ class ReactiveBuilder(AbstractProcessor):
                     )
 
     def publish(self, context: Context):
-        iter = [tuple()]
+        keys = [tuple()]
         if len(self.requires) > 0:
-            iter = list(zip(*[self.input_store[require] for require in self.requires]))
+            keys = list(zip(*[self.input_store[require] for require in self.requires]))
 
-        for key in iter:
+        for key in keys:
             skey = deepdiff.DeepHash(key)[key]
             archive = self.get_cache(context)
             if skey not in archive:
                 with timeit(self.build.__qualname__, logger=logger):
-                    artifacts = self.build(context, *key)
+                    artifacts = self.build(context, *itertools.chain.from_iterable(o(k) for k, o in zip(key, self.ops)))
                     assert isinstance(artifacts, Iterable)
                     collected = list()
                     for artifact in artifacts:
