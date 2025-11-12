@@ -15,7 +15,7 @@ from typing import List, Optional
 
 import deepdiff
 import dill
-from rocksdict import Rdict, WriteOptions
+from rocksdict import Rdict, WriteOptions, ReadOptions, Options
 from rocksdict.rocksdict import AccessType
 
 logger = logging.getLogger(__name__)
@@ -205,7 +205,6 @@ class Inbox:
 import signal
 import sys
 import blinker
-import os
 
 interrupted = blinker.signal("interrupted")
 
@@ -268,6 +267,8 @@ class Pipeline:
         self.max_workers = len(processors) if max_workers is None else max_workers
         self.config = dict() if config is None else config.copy()
 
+        self.archives = list()
+
         self.processors = defaultdict(set)
         for processor in processors:
             self.register_processor(processor)
@@ -275,6 +276,8 @@ class Pipeline:
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
+
+        self.submit(Event(name='__INIT__'))
 
     @functools.cache
     def get_inbox(self, processor: "AbstractProcessor"):
@@ -287,67 +290,73 @@ class Pipeline:
             self.processors[interest].add(processor)
 
     def run(self):
-        with (
-            ThreadPoolExecutor(1) as main_executor,
-        ):
-            q = self.q
+        try:
+            with (
+                ThreadPoolExecutor(1) as main_executor,
+            ):
+                q = self.q
 
-            aborting = threading.Event()
-            with self.cond:
-                last_jobs = self.jobs
-                aborting.clear()
-
-            main_executor.submit(self.execute_events, q)
-
-            phase = 0
-            idle_jobs_increment = 0
-            while not aborting.is_set():
-                logger.info(f"starting phase: {phase:02d}")
-                start = time.perf_counter()
-                q.put(True)
-                # Wait for all outstanding jobs (including nested emissions) to complete.
-                self.wait()
-
+                aborting = threading.Event()
                 with self.cond:
-                    if self.jobs <= (last_jobs + idle_jobs_increment):
-                        # this means that no other new jobs were launched during this phase.
-                        # proceed to abort
-                        aborting.set()
                     last_jobs = self.jobs
-                end = time.perf_counter()
-                logger.info(f"ending phase: {phase:02d}; elapsed time: {end - start:.4f} seconds")
-                phase += 1
+                    aborting.clear()
 
-                # let the current task executor finish, then immediately launch a task executor for the next phase
-                q.put(False)
                 main_executor.submit(self.execute_events, q)
 
-                idle_jobs_increment = self.submit(Event(name="__PHASE__", phase=phase)) + 1  # the expected increment in jobs count when no other jobs are launched by the processors.
-            else:
-                q.put(True)
-                self.wait()  # wait for the phasing-spawned events to finish
+                phase = 0
+                idle_jobs_increment = 0
+                while not aborting.is_set():
+                    logger.info(f"starting phase: {phase:02d}")
+                    start = time.perf_counter()
+                    q.put(True)
+                    # Wait for all outstanding jobs (including nested emissions) to complete.
+                    self.wait()
 
-                # final phase
-                logger.info("processing done; proceeding to shutdown phase")
+                    with self.cond:
+                        if self.jobs <= (last_jobs + idle_jobs_increment):
+                            # this means that no other new jobs were launched during this phase.
+                            # proceed to abort
+                            aborting.set()
+                        last_jobs = self.jobs
+                    end = time.perf_counter()
+                    logger.info(f"ending phase: {phase:02d}; elapsed time: {end - start:.4f} seconds")
+                    phase += 1
 
-                q.put(False)
-                main_executor.submit(self.execute_events, q)
+                    # let the current task executor finish, then immediately launch a task executor for the next phase
+                    q.put(False)
+                    main_executor.submit(self.execute_events, q)
 
-                # Submit poison-pill so the dispatcher can exit its blocking queue loop.
-                self.submit(Event(name="__POISON__"))
+                    idle_jobs_increment = self.submit(Event(name="__PHASE__", phase=phase)) + 1  # the expected increment in jobs count when no other jobs are launched by the processors.
+                else:
+                    q.put(True)
+                    self.wait()  # wait for the phasing-spawned events to finish
 
-                # Wake dispatcher to process the poison if it is currently waiting on q.get()
-                # with an empty ready queue.
-                q.put(True)
+                    # final phase
+                    logger.info("processing done; proceeding to shutdown phase")
 
-                # Wait until the poison event is processed and the dispatcher exits.
-                self.wait()
+                    q.put(False)
+                    main_executor.submit(self.execute_events, q)
 
-                q.put(False)
+                    # Submit poison-pill so the dispatcher can exit its blocking queue loop.
+                    self.submit(Event(name="__POISON__"))
 
-                logger.info("dispatcher terminated")
+                    # Wake dispatcher to process the poison if it is currently waiting on q.get()
+                    # with an empty ready queue.
+                    q.put(True)
 
-        logger.info("pipeline run completed")
+                    # Wait until the poison event is processed and the dispatcher exits.
+                    self.wait()
+
+                    q.put(False)
+
+                    logger.info("dispatcher terminated")
+        finally:
+            for suffix, archive in self.archives:
+                logger.info(f"closing archive for archive: {suffix}")
+                print(f"closing archive for archive: {suffix}")
+                archive.close()
+
+            logger.info("pipeline run completed")
 
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
@@ -426,21 +435,27 @@ class Pipeline:
                 pass
 
     @functools.cache
-    def archive(self, suffix: Optional[str]):
+    def archive(self, suffix: Optional[str], readonly=False):
         if self.workspace is None:
-            return InMemCache()
+            archive = InMemCache()
         else:
             path = self.workspace.joinpath(suffix)
             path.parent.mkdir(parents=True, exist_ok=True)
-            rdict = Rdict(
-                str(path),
-            )
-            rdict.set_dumps(dill.dumps)
-            rdict.set_loads(dill.loads)
-            wo = WriteOptions()
-            wo.sync = True
-            rdict.set_write_options(write_opt=wo)
-            return rdict
+            try:
+                rdict = Rdict(
+                    str(path),
+                    access_type=[AccessType.read_write(), AccessType.read_only(), ][readonly],
+                )
+                rdict.set_dumps(dill.dumps)
+                rdict.set_loads(dill.loads)
+                wo = WriteOptions()
+                wo.sync = True
+                rdict.set_write_options(write_opt=wo)
+                archive = rdict
+            except Exception as e:
+                raise e
+        self.archives.append((suffix, archive))
+        return archive
 
 def parse_pattern(p):
     import ast

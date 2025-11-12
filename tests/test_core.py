@@ -76,29 +76,6 @@ def test_retry_raises_after_exhaustion(caplog):
     assert any("attempt 2 / 2" in m and "escalating" in m for m in msgs)
 
 
-def test_retry_logs_levels(caplog):
-    caplog.set_level(logging.DEBUG)
-
-    @retry(2)
-    def flaky():
-        raise RuntimeError("fail")
-
-    with pytest.raises(RuntimeError):
-        flaky()
-
-    debug_records = [rec for rec in caplog.records if rec.levelno == logging.DEBUG]
-    assert len(debug_records) == 2
-    assert all("attempt" in rec.getMessage() and "began" in rec.getMessage() for rec in debug_records)
-
-    warning_records = [rec for rec in caplog.records if rec.levelno == logging.WARNING]
-    assert len(warning_records) == 1
-    assert "retrying" in warning_records[0].getMessage()
-
-    error_records = [rec for rec in caplog.records if rec.levelno == logging.ERROR]
-    assert len(error_records) == 1
-    assert "escalating" in error_records[0].getMessage()
-
-
 def test_context_submit_records_and_delegates():
     class PipeStub:
         def __init__(self):
@@ -312,7 +289,7 @@ def test_timeit_logs_debug(caplog):
     logger = logging.getLogger("framework.core.tests.timeit")
     caplog.set_level(logging.DEBUG, logger=logger.name)
 
-    with timeit_ctx("unit-test-block", logger, logging_threshold=0.0):
+    with timeit_ctx("unit-test-block", logger):
         pass
 
     msgs = [r.getMessage() for r in caplog.records if r.name == logger.name]

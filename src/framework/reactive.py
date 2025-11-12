@@ -53,6 +53,8 @@ class ReactiveBuilder(AbstractProcessor):
         match event:
             case ReactiveEvent() as e:
                 self._process(context, e)
+            case Event(name="__INIT__") as e:
+                self.on_init(context)
             case Event(name="__POISON__") as e:
                 self.on_terminate(context)
             case Event(name="__PHASE__", phase=phase) as e:
@@ -144,6 +146,9 @@ class ReactiveBuilder(AbstractProcessor):
 
     def phase(self, context: Context, phase: int):
         return tuple()
+
+    def on_init(self, context: Context):
+        pass
 
     def on_terminate(self, context: Context):
         """
