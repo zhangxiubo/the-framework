@@ -179,6 +179,27 @@ def test_pipeline_interest_inference_and_submit_routing():
     assert p_default.submit(Event(name="X")) == 2  # ProcX + generic
 
 
+def test_strict_interest_matches_event_subclasses():
+    class CustomEvent(Event):
+        pass
+
+    seen = []
+
+    class BaseMatcher(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="ping"):
+                    seen.append(event)
+         
+
+    pipe = Pipeline([BaseMatcher()], strict_interest_inference=True)
+    pipe.submit(CustomEvent(name="ping"))
+    run_dispatcher_once(pipe)
+
+    # BaseMatcher should see subclassed events even though it pattern-matches Event
+    assert seen != []  # Expected to fail: nothing dispatched for subclasses
+
+
 def test_pipeline_execute_events_processes_ready_processors():
     ran = []
 

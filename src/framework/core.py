@@ -367,9 +367,9 @@ class Pipeline:
             if not self.strict_interest_inference:
                 recipients |= self.processors.get((None, None), set())
 
-            event_class = event.__class__.__name__
-            recipients |= self.processors.get((event_class, None), set())
-            recipients |= self.processors.get((event_class, event.name), set())
+            for event_class in self._event_class_names(event):
+                recipients |= self.processors.get((event_class, None), set())
+                recipients |= self.processors.get((event_class, event.name), set())
 
             for processor in recipients:
                 self.increment()
@@ -433,6 +433,20 @@ class Pipeline:
             except KeyboardInterrupt:
                 self.done = self.jobs
                 pass
+
+    @staticmethod
+    def _event_class_names(event: Event) -> List[str]:
+        """
+        Return the MRO class names for the event limited to Event subclasses.
+        Enables processors matching on base Event types to receive subclassed events.
+        """
+        names = []
+        for cls in type(event).mro():
+            if cls is object:
+                break
+            if issubclass(cls, Event):
+                names.append(cls.__name__)
+        return names or [event.__class__.__name__]
 
     @functools.cache
     def archive(self, suffix: Optional[str], readonly=False):

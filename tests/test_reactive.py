@@ -308,3 +308,23 @@ def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
     run_dispatcher_once(pipe)
 
     assert seen == [20]
+
+
+def test_starred_requires_forward_both_raw_and_expanded_arguments():
+    captured = []
+
+    class DualUse(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X", "*X"], persist=False)
+
+        def build(self, context, *args):
+            captured.append(args)
+            yield from []
+
+    pipe = Pipeline([DualUse()])
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=(7, 9)))
+    pipe.submit(ReactiveEvent(name="resolve", target="Y"))
+    run_dispatcher_once(pipe)
+
+    # Expect the tuple and its expanded entries; currently only the tuple arrives.
+    assert captured == [((7, 9), 7, 9)]  # Expected to fail

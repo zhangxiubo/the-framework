@@ -39,8 +39,15 @@ class ReactiveBuilder(AbstractProcessor):
             name=name,
         )
         self.provides: str = provides
-        self.ops = [(lambda x: (*x,)) if r.startswith('*') else (lambda x: (x,)) for r in requires]
-        self.requires: List[str] = list(OrderedDict.fromkeys([re.sub(r'^\*', '', r) for r in requires]))
+        self.require_specs = []
+        normalized = OrderedDict()
+        for r in requires:
+            expand = r.startswith('*')
+            name = re.sub(r'^\*', '', r)
+            self.require_specs.append((name, expand))
+            normalized.setdefault(name, None)
+        self.requires: List[str] = list(normalized.keys())
+        self.require_index = {name: idx for idx, name in enumerate(self.requires)}
         self.handlers = {self.new, self.listen}
         self.input_store = defaultdict(deque)  # requrie -> artifacts (ingridents)
         self.persist = persist
@@ -76,7 +83,14 @@ class ReactiveBuilder(AbstractProcessor):
             archive = self.get_cache(context)
             if skey not in archive:
                 with timeit(self.build.__qualname__, logger=logger):
-                    artifacts = self.build(context, *itertools.chain.from_iterable(o(k) for k, o in zip(key, self.ops)))
+                    args = []
+                    for req_name, expand in self.require_specs:
+                        value = key[self.require_index[req_name]]
+                        if expand:
+                            args.extend(tuple(value))
+                        else:
+                            args.append(value)
+                    artifacts = self.build(context, *args)
                     assert isinstance(artifacts, Iterable)
                     collected = list()
                     for artifact in artifacts:
