@@ -1,6 +1,4 @@
 import threading
-from concurrent.futures import ThreadPoolExecutor
-from queue import SimpleQueue
 from typing import MutableMapping
 
 
@@ -20,11 +18,10 @@ from framework.reactive import (  # noqa: E402
 
 
 def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
-    q = SimpleQueue()
+    q = pipeline.q
 
     def runner():
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            pipeline.execute_events(executor, q)
+        pipeline.execute_events(q)
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()

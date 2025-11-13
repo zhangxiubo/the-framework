@@ -1,6 +1,6 @@
 import logging
 import threading
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future
 from queue import PriorityQueue, SimpleQueue
 
 import pytest
@@ -26,11 +26,10 @@ def run_dispatcher_once(pipeline: Pipeline):
     Start a dispatcher thread, pulse once, wait for all work,
     then stop dispatcher.
     """
-    q = SimpleQueue()
+    q = pipeline.q
 
     def runner():
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            pipeline.execute_events(executor, q)
+        pipeline.execute_events(q)
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -289,7 +288,7 @@ def test_timeit_logs_debug(caplog):
     logger = logging.getLogger("framework.core.tests.timeit")
     caplog.set_level(logging.DEBUG, logger=logger.name)
 
-    with timeit_ctx("unit-test-block", logger):
+    with timeit_ctx("unit-test-block", logger, logging_threshold=0):
         pass
 
     msgs = [r.getMessage() for r in caplog.records if r.name == logger.name]
