@@ -273,7 +273,7 @@ class StreamSampler(ReactiveBuilder):
         context,
         *args,
     ):
-        if random.random() > self.probability:
+        if self.random.random() > self.probability:
             yield args
 
 
