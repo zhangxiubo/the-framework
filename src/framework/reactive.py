@@ -71,6 +71,7 @@ class ReactiveBuilder(AbstractProcessor):
             keys = list(zip(*[self.input_store[require] for require in self.requires]))
 
         for key in keys:
+            # each key in keys is a tuple of known input arguments
             skey = deepdiff.DeepHash(key)[key]
             archive = self.get_cache(context)
             if skey not in archive:
@@ -273,7 +274,7 @@ class StreamSampler(ReactiveBuilder):
         context,
         *args,
     ):
-        if self.random.random() > self.probability:
+        if self.random.random() < self.probability:
             yield args
 
 
