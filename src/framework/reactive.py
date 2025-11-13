@@ -1,3 +1,5 @@
+"""Reactive builders layered on top of the core event pipeline."""
+
 from __future__ import annotations
 
 import abc
@@ -20,10 +22,19 @@ logger = logging.getLogger(__name__)
 
 
 class ReactiveEvent(Event):
+    """Event subtype used by the reactive layer for `resolve`/`built` flows."""
     pass
 
 
 class ReactiveBuilder(AbstractProcessor):
+    """Base class for dependency-aware processors that react to ``ReactiveEvent``s.
+
+    ``requires`` defines upstream targets. Prefix a requirement with ``*`` to expand
+    tuple artifacts into individual arguments before passing them to ``build``.
+    When ``persist`` is ``True`` the builder stores its outputs in the pipeline archive
+    and future ``resolve`` requests are served by the replay-only ``reply`` handler.
+    """
+
     def __init__(
         self,
         provides: str,
@@ -53,10 +64,12 @@ class ReactiveBuilder(AbstractProcessor):
         self.persist = persist
 
     def _process(self, context: Context, event: ReactiveEvent):
+        """Dispatch to the currently-installed handler set."""
         for handler in list(self.handlers):
             handler(context, event)
 
     def process(self, context: Context, event: ReactiveEvent):
+        """Handle lifecycle events plus the reactive ``resolve``/``built`` traffic."""
         match event:
             case ReactiveEvent() as e:
                 self._process(context, e)
@@ -73,6 +86,7 @@ class ReactiveBuilder(AbstractProcessor):
                     )
 
     def publish(self, context: Context):
+        """Attempt to build artifacts once every requirement has at least one value."""
         keys = [tuple()]
         if len(self.requires) > 0:
             keys = list(zip(*[self.input_store[require] for require in self.requires]))
@@ -105,6 +119,7 @@ class ReactiveBuilder(AbstractProcessor):
                 self.input_store[require].popleft()
 
     def new(self, context: Context, event: ReactiveEvent):
+        """Initial ``resolve`` handler installing the steady-state `reply`/`react` pair."""
         match event:
             case ReactiveEvent(name="resolve", target=target) if (
                 self.provides == target
@@ -119,6 +134,7 @@ class ReactiveBuilder(AbstractProcessor):
 
 
     def reply(self, context: Context, event: ReactiveEvent):
+        """Replay cached artifacts when a ``resolve`` arrives for ``provides``."""
         match event:
             case ReactiveEvent(name="resolve", target=target) if (
                 self.provides == target
@@ -141,6 +157,7 @@ class ReactiveBuilder(AbstractProcessor):
                         )
 
     def listen(self, context: Context, event: ReactiveEvent):
+        """Collect artifacts during the bootstrap phase before publication begins."""
         match event:
             case ReactiveEvent(name="built", target=target, artifact=artifact) if (
                 target in self.requires
@@ -148,6 +165,7 @@ class ReactiveBuilder(AbstractProcessor):
                 self.input_store[target].append(artifact)
 
     def react(self, context: Context, event: ReactiveEvent):
+        """Steady-state handler: consume new artifacts and trigger builds."""
         match event:
             case ReactiveEvent(name="built", target=target, artifact=artifact) if (
                 target in self.requires
@@ -157,12 +175,15 @@ class ReactiveBuilder(AbstractProcessor):
 
     @abc.abstractmethod
     def build(self, context: Context, *args, **kwargs):
+        """Yield artifacts to publish for ``self.provides``."""
         pass
 
     def phase(self, context: Context, phase: int):
+        """Optional hook giving builders a chance to emit work during phase ticks."""
         return tuple()
 
     def on_init(self, context: Context):
+        """Called when the pipeline emits ``__INIT__``."""
         pass
 
     def on_terminate(self, context: Context):
@@ -173,6 +194,7 @@ class ReactiveBuilder(AbstractProcessor):
 
 
     def get_cache(self, context: Context):
+        """Return a persistence-aware archive keyed by processor signature."""
         if self.persist:
             return context.pipeline.archive(self.signature())
         else:
@@ -180,6 +202,7 @@ class ReactiveBuilder(AbstractProcessor):
 
     @functools.cache
     def get_noop_cache(self):
+        """Memoized in-memory cache for non-persistent builders."""
         return InMemCache()
 
 
@@ -188,6 +211,7 @@ def reactive(
     requires: List[str],
     persist: bool = False,
 ):
+    """Class decorator that partially applies ``ReactiveBuilder.__init__``."""
     def decorator(cls):
         assert issubclass(cls, ReactiveBuilder)
         cls.__init__ = functools.partialmethod(
@@ -202,6 +226,8 @@ def reactive(
 
 
 class Collector(ReactiveBuilder):
+    """Batch inputs during a phase and forward them once per phase if changed."""
+
     def __init__(self, forwards_to, topics, limit=None):
         super().__init__(forwards_to, topics, persist=False)
         self.current_batch = list()
@@ -209,21 +235,26 @@ class Collector(ReactiveBuilder):
         self.limit = float("inf") if limit is None else limit
 
     def build(self, context, *args, **kwargs):
+        """Accumulate incoming artifacts up to the configured limit."""
         if len(self.current_batch) < self.limit:
             self.current_batch.append(args)
         yield from []
 
     def phase(self, context, phase):
+        """Emit the batch when advancing phases and remember historical values."""
         self.past_batches.append(self.current_batch)
         if self.current_batch:
             yield self.current_batch
         self.current_batch = list()
 
     def values(self):
+        """Iterate over all values ever seen."""
         return itertools.chain.from_iterable(self.past_batches + [self.current_batch])
 
 
 class Grouper(ReactiveBuilder):
+    """Group artifacts by a derived key per phase."""
+
     def __init__(self, forwards_to, topics, keyfunc: Callable[..., Any]):
         super().__init__(forwards_to, topics, persist=False)
         self.keyfunc = keyfunc
@@ -231,10 +262,12 @@ class Grouper(ReactiveBuilder):
         self.last = dict()
 
     def build(self, context, *args):
+        """Collect arguments under the derived key until the phase boundary."""
         key = self.keyfunc(*args)
         self.store[key].append(args)
 
     def phase(self, context, phase):
+        """On each phase, emit all groups and reset the working store."""
         self.last = self.store.copy()
         self.store.clear()
         if self.last:
@@ -243,6 +276,8 @@ class Grouper(ReactiveBuilder):
 
 
 class StreamGrouper(ReactiveBuilder):
+    """Streaming grouper that emits whenever the key changes."""
+
     def __init__(
         self,
         provides,
@@ -260,6 +295,7 @@ class StreamGrouper(ReactiveBuilder):
         context,
         *args,
     ):
+        """Emit the previous key's group when a new key is observed."""
         thiskey = self.keyfunc(*args)
         if thiskey == self.lastkey:
             self.lastset.append(args)
@@ -270,6 +306,7 @@ class StreamGrouper(ReactiveBuilder):
             self.lastset.append(args)
 
     def phase(self, context, phase):
+        """Flush any trailing group so nothing is lost between phases."""
         if self.lastkey is not None:
             yield (self.lastkey, self.lastset)
         self.lastkey = None
@@ -277,6 +314,8 @@ class StreamGrouper(ReactiveBuilder):
 
 
 class StreamSampler(ReactiveBuilder):
+    """Emit each artifact with a fixed probability."""
+
     def __init__(self, provides, requires, probability: float, seed=42, **kwargs):
         super().__init__(provides, requires, **kwargs)
         self.probability = probability
@@ -288,11 +327,14 @@ class StreamSampler(ReactiveBuilder):
         context,
         *args,
     ):
+        """Yield ``args`` whenever the RNG draw is beneath ``probability``."""
         if self.random.random() < self.probability:
             yield args
 
 
 class ReservoirSampler(ReactiveBuilder):
+    """Bounded-size random sample maintained via reservoir sampling."""
+
     def __init__(self, provides, requires, size: int, seed=42, **kwargs):
         super().__init__(provides, requires, **kwargs)
         self.size = size
@@ -305,12 +347,14 @@ class ReservoirSampler(ReactiveBuilder):
         context: Context,
         *args,
     ):
+        """Keep a max-heap of random priorities and trim it to ``size``."""
         heapq.heappush(self.heap, (self.random.random(), args))
         if len(self.heap) > self.size:
             heapq.heappop(self.heap)
         yield from []
 
     def phase(self, context, phase):
+        """Drain the heap and emit the sampled items."""
         while self.heap:
             _, item = heapq.heappop(self.heap)
             yield item
