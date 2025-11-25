@@ -251,7 +251,7 @@ def chain_signal_handler(sig, new_handler):
 
 def pipeline_handler(signum, frame):
     """Relay a SIGINT into the ``interrupted`` blinker signal."""
-    logging.info("propagating executor shutdown events...", file=sys.stderr)
+    logging.info("propagating executor shutdown events...")
     try:
         interrupted.send()
     except Exception as e:

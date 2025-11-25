@@ -265,6 +265,7 @@ class Grouper(ReactiveBuilder):
         """Collect arguments under the derived key until the phase boundary."""
         key = self.keyfunc(*args)
         self.store[key].append(args)
+        yield from []
 
     def phase(self, context, phase):
         """On each phase, emit all groups and reset the working store."""
@@ -278,6 +279,8 @@ class Grouper(ReactiveBuilder):
 class StreamGrouper(ReactiveBuilder):
     """Streaming grouper that emits whenever the key changes."""
 
+    _UNSET = object()  # Sentinel that can't collide with any user key
+
     def __init__(
         self,
         provides,
@@ -286,31 +289,27 @@ class StreamGrouper(ReactiveBuilder):
         **kwargs,
     ):
         super().__init__(provides, requires, persist=False, **kwargs)
-        self.lastkey = None
-        self.lastset = list()
+        self.lastkey = self._UNSET
+        self.lastset = []
         self.keyfunc = keyfunc
 
-    def build(
-        self,
-        context,
-        *args,
-    ):
+    def build(self, context, *args):
         """Emit the previous key's group when a new key is observed."""
         thiskey = self.keyfunc(*args)
         if thiskey == self.lastkey:
             self.lastset.append(args)
         else:
-            yield self.lastkey, self.lastset
+            if self.lastkey is not self._UNSET:
+                yield self.lastkey, self.lastset
             self.lastkey = thiskey
-            self.lastset = list()
-            self.lastset.append(args)
+            self.lastset = [args]
 
     def phase(self, context, phase):
         """Flush any trailing group so nothing is lost between phases."""
-        if self.lastkey is not None:
-            yield (self.lastkey, self.lastset)
-        self.lastkey = None
-        self.lastset = list()
+        if self.lastkey is not self._UNSET:
+            yield self.lastkey, self.lastset
+        self.lastkey = self._UNSET
+        self.lastset = []
 
 
 class StreamSampler(ReactiveBuilder):
