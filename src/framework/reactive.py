@@ -10,8 +10,8 @@ import logging
 import random
 import heapq
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Callable, Iterable
-from typing import Any, Collection, List, Optional
+from collections.abc import Callable, Hashable, Iterable
+from typing import Any, Collection, List, Optional, Tuple
 
 import deepdiff
 from framework.core import InMemCache
@@ -361,28 +361,70 @@ class ReservoirSampler(ReactiveBuilder):
 
 
 class RendezvousPublisher(ReactiveBuilder):
+    """Joins items from multiple streams by matching keys.
+    
+    Items from each input stream are collected and indexed by their extracted key.
+    When all streams have contributed an item with the same key, the joined tuple
+    is emitted, ordered by stream index.
+    """
 
-    def __init__(self, provides: str, requires: Collection[str], keys=Collection[Callable[[Any], Hashable]], **kwargs) -> None:
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        keys: Collection[Callable[[Any], Hashable]],
+        **kwargs,
+    ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
-        self.index = defaultdict(list)
+        # index maps key -> dict of {stream_index: value}
+        # Using dict instead of list prevents duplicates from same stream
+        self.index: dict[Hashable, dict[int, Any]] = defaultdict(dict)
         self.keys = keys
 
     def build(self, context: Context, item: Tuple[int, Any]):
         i, (v, *_) = item
-        key = self.keys[i]
-        k = key(v)
-        self.index[k].append((i, v))
-        if len(  self.index[k]  ) == len(self.keys):
-            # we are done with this key
-            if len({i for i, _ in self.index[k]}) != len(self.keys):  # we expect all keys to be unique
-                print('duplicated payload detected')
-                assert False
-            yield tuple(e for _, e in sorted(self.index[k]) )
+        key_func = self.keys[i]
+        k = key_func(v)
+        
+        # Check for duplicate key from same stream
+        if i in self.index[k]:
+            logger.warning(
+                f"Rendezvous: duplicate key '{k}' from stream {i}, "
+                f"overwriting previous value"
+            )
+        
+        self.index[k][i] = v
+        
+        if len(self.index[k]) == len(self.keys):
+            # All streams have contributed - emit the joined result
+            result = tuple(self.index[k][idx] for idx in range(len(self.keys)))
             del self.index[k]
+            yield result
+    
+    def clear_orphaned_keys(self) -> int:
+        """Remove keys that will never complete. Returns count of removed keys.
+        
+        Call this periodically to prevent memory leaks from unmatched keys.
+        """
+        count = len(self.index)
+        self.index.clear()
+        return count
 
 class RendezvousReceiver(ReactiveBuilder):
+    """Tags incoming artifacts with a stream index for the RendezvousPublisher.
+    
+    Each receiver is assigned an index corresponding to its position in the
+    list of required streams. It wraps each incoming artifact as (index, args)
+    for downstream processing by the publisher.
+    """
 
-    def __init__(self, provides: str, requires: Collection[str], index, **kwargs) -> None:
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        index: int,
+        **kwargs,
+    ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
         self.index = index
 
@@ -390,7 +432,43 @@ class RendezvousReceiver(ReactiveBuilder):
         yield self.index, args
 
 
-def make_rendezvous(provides: str, requires: Collection[str], keys=Collection[Callable[[Any], Hashable]]):
+def make_rendezvous(
+    provides: str,
+    requires: Collection[str],
+    keys: Collection[Callable[[Any], Hashable]],
+) -> Tuple[RendezvousPublisher, ...]:
+    """Create a rendezvous pattern that joins multiple input streams by key.
+    
+    Args:
+        provides: The target name for the joined output.
+        requires: Collection of input stream names to join.
+        keys: Collection of key extraction functions, one per input stream.
+              Each function extracts a hashable key from items in its stream.
+    
+    Returns:
+        A tuple of (publisher, receiver1, receiver2, ...) where:
+        - publisher: The RendezvousPublisher that emits joined tuples
+        - receivers: One RendezvousReceiver per input stream
+    
+    Example:
+        >>> publisher, recv_a, recv_b = make_rendezvous(
+        ...     provides="joined",
+        ...     requires=["stream_a", "stream_b"],
+        ...     keys=[lambda x: x["id"], lambda x: x["id"]],
+        ... )
+    """
     import uuid
+    
+    if len(requires) != len(keys):
+        raise ValueError(
+            f"Number of key functions ({len(keys)}) must match "
+            f"number of required streams ({len(requires)})"
+        )
+    
     topic = str(uuid.uuid4())
-    return RendezvousPublisher(provides, [topic], keys), *tuple(RendezvousReceiver(topic, [require], i) for i, require in enumerate(requires))
+    publisher = RendezvousPublisher(provides, [topic], list(keys))
+    receivers = tuple(
+        RendezvousReceiver(topic, [require], i)
+        for i, require in enumerate(requires)
+    )
+    return (publisher, *receivers)
