@@ -334,11 +334,9 @@ class StreamSampler(ReactiveBuilder):
 class ReservoirSampler(ReactiveBuilder):
     """Bounded-size random sample maintained via reservoir sampling."""
 
-    def __init__(self, provides, requires, size: int, seed=42, **kwargs):
+    def __init__(self, provides, requires, size: int, **kwargs):
         super().__init__(provides, requires, **kwargs)
         self.size = size
-        self.seed = seed
-        self.random = random.Random(seed)
         self.heap = []
 
     def build(
@@ -347,7 +345,9 @@ class ReservoirSampler(ReactiveBuilder):
         *args,
     ):
         """Keep a max-heap of random priorities and trim it to ``size``."""
-        heapq.heappush(self.heap, (self.random.random(), args))
+        seed = deepdiff.DeepHash(args)[args]
+        rng = random.Random(seed)
+        heapq.heappush(self.heap, (rng.random(), args))
         if len(self.heap) > self.size:
             heapq.heappop(self.heap)
         yield from []
