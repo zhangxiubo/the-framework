@@ -357,3 +357,40 @@ class ReservoirSampler(ReactiveBuilder):
         while self.heap:
             _, item = heapq.heappop(self.heap)
             yield item
+
+
+
+class RendezvousPublisher(ReactiveBuilder):
+
+    def __init__(self, provides: str, requires: Collection[str], keys=Collection[Callable[[Any], Hashable]], **kwargs) -> None:
+        super().__init__(provides, requires, persist=False, **kwargs)
+        self.index = defaultdict(list)
+        self.keys = keys
+
+    def build(self, context: Context, item: Tuple[int, Any]):
+        i, (v, *_) = item
+        key = self.keys[i]
+        k = key(v)
+        self.index[k].append((i, v))
+        if len(  self.index[k]  ) == len(self.keys):
+            # we are done with this key
+            if len({i for i, _ in self.index[k]}) != len(self.keys):  # we expect all keys to be unique
+                print('duplicated payload detected')
+                assert False
+            yield tuple(e for _, e in sorted(self.index[k]) )
+            del self.index[k]
+
+class RendezvousReceiver(ReactiveBuilder):
+
+    def __init__(self, provides: str, requires: Collection[str], index, **kwargs) -> None:
+        super().__init__(provides, requires, persist=False, **kwargs)
+        self.index = index
+
+    def build(self, context: Context, *args, **kwargs):
+        yield self.index, args
+
+
+def make_rendezvous(provides: str, requires: Collection[str], keys=Collection[Callable[[Any], Hashable]]):
+    import uuid
+    topic = str(uuid.uuid4())
+    return RendezvousPublisher(provides, [topic], keys), *tuple(RendezvousReceiver(topic, [require], i) for i, require in enumerate(requires))
