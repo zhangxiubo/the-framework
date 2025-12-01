@@ -3,20 +3,20 @@
 from __future__ import annotations
 
 import abc
-import re
 import functools
+import heapq
 import itertools
 import logging
 import random
-import heapq
+import re
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Hashable, Iterable
 from typing import Any, Collection, List, Optional, Tuple, Type
 
 import deepdiff
-from framework.core import InMemCache
 
-from .core import AbstractProcessor, Context, Event, timeit, NoOpCache
+from framework.core import InMemCache
+from .core import AbstractProcessor, Context, Event, timeit
 
 logger = logging.getLogger(__name__)
 
@@ -486,15 +486,15 @@ class LoadBalancerSequencer(ReactiveBuilder):
         self,
         provides: str,
         requires: Collection[str],
+        num_workers: int,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
-        self.next_seq = 0
+        self.num_workers = num_workers
 
     def build(self, context: Context, *args):
-        seq = self.next_seq
-        self.next_seq += 1
-        yield (seq, args)
+        seq = hash(deepdiff.DeepHash(args)[args]) % self.num_workers
+        yield seq, args
 
 
 class LoadBalancerRouter(ReactiveBuilder):
@@ -510,195 +510,29 @@ class LoadBalancerRouter(ReactiveBuilder):
         provides: str,
         requires: Collection[str],
         worker_id: int,
-        num_workers: int,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
         self.worker_id = worker_id
-        self.num_workers = num_workers
 
-    def build(self, context: Context, item):
-        seq, args = item
-        if seq % self.num_workers == self.worker_id:
-            yield (seq, args)
+    def build(self, context: Context, seq: int, items: Tuple[Any, ...]):
+        if seq == self.worker_id:
+            yield items
 
-
-class LoadBalancerWorkerWrapper(ReactiveBuilder):
-    """Wraps a worker to handle sequenced items and preserve sequence numbers.
-    
-    Receives (seq, args), calls the wrapped worker's build method with args,
-    collects all results, and yields (seq, results_list) to enable
-    downstream reordering.
-    """
-
-    def __init__(
-        self,
-        provides: str,
-        requires: Collection[str],
-        worker: ReactiveBuilder,
-        **kwargs,
-    ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
-        self.worker = worker
-
-    def build(self, context: Context, item):
-        seq, args = item
-        # Collect ALL results from the worker's build to preserve atomicity
-        results = list(self.worker.build(context, *args))
-        yield (seq, results)
-
-
-class LoadBalancerCollector(ReactiveBuilder):
-    """Collects worker results and emits in FIFO sequence order.
-    
-    Results from workers may arrive out of order (due to different processing
-    times). The collector buffers results and emits them strictly in sequence
-    order, ensuring deterministic FIFO semantics.
-    """
-
-    def __init__(
-        self,
-        provides: str,
-        requires: Collection[str],
-        **kwargs,
-    ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
-        self.buffer: dict[int, List[Any]] = {}
-        self.next_to_emit = 0
-
-    def build(self, context: Context, item):
-        seq, results = item
-        self.buffer[seq] = results
-        
-        # Emit all consecutive ready results in sequence order
-        while self.next_to_emit in self.buffer:
-            for result in self.buffer.pop(self.next_to_emit):
-                yield result
-            self.next_to_emit += 1
-    
-    def get_pending_count(self) -> int:
-        """Return the number of sequences waiting in the buffer."""
-        return len(self.buffer)
-    
-    def get_next_expected_seq(self) -> int:
-        """Return the next sequence number expected to be emitted."""
-        return self.next_to_emit
-
-
-def make_load_balancer(
+def parallelize(
     provides: str,
     requires: Collection[str],
-    worker_class: Type[ReactiveBuilder],
+    worker_builder: Type[ReactiveBuilder],
     num_workers: int,
-    worker_init_args: Optional[Tuple] = None,
-    worker_init_kwargs: Optional[dict] = None,
+    **kwargs,
 ) -> Tuple[ReactiveBuilder, ...]:
-    """Create a load balancer that distributes work across N worker instances.
-    
-    The load balancer maintains deterministic FIFO ordering - items are emitted
-    in exactly the same order they would be if processed by a single worker,
-    regardless of which worker processes them or how long each takes.
-    
-    Architecture (similar to make_rendezvous):
-        Input -> Sequencer -> (seq, item)
-                    |
-                    v
-            [Router_0, Router_1, ..., Router_N-1]  (each filters by seq % N)
-                    |
-                    v
-            [Worker_0, Worker_1, ..., Worker_N-1]  (instances of worker_class)
-                    |
-                    v  (all workers publish to shared results_topic)
-                Collector -> Output (reordered by seq)
-    
-    Args:
-        provides: Output topic for the load-balanced results.
-        requires: Input topics to distribute across workers.
-        worker_class: ReactiveBuilder subclass to instantiate for each worker.
-                      Only the build() method is used; provides/requires in the
-                      worker class are ignored since routing is handled by the
-                      load balancer.
-        num_workers: Number of parallel worker instances.
-        worker_init_args: Positional args to pass to worker_class.__init__().
-        worker_init_kwargs: Keyword args to pass to worker_class.__init__().
-    
-    Returns:
-        A tuple of all ReactiveBuilder components that should be added to the pipeline.
-    
-    Example:
-        >>> class MyWorker(ReactiveBuilder):
-        ...     def __init__(self):
-        ...         super().__init__(provides="unused", requires=[], persist=False)
-        ...     def build(self, context, item):
-        ...         yield item * 2  # Double each input
-        ...
-        >>> components = make_load_balancer(
-        ...     provides="doubled",
-        ...     requires=["numbers"],
-        ...     worker_class=MyWorker,
-        ...     num_workers=2,
-        ... )
-        >>> pipe = Pipeline([source, *components, sink])
-    
-    Note:
-        The worker's build() method should be stateless or thread-safe if
-        workers may process items concurrently. Each worker instance is
-        independent and may be called in any order.
-    """
-    if num_workers < 1:
-        raise ValueError(f"num_workers must be >= 1, got {num_workers}")
-    
-    # Deterministic base identifier derived from the output topic and worker class
-    # This ensures stable names across runs for caching/persistence
-    worker_class_name = worker_class.__name__
-    lb_id = f"lb_{provides}_{worker_class_name}"
-    
-    # Internal topics (deterministic, scoped to this load balancer)
-    sequenced_topic = f"{lb_id}_sequenced"
-    results_topic = f"{lb_id}_results"
-    
-    init_args = worker_init_args or ()
-    init_kwargs = worker_init_kwargs or {}
-    
-    components: List[ReactiveBuilder] = []
-    
-    # 1. Sequencer: assigns (seq, item) to each input
-    sequencer = LoadBalancerSequencer(
-        provides=sequenced_topic,
-        requires=list(requires),
-    )
-    components.append(sequencer)
-    
-    # 2. For each worker: Router -> WorkerWrapper
-    for i in range(num_workers):
-        router_topic = f"{lb_id}_router_{i}"
-        
-        # Router filters items for this worker
-        router = LoadBalancerRouter(
-            provides=router_topic,
-            requires=[sequenced_topic],
-            worker_id=i,
-            num_workers=num_workers,
-        )
-        components.append(router)
-        
-        # Worker wrapper processes items and publishes to shared results topic
-        # Each worker gets a deterministic unique name to avoid archive collisions
-        worker_kwargs = dict(init_kwargs)
-        worker_kwargs["name"] = f"{lb_id}_worker_{i}"
-        worker_instance = worker_class(*init_args, **worker_kwargs)
-        wrapper = LoadBalancerWorkerWrapper(
-            provides=results_topic,  # All workers publish to same topic
-            requires=[router_topic],
-            worker=worker_instance,
-        )
-        components.append(wrapper)
-    
-    # 3. Collector: gathers from shared results topic and reorders
-    collector = LoadBalancerCollector(
-        provides=provides,
-        requires=[results_topic],  # Single shared topic
-    )
-    components.append(collector)
-    
+
+    builder_name = worker_builder.__name__
+    components: List[ReactiveBuilder] = [LoadBalancerSequencer(provides=f'sequencer::{builder_name}::{provides}::{requires}', requires=requires, num_workers=num_workers)]
+
+    for n in range(num_workers):
+        components.append(LoadBalancerRouter(provides=f'worker::{builder_name}::{provides}::{requires}::{n:02d}', requires=[f'*sequencer::{builder_name}::{provides}::{requires}'], worker_id=n))
+        name = f'worker::{builder_name}::{provides}::{requires}::{n:02d}'
+        components.append(worker_builder(provides=provides, requires=[f'*{name}'], name=name, **kwargs))
+
     return tuple(components)
