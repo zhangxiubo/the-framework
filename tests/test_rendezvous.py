@@ -360,7 +360,9 @@ class TestRendezvousBugExposure:
         # All have the same key so they should match
         list(publisher.build(ctx, (2, ({"key": "shared", "src": "stream_2"},))))
         list(publisher.build(ctx, (0, ({"key": "shared", "src": "stream_0"},))))
-        results = list(publisher.build(ctx, (1, ({"key": "shared", "src": "stream_1"},))))
+        results = list(
+            publisher.build(ctx, (1, ({"key": "shared", "src": "stream_1"},)))
+        )
 
         # Should be sorted by stream index (0, 1, 2)
         assert len(results) == 1
@@ -699,3 +701,24 @@ class TestMakeRendezvousFactoryFunction:
                 keys=[lambda x: x, lambda x: x],  # Only 2 keys for 3 requires
             )
 
+    def test_make_rendezvous_handles_generator_keys(self):
+        """Generator keys should be materialized to list (bug fix regression test)."""
+        from framework.core import Context
+
+        def key_funcs():
+            yield lambda x: x["a"]
+            yield lambda x: x["b"]
+
+        publisher, recv_a, recv_b = make_rendezvous(
+            provides="joined",
+            requires=["stream_a", "stream_b"],
+            keys=key_funcs(),
+        )
+
+        pipeline = Pipeline([publisher])
+        ctx = Context(pipeline)
+
+        list(publisher.build(ctx, (0, ({"a": "k1"},))))
+        results = list(publisher.build(ctx, (1, ({"b": "k1"},))))
+
+        assert len(results) == 1
