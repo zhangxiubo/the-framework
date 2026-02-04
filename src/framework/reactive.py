@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 
 class ReactiveEvent(Event):
     """Event subtype used by the reactive layer for `resolve`/`built` flows."""
+
     pass
 
 
@@ -53,8 +54,8 @@ class ReactiveBuilder(AbstractProcessor):
         self.require_specs = []
         normalized = OrderedDict()
         for r in requires:
-            expand = r.startswith('*')
-            name = re.sub(r'^\*', '', r)
+            expand = r.startswith("*")
+            name = re.sub(r"^\*", "", r)
             self.require_specs.append((name, expand))
             normalized.setdefault(name, None)
         self.requires: List[str] = list(normalized.keys())
@@ -132,7 +133,6 @@ class ReactiveBuilder(AbstractProcessor):
                     # kicks-off downstream tasks
                     context.submit(ReactiveEvent(name="resolve", target=require))
 
-
     def reply(self, context: Context, event: ReactiveEvent):
         """Replay cached artifacts when a ``resolve`` arrives for ``provides``."""
         match event:
@@ -192,7 +192,6 @@ class ReactiveBuilder(AbstractProcessor):
         """
         self.get_cache(context).flush_wal(sync=True)
 
-
     def get_cache(self, context: Context):
         """Return a persistence-aware archive keyed by processor signature."""
         if self.persist:
@@ -212,6 +211,7 @@ def reactive(
     persist: bool = False,
 ):
     """Class decorator that partially applies ``ReactiveBuilder.__init__``."""
+
     def decorator(cls):
         assert issubclass(cls, ReactiveBuilder)
         cls.__init__ = functools.partialmethod(
@@ -359,10 +359,9 @@ class ReservoirSampler(ReactiveBuilder):
             yield item
 
 
-
 class RendezvousPublisher(ReactiveBuilder):
     """Joins items from multiple streams by matching keys.
-    
+
     Items from each input stream are collected and indexed by their extracted key.
     When all streams have contributed an item with the same key, the joined tuple
     is emitted, ordered by stream index.
@@ -385,34 +384,35 @@ class RendezvousPublisher(ReactiveBuilder):
         i, (v, *_) = item
         key_func = self.keys[i]
         k = key_func(v)
-        
+
         # Check for duplicate key from same stream
         if i in self.index[k]:
             logger.warning(
                 f"Rendezvous: duplicate key '{k}' from stream {i}, "
                 f"overwriting previous value"
             )
-        
+
         self.index[k][i] = v
-        
+
         if len(self.index[k]) == len(self.keys):
             # All streams have contributed - emit the joined result
             result = tuple(self.index[k][idx] for idx in range(len(self.keys)))
             del self.index[k]
             yield result
-    
+
     def clear_orphaned_keys(self) -> int:
         """Remove keys that will never complete. Returns count of removed keys.
-        
+
         Call this periodically to prevent memory leaks from unmatched keys.
         """
         count = len(self.index)
         self.index.clear()
         return count
 
+
 class RendezvousReceiver(ReactiveBuilder):
     """Tags incoming artifacts with a stream index for the RendezvousPublisher.
-    
+
     Each receiver is assigned an index corresponding to its position in the
     list of required streams. It wraps each incoming artifact as (index, args)
     for downstream processing by the publisher.
@@ -438,18 +438,18 @@ def make_rendezvous(
     keys: Collection[Callable[[Any], Hashable]],
 ) -> Tuple[RendezvousPublisher, ...]:
     """Create a rendezvous pattern that joins multiple input streams by key.
-    
+
     Args:
         provides: The target name for the joined output.
         requires: Collection of input stream names to join.
         keys: Collection of key extraction functions, one per input stream.
               Each function extracts a hashable key from items in its stream.
-    
+
     Returns:
         A tuple of (publisher, receiver1, receiver2, ...) where:
         - publisher: The RendezvousPublisher that emits joined tuples
         - receivers: One RendezvousReceiver per input stream
-    
+
     Example:
         >>> publisher, recv_a, recv_b = make_rendezvous(
         ...     provides="joined",
@@ -458,48 +458,43 @@ def make_rendezvous(
         ... )
     """
     import uuid
-    
-    if len(requires) != len(keys):
+
+    keys_list = list(keys)  # Materialize to support generators
+    if len(requires) != len(keys_list):
         raise ValueError(
-            f"Number of key functions ({len(keys)}) must match "
+            f"Number of key functions ({len(keys_list)}) must match "
             f"number of required streams ({len(requires)})"
         )
-    
+
     topic = str(uuid.uuid4())
-    publisher = RendezvousPublisher(provides, [topic], list(keys))
+    publisher = RendezvousPublisher(provides, [topic], keys_list)
     receivers = tuple(
-        RendezvousReceiver(topic, [require], i)
-        for i, require in enumerate(requires)
+        RendezvousReceiver(topic, [require], i) for i, require in enumerate(requires)
     )
     return (publisher, *receivers)
 
 
 class LoadBalancerSequencer(ReactiveBuilder):
-    """Assigns incrementing sequence numbers to incoming items.
-    
-    Each item from input topics gets tagged with (seq, item) where seq
-    is a monotonically increasing integer. This enables downstream
-    components to reconstruct FIFO ordering.
-    """
+    """Tags each input with a monotonically increasing sequence number."""
 
     def __init__(
         self,
         provides: str,
         requires: Collection[str],
-        num_workers: int,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
-        self.num_workers = num_workers
+        self._next_seq = 0
 
     def build(self, context: Context, *args):
-        seq = hash(deepdiff.DeepHash(args)[args]) % self.num_workers
+        seq = self._next_seq
+        self._next_seq += 1
         yield seq, args
 
 
 class LoadBalancerRouter(ReactiveBuilder):
     """Routes items to a specific worker based on sequence number modulo.
-    
+
     Each router has a worker_id and only forwards items where
     seq % num_workers == worker_id. This distributes work evenly
     across workers while maintaining deterministic routing.
@@ -510,29 +505,194 @@ class LoadBalancerRouter(ReactiveBuilder):
         provides: str,
         requires: Collection[str],
         worker_id: int,
+        num_workers: int,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
         self.worker_id = worker_id
+        self.num_workers = num_workers
 
-    def build(self, context: Context, seq: int, items: Tuple[Any, ...]):
-        if seq == self.worker_id:
-            yield items
+    def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
+        seq, args = item
+        if seq % self.num_workers == self.worker_id:
+            yield item
+
+
+class LoadBalancerWorkerWrapper(ReactiveBuilder):
+    """Wraps a worker builder and preserves FIFO ordering metadata.
+
+    Input artifact is `(seq, args)` and output artifact is `(seq, results)` where
+    `results` is a list of artifacts produced by the wrapped worker.
+    """
+
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        worker: ReactiveBuilder,
+        **kwargs,
+    ) -> None:
+        super().__init__(provides, requires, persist=False, **kwargs)
+        self.worker = worker
+
+    def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
+        seq, args = item
+        results = list(self.worker.build(context, *args))
+        yield seq, results
+
+
+class LoadBalancerWorkerEmitter(ReactiveBuilder):
+    """Runs a wrapped worker and emits artifacts immediately.
+
+    This is the low-overhead alternative to the FIFO collector path. It disables
+    any cross-worker reassembly/reordering: artifacts are emitted as soon as the
+    worker produces them.
+
+    Input artifact is `(seq, args)`; the sequence number is only used for routing
+    and is not included in output artifacts.
+    """
+
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        worker: ReactiveBuilder,
+        **kwargs,
+    ) -> None:
+        super().__init__(provides, requires, persist=False, **kwargs)
+        self.worker = worker
+
+    def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
+        _seq, args = item
+        yield from self.worker.build(context, *args)
+
+
+class LoadBalancerCollector(ReactiveBuilder):
+    """Reorders worker results back into FIFO sequence order."""
+
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        **kwargs,
+    ) -> None:
+        super().__init__(provides, requires, persist=False, **kwargs)
+        self.buffer: dict[int, List[Any]] = {}
+        self._next_expected = 0
+
+    def build(self, context: Context, item: Tuple[int, List[Any]]):
+        seq, results = item
+        self.buffer[seq] = list(results)
+
+        while self._next_expected in self.buffer:
+            ready = self.buffer.pop(self._next_expected)
+            self._next_expected += 1
+            for artifact in ready:
+                yield artifact
+
+    def get_pending_count(self) -> int:
+        return len(self.buffer)
+
+    def get_next_expected_seq(self) -> int:
+        return self._next_expected
+
+
+def make_load_balancer(
+    provides: str,
+    requires: Collection[str],
+    worker_class: Type[ReactiveBuilder],
+    num_workers: int,
+    worker_init_args: Tuple[Any, ...] = (),
+    worker_init_kwargs: Optional[dict[str, Any]] = None,
+    preserve_fifo: bool = True,
+) -> List[ReactiveBuilder]:
+    """Build a load balancer pipeline.
+
+    When ``preserve_fifo`` is True (default), results are reassembled into the
+    original input order using a collector stage. When False, artifacts are
+    emitted as soon as workers produce them (no reassembly/reordering).
+
+    Returns components in this order:
+      - preserve_fifo=True:  sequencer, (router_i, wrapper_i)*, collector
+      - preserve_fifo=False: sequencer, (router_i, emitter_i)*
+    """
+
+    if num_workers < 1:
+        raise ValueError("num_workers must be >= 1")
+
+    worker_init_kwargs = {} if worker_init_kwargs is None else dict(worker_init_kwargs)
+
+    requires_list = list(requires)
+    requires_tag = "+".join(requires_list)
+    base = f"load_balancer::{provides}::{worker_class.__name__}::{requires_tag}"
+
+    sequenced = f"{base}::sequenced"
+    results = f"{base}::results"
+
+    components: List[ReactiveBuilder] = [
+        LoadBalancerSequencer(provides=sequenced, requires=requires_list),
+    ]
+
+    for worker_id in range(num_workers):
+        routed = f"{base}::routed::{worker_id:02d}"
+        components.append(
+            LoadBalancerRouter(
+                provides=routed,
+                requires=[sequenced],
+                worker_id=worker_id,
+                num_workers=num_workers,
+            )
+        )
+
+        worker_name = f"{base}::_worker_{worker_id}"
+        worker = worker_class(
+            *worker_init_args,
+            name=worker_name,
+            **worker_init_kwargs,
+        )
+        if preserve_fifo:
+            components.append(
+                LoadBalancerWorkerWrapper(
+                    provides=results,
+                    requires=[routed],
+                    worker=worker,
+                )
+            )
+        else:
+            components.append(
+                LoadBalancerWorkerEmitter(
+                    provides=provides,
+                    requires=[routed],
+                    worker=worker,
+                )
+            )
+
+    if preserve_fifo:
+        components.append(LoadBalancerCollector(provides=provides, requires=[results]))
+    return components
+
 
 def parallelize(
     provides: str,
     requires: Collection[str],
     worker_builder: Type[ReactiveBuilder],
     num_workers: int,
+    preserve_fifo: bool = True,
+    worker_init_args: Tuple[Any, ...] = (),
     **kwargs,
 ) -> Tuple[ReactiveBuilder, ...]:
+    """Backward-compatible alias for make_load_balancer.
 
-    builder_name = worker_builder.__name__
-    components: List[ReactiveBuilder] = [LoadBalancerSequencer(provides=f'sequencer::{builder_name}::{provides}::{requires}', requires=requires, num_workers=num_workers)]
-
-    for n in range(num_workers):
-        components.append(LoadBalancerRouter(provides=f'worker::{builder_name}::{provides}::{requires}::{n:02d}', requires=[f'*sequencer::{builder_name}::{provides}::{requires}'], worker_id=n))
-        name = f'worker::{builder_name}::{provides}::{requires}::{n:02d}'
-        components.append(worker_builder(provides=provides, requires=[f'*{name}'], name=name, **kwargs))
-
+    Set ``preserve_fifo=False`` to disable output reassembly/reordering.
+    Use ``worker_init_args`` for workers requiring positional constructor args.
+    """
+    components = make_load_balancer(
+        provides=provides,
+        requires=requires,
+        worker_class=worker_builder,
+        num_workers=num_workers,
+        worker_init_args=worker_init_args,
+        worker_init_kwargs=kwargs,
+        preserve_fifo=preserve_fifo,
+    )
     return tuple(components)
