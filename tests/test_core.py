@@ -1,6 +1,14 @@
 import logging
+import os
+import selectors
+import signal
+import subprocess
+import sys
+import textwrap
 import threading
+import time
 from concurrent.futures import Future
+from pathlib import Path
 from queue import Empty, PriorityQueue
 
 import pytest
@@ -457,6 +465,126 @@ def test_context_blocks_cross_thread_submission_while_task_active():
 
     assert captures["errors"]
     assert "cross-thread submissions are forbidden" in captures["errors"][0]
+
+
+def test_pipeline_run_handles_keyboard_interrupt(monkeypatch):
+    poison_seen = threading.Event()
+
+    class Terminator(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="__POISON__"):
+                    poison_seen.set()
+
+    pipe = Pipeline([Terminator()], strict_interest_inference=True)
+
+    def fake_run_phases():
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(pipe, "run_phases", fake_run_phases)
+
+    pipe.run()
+
+    assert poison_seen.wait(timeout=1), "interrupt shutdown should still emit __POISON__"
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="SIGINT test requires POSIX signal semantics")
+def test_pipeline_run_handles_sigint_in_subprocess(tmp_path):
+    project_root = Path(__file__).resolve().parents[1]
+    src_path = str(project_root / "src")
+    script = textwrap.dedent(
+        """
+        import time
+
+        from framework.core import AbstractProcessor, Event, Pipeline
+
+        class SlowPhase(AbstractProcessor):
+            def __init__(self):
+                super().__init__()
+                self.ready_printed = False
+
+            def process(self, context, event):
+                match event:
+                    case Event(name="__PHASE__", phase=_):
+                        if not self.ready_printed:
+                            self.ready_printed = True
+                            print("READY", flush=True)
+                        for _ in range(300):
+                            time.sleep(0.01)
+                    case Event(name="__POISON__"):
+                        print("POISONED", flush=True)
+
+        pipe = Pipeline([SlowPhase()], strict_interest_inference=True)
+        pipe.run()
+        print("DONE", flush=True)
+        """
+    )
+    script_path = tmp_path / "sigint_probe.py"
+    script_path.write_text(script, encoding="utf-8")
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        f"{src_path}{os.pathsep}{env['PYTHONPATH']}"
+        if env.get("PYTHONPATH")
+        else src_path
+    )
+
+    proc = subprocess.Popen(
+        [sys.executable, "-u", str(script_path)],
+        cwd=project_root,
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    assert proc.stdout is not None
+
+    stdout_lines = []
+    ready_seen = False
+    selector = selectors.DefaultSelector()
+    selector.register(proc.stdout, selectors.EVENT_READ)
+    deadline = time.monotonic() + 10
+
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            break
+        events = selector.select(timeout=0.2)
+        if not events:
+            continue
+        line = proc.stdout.readline()
+        if not line:
+            continue
+        stdout_lines.append(line.rstrip("\n"))
+        if line.strip() == "READY":
+            ready_seen = True
+            break
+
+    if not ready_seen:
+        proc.kill()
+        out, err = proc.communicate(timeout=5)
+        captured = "\n".join(stdout_lines + out.splitlines())
+        pytest.fail(
+            "subprocess never reached READY\n"
+            f"stdout:\n{captured}\n"
+            f"stderr:\n{err}"
+        )
+
+    proc.send_signal(signal.SIGINT)
+    try:
+        out, err = proc.communicate(timeout=15)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        out, err = proc.communicate(timeout=5)
+        captured = "\n".join(stdout_lines + out.splitlines())
+        pytest.fail(
+            "subprocess did not exit after SIGINT\n"
+            f"stdout:\n{captured}\n"
+            f"stderr:\n{err}"
+        )
+
+    captured = "\n".join(stdout_lines + out.splitlines())
+    assert proc.returncode == 0, f"expected clean exit, got {proc.returncode}\n{captured}\n{err}"
+    assert "POISONED" in captured
+    assert "DONE" in captured
 
 
 def test_timeit_logs_debug(caplog):
