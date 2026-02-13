@@ -64,7 +64,7 @@ class ReactiveBuilder(AbstractProcessor):
         self.input_store = defaultdict(deque)  # requrie -> artifacts (ingridents)
         self.persist = persist
 
-    def _process(self, context: Context, event: ReactiveEvent):
+    def process_reactive_event(self, context: Context, event: ReactiveEvent):
         """Dispatch to the currently-installed handler set."""
         for handler in list(self.handlers):
             handler(context, event)
@@ -73,7 +73,7 @@ class ReactiveBuilder(AbstractProcessor):
         """Handle lifecycle events plus the reactive ``resolve``/``built`` traffic."""
         match event:
             case ReactiveEvent() as e:
-                self._process(context, e)
+                self.process_reactive_event(context, e)
             case Event(name="__INIT__") as e:
                 self.on_init(context)
             case Event(name="__POISON__") as e:
@@ -279,7 +279,7 @@ class Grouper(ReactiveBuilder):
 class StreamGrouper(ReactiveBuilder):
     """Streaming grouper that emits whenever the key changes."""
 
-    _UNSET = object()  # Sentinel that can't collide with any user key
+    UNSET_SENTINEL = object()  # Sentinel that can't collide with any user key
 
     def __init__(
         self,
@@ -289,7 +289,7 @@ class StreamGrouper(ReactiveBuilder):
         **kwargs,
     ):
         super().__init__(provides, requires, persist=False, **kwargs)
-        self.lastkey = self._UNSET
+        self.lastkey = self.UNSET_SENTINEL
         self.lastset = []
         self.keyfunc = keyfunc
 
@@ -299,16 +299,16 @@ class StreamGrouper(ReactiveBuilder):
         if thiskey == self.lastkey:
             self.lastset.append(args)
         else:
-            if self.lastkey is not self._UNSET:
+            if self.lastkey is not self.UNSET_SENTINEL:
                 yield self.lastkey, self.lastset
             self.lastkey = thiskey
             self.lastset = [args]
 
     def phase(self, context, phase):
         """Flush any trailing group so nothing is lost between phases."""
-        if self.lastkey is not self._UNSET:
+        if self.lastkey is not self.UNSET_SENTINEL:
             yield self.lastkey, self.lastset
-        self.lastkey = self._UNSET
+        self.lastkey = self.UNSET_SENTINEL
         self.lastset = []
 
 
@@ -542,11 +542,11 @@ class LoadBalancerSequencer(ReactiveBuilder):
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
-        self._next_seq = 0
+        self.next_seq = 0
 
     def build(self, context: Context, *args):
-        seq = self._next_seq
-        self._next_seq += 1
+        seq = self.next_seq
+        self.next_seq += 1
         yield seq, args
 
 
@@ -621,7 +621,7 @@ class LoadBalancerWorkerEmitter(ReactiveBuilder):
         self.worker = worker
 
     def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
-        _seq, args = item
+        seq, args = item
         yield from self.worker.build(context, *args)
 
 
@@ -637,30 +637,30 @@ class LoadBalancerCollector(ReactiveBuilder):
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
         self.buffer: dict[int, List[Any]] = {}
-        self._next_expected = 0
+        self.next_expected = 0
         self.gap_policy = WaitForSequenceGaps() if gap_policy is None else gap_policy
         self.skipped_sequences = 0
 
     def build(self, context: Context, item: Tuple[int, List[Any]]):
         seq, results = item
         self.buffer[seq] = list(results)
-        resolved = self.gap_policy.resolve_next_expected(self.buffer, self._next_expected)
-        if resolved < self._next_expected:
+        resolved = self.gap_policy.resolve_next_expected(self.buffer, self.next_expected)
+        if resolved < self.next_expected:
             raise ValueError(
                 "gap policy returned a next_expected smaller than current cursor"
             )
-        if resolved > self._next_expected:
-            self.skipped_sequences += resolved - self._next_expected
+        if resolved > self.next_expected:
+            self.skipped_sequences += resolved - self.next_expected
             logger.warning(
                 "LoadBalancerCollector skipped %d sequence(s) due to gap policy %s",
-                resolved - self._next_expected,
+                resolved - self.next_expected,
                 self.gap_policy.__class__.__name__,
             )
-        self._next_expected = resolved
+        self.next_expected = resolved
 
-        while self._next_expected in self.buffer:
-            ready = self.buffer.pop(self._next_expected)
-            self._next_expected += 1
+        while self.next_expected in self.buffer:
+            ready = self.buffer.pop(self.next_expected)
+            self.next_expected += 1
             for artifact in ready:
                 yield artifact
 
@@ -668,7 +668,7 @@ class LoadBalancerCollector(ReactiveBuilder):
         return len(self.buffer)
 
     def get_next_expected_seq(self) -> int:
-        return self._next_expected
+        return self.next_expected
 
 
 class SequenceGapPolicy(abc.ABC):
