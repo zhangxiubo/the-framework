@@ -1,21 +1,17 @@
 import logging
 import threading
 from concurrent.futures import Future
-from queue import PriorityQueue, SimpleQueue
+from queue import Empty, PriorityQueue
 
 import pytest
 
-# Ensure src is importable regardless of packaging
-import sys
-from pathlib import Path
-sys.path.append(str(Path(__file__).parents[1] / "src"))
-
-from framework.core import (  # noqa: E402
+from framework.core import (
     AbstractProcessor,
     Context,
     Event,
     Inbox,
     Pipeline,
+    ProcessEntry,
     caching,
     retry,
 )
@@ -29,7 +25,7 @@ def run_dispatcher_once(pipeline: Pipeline):
     q = pipeline.q
 
     def runner():
-        pipeline.execute_events(q)
+        pipeline.execute_events()
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -118,16 +114,16 @@ def test_done_callback_marks_done_and_wakes_dispatcher():
     pipe = PipeStub()
     ctx = Context(pipe)
     inbox = InboxStub()
-    q = SimpleQueue()
+    signal = threading.Event()
     proc = P()
     fut = Future()
     fut.set_result(None)
 
-    ctx.done_callback(fut, proc, Event(name="X"), inbox, q)
+    ctx.done_callback(fut, proc, Event(name="X"), inbox, signal=signal)
 
     assert inbox.count == 1
     assert pipe.dec == 1
-    assert q.get(timeout=1) is True
+    assert signal.is_set()
 
 
 def test_inbox_single_active_execution_model():
@@ -233,8 +229,8 @@ def test_strict_interest_matches_event_subclasses():
     pipe.submit(CustomEvent(name="ping"))
     run_dispatcher_once(pipe)
 
-    # BaseMatcher should see subclassed events even though it pattern-matches Event
-    assert seen != []  # Expected to fail: nothing dispatched for subclasses
+    # BaseMatcher should see subclassed events even though it pattern-matches Event.
+    assert seen
 
 
 def test_pipeline_execute_events_processes_ready_processors():
@@ -255,7 +251,6 @@ def test_pipeline_execute_events_processes_ready_processors():
 
 
 def test_pipeline_run_emits_phase_events():
-    # Intended: run() should submit __PHASE__ events at least once
     phases = []
 
     class PhaseRecorder(AbstractProcessor):
@@ -266,8 +261,43 @@ def test_pipeline_run_emits_phase_events():
 
     pipe = Pipeline([PhaseRecorder()])
     pipe.run()
-    # Intended assertion: at least one phase should be observed
-    assert len(phases) >= 1  # Expected to fail with current code
+    assert phases
+
+
+def test_pipeline_run_fixed_point_stops_after_single_phase_when_no_phase_work():
+    phases = []
+
+    class PhaseRecorder(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="__PHASE__", phase=p):
+                    phases.append(p)
+
+    pipe = Pipeline([PhaseRecorder()], strict_interest_inference=True)
+    pipe.run()
+
+    assert phases == [1]
+
+
+def test_pipeline_run_fixed_point_advances_until_phase_generated_work_stops():
+    phases = []
+    pings = []
+
+    class PhaseProducer(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="__PHASE__", phase=p):
+                    phases.append(p)
+                    if p == 1:
+                        context.submit(Event(name="PING"))
+                case Event(name="PING"):
+                    pings.append("seen")
+
+    pipe = Pipeline([PhaseProducer()], strict_interest_inference=True)
+    pipe.run()
+
+    assert phases == [1, 2]
+    assert pings == ["seen"]
 
 
 def test_caching_persists_and_replays_with_workspace(tmp_path):
@@ -335,6 +365,98 @@ def test_inbox_take_event_empty_raises():
     inbox = Inbox(Proc(), PriorityQueue())
     with pytest.raises(RuntimeError):
         inbox.take_event()
+
+
+def test_pipeline_pulse_dispatcher_deduplicates_pending_pulse():
+    class Proc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    pass
+
+    pipe = Pipeline([Proc()], strict_interest_inference=True)
+
+    # Drain any bootstrap pulse left from initialization.
+    while True:
+        try:
+            pipe.q.get(block=False)
+        except Empty:
+            break
+
+    pipe.pulse_dispatcher()
+    pipe.pulse_dispatcher()
+    pipe.pulse_dispatcher()
+
+    assert pipe.q.get(block=False) is True
+    with pytest.raises(Empty):
+        pipe.q.get(block=False)
+
+
+def test_pipeline_sets_fatal_error_on_stale_ready_entry():
+    class Proc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    pass
+
+    processor = Proc()
+    pipe = Pipeline([processor], strict_interest_inference=True)
+    stale_entry = ProcessEntry(priority=processor.priority, processor=processor)
+
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pipe.dispatch_entry(stale_entry, executor)
+
+    with pytest.raises(RuntimeError, match="internal dispatch error"):
+        pipe.wait()
+
+
+def test_context_blocks_late_submission_after_task_completion():
+    captured = {}
+
+    class Proc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    captured["context"] = context
+
+    pipe = Pipeline([Proc()], strict_interest_inference=True)
+    pipe.submit(Event(name="X"))
+    run_dispatcher_once(pipe)
+
+    with pytest.raises(RuntimeError, match="late/unsafe context.submit"):
+        captured["context"].submit(Event(name="Y"))
+
+
+def test_context_blocks_cross_thread_submission_while_task_active():
+    captures = {"errors": []}
+
+    class Proc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    done = threading.Event()
+
+                    def worker():
+                        try:
+                            context.submit(Event(name="Y"))
+                        except RuntimeError as exc:
+                            captures["errors"].append(str(exc))
+                        finally:
+                            done.set()
+
+                    t = threading.Thread(target=worker)
+                    t.start()
+                    done.wait(timeout=2)
+                    t.join(timeout=2)
+
+    pipe = Pipeline([Proc()], strict_interest_inference=True)
+    pipe.submit(Event(name="X"))
+    run_dispatcher_once(pipe)
+
+    assert captures["errors"]
+    assert "cross-thread submissions are forbidden" in captures["errors"][0]
 
 
 def test_timeit_logs_debug(caplog):

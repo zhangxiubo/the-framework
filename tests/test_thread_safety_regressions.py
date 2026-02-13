@@ -3,7 +3,10 @@ import sys
 import threading
 import time
 import types
-from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from queue import Empty
+
+import pytest
 
 
 def install_optional_dependency_stubs():
@@ -71,7 +74,6 @@ def install_optional_dependency_stubs():
 
 
 install_optional_dependency_stubs()
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 core = importlib.import_module("framework.core")
 
 AbstractProcessor = core.AbstractProcessor
@@ -83,7 +85,7 @@ def run_dispatcher_once(pipeline: Pipeline):
     q = pipeline.q
 
     def runner():
-        pipeline.execute_events(q)
+        pipeline.execute_events()
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -207,3 +209,107 @@ def test_context_submit_from_worker_keeps_progress_without_pulse_loop():
     pipe.run()
 
     assert seen == [6]
+
+
+def test_pulse_dedup_under_concurrent_contention():
+    class NoOp(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    pass
+
+    pipe = Pipeline([NoOp()], strict_interest_inference=True)
+
+    # Drain any bootstrap pulses.
+    while True:
+        try:
+            pipe.q.get(block=False)
+        except Empty:
+            break
+
+    start = threading.Barrier(9)
+
+    def pulser():
+        start.wait()
+        for _ in range(100):
+            pipe.pulse_dispatcher()
+
+    threads = [threading.Thread(target=pulser) for _ in range(8)]
+    for t in threads:
+        t.start()
+    start.wait()
+    for t in threads:
+        t.join()
+
+    # Despite heavy contention, at most one pending pulse should remain.
+    assert pipe.q.get(block=False) is True
+    with pytest.raises(Empty):
+        pipe.q.get(block=False)
+
+
+def test_wait_unblocks_promptly_on_internal_fatal_error():
+    class NoOp(AbstractProcessor):
+        def process(self, context, event):
+            pass
+
+    processor = NoOp()
+    pipe = Pipeline([processor], strict_interest_inference=True)
+    pipe.increment()  # Ensure wait() actually blocks.
+
+    result = {"error": None}
+    waiter_done = threading.Event()
+
+    def waiter():
+        try:
+            pipe.wait()
+        except Exception as exc:  # noqa: BLE001
+            result["error"] = exc
+        finally:
+            waiter_done.set()
+
+    wt = threading.Thread(target=waiter, daemon=True)
+    wt.start()
+    time.sleep(0.05)
+
+    stale_entry = core.ProcessEntry(priority=processor.priority, processor=processor)
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        pipe.dispatch_entry(stale_entry, executor)
+
+    assert waiter_done.wait(timeout=2), "waiter should not hang after fatal error"
+    assert isinstance(result["error"], RuntimeError)
+    assert "internal dispatch error" in str(result["error"])
+
+
+def test_external_submit_rejected_during_shutdown_without_hang():
+    poison_started = threading.Event()
+    run_error = {"exc": None}
+
+    class Terminator(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    pass
+                case Event(name="__POISON__"):
+                    poison_started.set()
+                    # Keep shutdown phase open long enough for concurrent submit attempt.
+                    time.sleep(0.2)
+
+    pipe = Pipeline([Terminator()], strict_interest_inference=True)
+    pipe.submit(Event(name="X"))
+
+    def run_pipe():
+        try:
+            pipe.run()
+        except Exception as exc:  # noqa: BLE001
+            run_error["exc"] = exc
+
+    t = threading.Thread(target=run_pipe, daemon=True)
+    t.start()
+
+    assert poison_started.wait(timeout=2), "pipeline should reach poison phase"
+    with pytest.raises(RuntimeError, match="not accepting external submissions"):
+        pipe.submit(Event(name="X"))
+
+    t.join(timeout=3)
+    assert not t.is_alive(), "pipeline run should terminate without hanging"
+    assert run_error["exc"] is None
