@@ -6,7 +6,7 @@ import types
 from pathlib import Path
 
 
-def _install_optional_dependency_stubs():
+def install_optional_dependency_stubs():
     try:
         import deepdiff  # noqa: F401
     except ModuleNotFoundError:
@@ -70,7 +70,7 @@ def _install_optional_dependency_stubs():
         sys.modules["rocksdict.rocksdict"] = rocksdict_sub
 
 
-_install_optional_dependency_stubs()
+install_optional_dependency_stubs()
 sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 core = importlib.import_module("framework.core")
 
@@ -166,7 +166,8 @@ def test_concurrent_first_archive_open_returns_single_handle(monkeypatch):
     t2.join()
 
     assert refs[0] is refs[1]
-    assert len([suffix for suffix, _ in pipe.archives if suffix == "shared"]) == 1
+    assert len(pipe.archives_by_key) == 1
+    assert ("shared", False) in pipe.archives_by_key
 
 
 def test_run_processes_buffered_events_without_dispatcher():

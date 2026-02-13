@@ -130,9 +130,7 @@ def test_done_callback_marks_done_and_wakes_dispatcher():
     assert q.get(timeout=1) is True
 
 
-def test_inbox_scheduling_concurrency_one():
-    ready = PriorityQueue()
-
+def test_inbox_single_active_execution_model():
     class DummyProc:
         def __init__(self, priority):
             self.priority = priority
@@ -140,24 +138,63 @@ def test_inbox_scheduling_concurrency_one():
         def __repr__(self):
             return "DummyProc"
 
-    inbox = Inbox(DummyProc(priority=5), ready, concurrency=1)
+    ready = PriorityQueue()
+    inbox = Inbox(DummyProc(priority=5), ready)
 
     e1 = Event(name="E1")
     e2 = Event(name="E2")
-
     inbox.put_event(e1)
-    # first put should signal readiness
-    entry = ready.get_nowait()
-    assert entry.processor.priority == 5
-    # second put should NOT enqueue because slot is taken
     inbox.put_event(e2)
+
+    # First enqueue should make processor ready.
+    first_ready = ready.get_nowait()
+    assert first_ready.processor.priority == 5
+
+    # Slot is occupied; second enqueue should not add another ready entry yet.
     with pytest.raises(Exception):
-        # queue is empty now
         ready.get_nowait()
-    # marking done should enqueue again because there are pending jobs
+
+    # Dispatcher takes first event and completion re-signals readiness for second.
+    assert inbox.take_event() is e1
     inbox.mark_task_done()
-    entry2 = ready.get_nowait()
-    assert entry2.processor.priority == 5
+    second_ready = ready.get_nowait()
+    assert second_ready.processor.priority == 5
+
+    assert inbox.take_event() is e2
+    inbox.mark_task_done()
+
+
+def test_pipeline_respects_processor_priority_order():
+    seen = []
+
+    class HighPriority(AbstractProcessor):
+        def __init__(self):
+            super().__init__(priority=10)
+
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    seen.append("high")
+
+    class LowPriority(AbstractProcessor):
+        def __init__(self):
+            super().__init__(priority=0)
+
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    seen.append("low")
+
+    # max_workers=1 makes dispatch order observable and deterministic.
+    p = Pipeline(
+        [HighPriority(), LowPriority()],
+        strict_interest_inference=True,
+        max_workers=1,
+    )
+    p.submit(Event(name="X"))
+    run_dispatcher_once(p)
+
+    assert seen == ["low", "high"]
 
 
 def test_pipeline_interest_inference_and_submit_routing():
@@ -288,16 +325,14 @@ def test_infer_interests_match_or_routing():
 
 
 def test_inbox_take_event_empty_raises():
-    from queue import PriorityQueue
-
     class Proc:
         def __init__(self):
             self.priority = 0
+
         def __repr__(self):
             return "Proc"
 
-    inbox = Inbox(Proc(), PriorityQueue(), concurrency=1)
-    import pytest
+    inbox = Inbox(Proc(), PriorityQueue())
     with pytest.raises(RuntimeError):
         inbox.take_event()
 

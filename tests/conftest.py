@@ -15,7 +15,7 @@ def run_pipeline():
     """Factory fixture that returns a helper to run pipelines for testing."""
     from framework.core import Pipeline
 
-    def _run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
+    def run_dispatcher_once_impl(pipeline: Pipeline, pulses: int = 1):
         """Run the pipeline dispatcher for a given number of pulses."""
         q = pipeline.q
 
@@ -32,7 +32,7 @@ def run_pipeline():
             q.put(False)
             t.join(timeout=5)
 
-    return _run_dispatcher_once
+    return run_dispatcher_once_impl
 
 
 def run_dispatcher_once(pipeline, pulses: int = 1):
