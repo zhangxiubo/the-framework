@@ -16,12 +16,12 @@ import inspect
 import logging
 import threading
 import time
-from collections import defaultdict, UserDict
+from collections import defaultdict, UserDict, deque
 from concurrent.futures import Future, ThreadPoolExecutor, CancelledError
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from queue import Empty, PriorityQueue, SimpleQueue
+from queue import PriorityQueue, SimpleQueue
 from typing import List, Optional
 
 import deepdiff
@@ -137,7 +137,7 @@ class Context:
         processor: "AbstractProcessor",
         event: Event,
         inbox: "Inbox",
-        q: SimpleQueue,
+        q: Optional[SimpleQueue] = None,
     ):
         """Callback attached to processor futures to handle completion.
 
@@ -166,8 +166,9 @@ class Context:
         finally:
             inbox.mark_task_done()
             self.pipeline.decrement()  # Ensure job accounting is balanced even on failure.
-            # Wake the dispatcher to continue scheduling.
-            q.put(True)
+            if q is not None:
+                # Wake execute_events compatibility loops, if present.
+                q.put(True)
 
 
 @dataclass(order=True, frozen=True)
@@ -186,22 +187,25 @@ class Inbox:
     def __init__(
         self,
         processor: "AbstractProcessor",
-        ready_queue: PriorityQueue[ProcessEntry],
+        ready_queue: Optional[PriorityQueue[ProcessEntry]],
         concurrency: int = 1,
     ):
         self.processor = processor
-        self.events: SimpleQueue = SimpleQueue()
+        self.events = deque()
         self.jobs = 0
-        self.slots_left = concurrency
+        self.active = False
         self.lock = threading.RLock()
+        # Kept for compatibility with older tests and callers.
+        self.concurrency = concurrency
+        self.slots_left = concurrency
         self.ready_queue = ready_queue
 
     def put_event(self, event: Event):
-        """Queue an event and, if capacity exists, signal the dispatcher."""
+        """Queue an event for this processor."""
         with self.lock:
-            self.events.put(event)
+            self.events.append(event)
             self.jobs += 1
-            if self.slots_left > 0:  # Check if we have any slots left
+            if self.ready_queue is not None and self.slots_left > 0:
                 self.slots_left -= 1
                 self.ready_queue.put(
                     ProcessEntry(self.processor.priority, self.processor)
@@ -209,55 +213,181 @@ class Inbox:
 
     def take_event(self):
         """Return the next event without blocking; raise if the inbox is empty."""
-        try:
-            event = self.events.get(block=False)
-            with self.lock:
-                self.jobs -= 1
-                return event
-        except Empty:
-            msg = f"taking from empty inbox from {self.processor}; this should not have happened"
-            logger.critical(msg)
-            raise RuntimeError(msg)
+        with self.lock:
+            if not self.events:
+                msg = (
+                    f"taking from empty inbox from {self.processor}; this should not "
+                    "have happened"
+                )
+                logger.critical(msg)
+                raise RuntimeError(msg)
+            event = self.events.popleft()
+            self.jobs -= 1
+            return event
 
     def mark_task_done(self):
-        """Release a slot and re-signal when pending events remain."""
+        """Compatibility behavior for callers that rely on ready-queue signaling."""
         with self.lock:
-            self.slots_left += 1
-            if self.jobs > 0:  # Check if we have any jobs left
+            self.slots_left = min(self.slots_left + 1, self.concurrency)
+            if self.ready_queue is not None and self.jobs > 0:
                 self.slots_left -= 1
                 self.ready_queue.put(
                     ProcessEntry(self.processor.priority, self.processor)
                 )
 
+    def try_start_next(self) -> Optional[Event]:
+        """Reserve processor execution and return next event if idle + non-empty."""
+        with self.lock:
+            if self.active or self.jobs == 0:
+                return None
+            self.active = True
+            return self.take_event()
+
+    def finish_current_and_take_next(self) -> Optional[Event]:
+        """Advance mailbox after one task; keep active when more events are queued."""
+        with self.lock:
+            if self.jobs > 0:
+                return self.take_event()
+            self.active = False
+            return None
+
+    def restore_unstarted(self, event: Event):
+        """Return an unscheduled event to the front and mark mailbox idle."""
+        with self.lock:
+            self.events.appendleft(event)
+            self.jobs += 1
+            self.active = False
+
+
+class AbstractScheduler(abc.ABC):
+    """Strategy interface for event scheduling/execution."""
+
+    @abc.abstractmethod
+    def bind_executor(self, executor: ThreadPoolExecutor):
+        pass
+
+    @abc.abstractmethod
+    def restore_executor(self, previous):
+        pass
+
+    @abc.abstractmethod
+    def on_submit(self, scheduled: list[tuple["AbstractProcessor", Inbox]]):
+        pass
+
+    @abc.abstractmethod
+    def drain(self, q: Optional[SimpleQueue] = None):
+        pass
+
+
+class MailboxScheduler(AbstractScheduler):
+    """Single-active-task-per-processor scheduler backed by inbox mailboxes."""
+
+    def __init__(self, pipeline: "Pipeline"):
+        self.pipeline = pipeline
+        self._executor_lock = threading.Lock()
+        self._executor: Optional[ThreadPoolExecutor] = None
+
+    def bind_executor(self, executor: ThreadPoolExecutor):
+        with self._executor_lock:
+            previous = self._executor
+            self._executor = executor
+        self.drain()
+        return previous
+
+    def restore_executor(self, previous):
+        with self._executor_lock:
+            self._executor = previous
+
+    def on_submit(self, scheduled: list[tuple["AbstractProcessor", Inbox]]):
+        for processor, inbox in scheduled:
+            self._start_if_idle(processor, inbox)
+
+    def drain(self, q: Optional[SimpleQueue] = None):
+        with self.pipeline._inbox_lock:
+            inbox_items = list(self.pipeline._inboxes.items())
+        for processor, inbox in inbox_items:
+            self._start_if_idle(processor, inbox, q=q)
+
+    def _current_executor(self) -> Optional[ThreadPoolExecutor]:
+        with self._executor_lock:
+            return self._executor
+
+    def _start_if_idle(
+        self,
+        processor: "AbstractProcessor",
+        inbox: Inbox,
+        q: Optional[SimpleQueue] = None,
+    ):
+        event = inbox.try_start_next()
+        if event is None:
+            return
+
+        executor = self._current_executor()
+        if executor is None:
+            inbox.restore_unstarted(event)
+            return
+
+        self._submit_processor_task(executor, processor, inbox, event, q=q)
+
+    def _continue_processor(
+        self,
+        processor: "AbstractProcessor",
+        inbox: Inbox,
+        q: Optional[SimpleQueue] = None,
+    ):
+        event = inbox.finish_current_and_take_next()
+        if event is None:
+            return
+
+        executor = self._current_executor()
+        if executor is None:
+            inbox.restore_unstarted(event)
+            return
+
+        self._submit_processor_task(executor, processor, inbox, event, q=q)
+
+    def _submit_processor_task(
+        self,
+        executor: ThreadPoolExecutor,
+        processor: "AbstractProcessor",
+        inbox: Inbox,
+        event: Event,
+        q: Optional[SimpleQueue] = None,
+    ):
+        context = Context(self.pipeline)
+        done_callback = functools.partial(
+            context.done_callback,
+            processor=processor,
+            event=event,
+            inbox=inbox,
+            q=q,
+        )
+
+        def on_done(future: Future):
+            try:
+                done_callback(future)
+            finally:
+                self._continue_processor(processor, inbox, q=q)
+
+        try:
+            future = executor.submit(processor.process, context, event)
+            future.add_done_callback(on_done)
+        except Exception as exc:
+            f = Future()
+            f.set_exception(exc)
+            on_done(f)
+
 
 class Pipeline:
-    """Dispatcher that routes events to processors based on declared interests.
+    """Route events to interested processors and run per-processor mailboxes.
 
-    Scheduling overview (job counting + dispatch coordination):
+    Each processor has one inbox and at most one in-flight task at a time.
+    Submissions enqueue events and immediately schedule idle processors on a
+    shared :class:`ThreadPoolExecutor`.
 
-    * Every call to :meth:`submit` increments ``jobs`` once, then increments once
-      per recipient. Each processor inbox decrements when it finishes a task by
-      calling :meth:`Context.done_callback`, which in turn calls
-      :meth:`Pipeline.decrement`. The ``jobs`` counter therefore represents the
-      total amount of work currently enqueued (including nested emissions).
-    * ``done`` tracks completions. When ``done >= jobs`` the dispatcher knows the
-      phase is quiescent and :meth:`wait` returns to the caller (either
-      :meth:`run` or tests invoking ``run_dispatcher_once``).
-    * ``q`` is a simple queue used as a pulse line: pushing ``True`` wakes the
-      dispatcher loop, which drains ``rdyq`` (the priority queue of processors
-      that have available slots). ``False`` stops the dispatcher thread.
-    * Each :class:`Inbox` nominates itself by pushing a :class:`ProcessEntry`
-      into ``rdyq`` whenever it has work *and* slots available. Because per
-      processor concurrency is typically 1, this keeps processors single-threaded.
-    * When the dispatcher drains ``rdyq`` it immediately submits work to the
-      shared :class:`ThreadPoolExecutor`. Completion callbacks mark the inbox
-      task done, decrement the pipeline counter, and push another pulse to ``q`` so
-      additional processors can be scheduled without waiting for the next phase.
-
-    The result is a feedback loop that never loses track of work: every enqueue
-    increments ``jobs``; every completion increments ``done``; ``wait`` only
-    returns when the two match; and pulses keep the executor busy without busy
-    polling.
+    Job accounting remains cumulative via ``jobs``/``done`` so :meth:`wait`
+    blocks until quiescence (``done >= jobs``), including nested submissions
+    emitted by worker threads.
     """
 
     def __init__(
@@ -267,6 +397,7 @@ class Pipeline:
         workspace: Optional[str | Path] = None,
         max_workers=None,
         config=None,
+        scheduler: Optional[AbstractScheduler] = None,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -275,6 +406,13 @@ class Pipeline:
         self.cond = threading.Condition()
         self.rdyq = PriorityQueue()
         self.q = SimpleQueue()
+        self._inbox_lock = threading.Lock()
+        self._archive_lock = threading.Lock()
+        self._inboxes = dict()
+        self._archives_by_key = dict()
+        self.scheduler: AbstractScheduler = (
+            MailboxScheduler(self) if scheduler is None else scheduler
+        )
         self.strict_interest_inference = strict_interest_inference
         self.max_workers = len(processors) if max_workers is None else max_workers
         self.config = dict() if config is None else config.copy()
@@ -291,10 +429,15 @@ class Pipeline:
 
         self.submit(Event(name="__INIT__"))
 
-    @functools.cache
     def get_inbox(self, processor: "AbstractProcessor"):
         """Return (and memoize) the inbox dedicated to ``processor``."""
-        return Inbox(processor, self.rdyq, 1)
+        with self._inbox_lock:
+            inbox = self._inboxes.get(processor)
+            if inbox is None:
+                # run()/submit() scheduling no longer uses the ready queue.
+                inbox = Inbox(processor, None, 1)
+                self._inboxes[processor] = inbox
+            return inbox
 
     def register_processor(self, processor: "AbstractProcessor"):
         """Register every declared interest emitted by ``infer_interests``."""
@@ -304,15 +447,9 @@ class Pipeline:
             self.processors[interest].add(processor)
 
     def run(self):
-        """Drive the dispatcher until all work (and phase-driven work) has completed."""
-        q = self.q
+        """Drive the pipeline until all work (and phase-driven work) has completed."""
         executor = ThreadPoolExecutor(self.max_workers)
-        dispatcher = threading.Thread(
-            target=self.execute_events,
-            args=(q, executor),
-            daemon=True,
-        )
-        dispatcher.start()
+        previous_executor = self.scheduler.bind_executor(executor)
 
         try:
             aborting = threading.Event()
@@ -325,8 +462,7 @@ class Pipeline:
             while not aborting.is_set():
                 logger.info(f"starting phase: {phase:02d}")
                 start = time.perf_counter()
-                q.put(True)
-                # Wait for all outstanding jobs (including nested emissions) to complete.
+                self.scheduler.drain()
                 self.wait()
 
                 with self.cond:
@@ -346,7 +482,7 @@ class Pipeline:
                 )  # the expected increment in jobs count when no other jobs are launched by the processors.
 
             # Drain any phasing-spawned events.
-            q.put(True)
+            self.scheduler.drain()
             self.wait()
 
             # Final phase / termination.
@@ -355,14 +491,10 @@ class Pipeline:
             # Submit poison-pill so processors can flush/terminate.
             self.submit(Event(name="__POISON__"))
 
-            # Wake dispatcher to process the poison if it is currently waiting on q.get()
-            # with an empty ready queue.
-            q.put(True)
-
             # Wait until the poison event is processed.
             self.wait()
 
-            logger.info("dispatcher terminated")
+            logger.info("pipeline terminated")
         except KeyboardInterrupt:
             # Ensure anyone waiting on cond is released.
             with self.cond:
@@ -370,9 +502,7 @@ class Pipeline:
                 self.cond.notify_all()
             logger.info("pipeline interrupted; proceeding to shutdown")
         finally:
-            # Stop dispatcher then shut down executor.
-            q.put(False)
-            dispatcher.join(timeout=5)
+            self.scheduler.restore_executor(previous_executor)
             executor.shutdown(wait=True, cancel_futures=True)
 
             for suffix, archive in self.archives:
@@ -385,36 +515,33 @@ class Pipeline:
     def submit(self, event: Event):
         """Submit an event to the queue and increment job count."""
         recipients = set()
-        try:
+        scheduled = []
+        self.increment()
+        # Collect all relevant recipients
+        if not self.strict_interest_inference:
+            recipients |= self.processors.get((None, None), set())
+
+        for event_class in self._event_class_names(event):
+            recipients |= self.processors.get((event_class, None), set())
+            recipients |= self.processors.get((event_class, event.name), set())
+
+        for processor in recipients:
             self.increment()
-            # Collect all relevant recipients
-            if not self.strict_interest_inference:
-                recipients |= self.processors.get((None, None), set())
-
-            for event_class in self._event_class_names(event):
-                recipients |= self.processors.get((event_class, None), set())
-                recipients |= self.processors.get((event_class, event.name), set())
-
-            for processor in recipients:
-                self.increment()
-                inbox = self.get_inbox(processor)
-                inbox.put_event(event)
-            self.decrement()
-            return len(recipients)
-        finally:
-            if recipients:
-                self.q.put(
-                    True
-                )  # force a tick; otherwise the pipeline will only tick upon task completion
+            inbox = self.get_inbox(processor)
+            inbox.put_event(event)
+            scheduled.append((processor, inbox))
+        self.decrement()
+        self.scheduler.on_submit(scheduled)
+        return len(recipients)
 
     def execute_events(
         self, q: SimpleQueue, executor: Optional[ThreadPoolExecutor] = None
     ):
-        """Drain the ready queue whenever ``q`` signals a scheduling pulse.
+        """Compatibility scheduler loop driven by pulses on ``q``.
 
         When ``executor`` is provided, it is used as-is and is not shut down by this
         method. When omitted, a new executor is created for the duration of the
-        dispatch loop.
+        loop.
         """
 
         if executor is None:
@@ -422,48 +549,12 @@ class Pipeline:
                 self.execute_events(q, owned_executor)
             return
 
-        # Drive scheduling by pulses on q; drain all currently-ready processors per pulse.
-        while q.get():
-            # Drain all ready processors without blocking on an empty ready queue.
-            while True:
-                try:
-                    entry = self.rdyq.get_nowait()
-                except Empty:
-                    break
-
-                processor = entry.processor
-                inbox: Inbox = self.get_inbox(processor)
-
-                try:
-                    event: Event = inbox.take_event()
-                except Exception:
-                    # Keep the dispatcher resilient: release the reserved slot and
-                    # balance job accounting so waiters do not deadlock.
-                    logger.exception("failed to take event for %s", processor)
-                    try:
-                        inbox.mark_task_done()
-                    finally:
-                        self.decrement()
-                    continue
-
-                context = Context(self)
-                callback = functools.partial(
-                    context.done_callback,
-                    processor=processor,
-                    event=event,
-                    inbox=inbox,
-                    q=q,
-                )
-
-                try:
-                    future = executor.submit(processor.process, context, event)
-                    future.add_done_callback(callback)
-                except Exception as e:
-                    f = Future()
-                    f.set_exception(e)
-                    callback(
-                        f
-                    )  # manually invoke the call back function to ensure integrity of job counting
+        previous_executor = self.scheduler.bind_executor(executor)
+        try:
+            while q.get():
+                self.scheduler.drain(q=q)
+        finally:
+            self.scheduler.restore_executor(previous_executor)
 
     def increment(self):
         """Increment job counter (called when new work enters the system)."""
@@ -501,17 +592,20 @@ class Pipeline:
                 names.append(cls.__name__)
         return names or [event.__class__.__name__]
 
-    @functools.cache
     def archive(self, suffix: Optional[str], readonly=False):
         """Return a cache/rocksdb archive keyed by ``suffix`` (memoized per suffix)."""
-        if self.workspace is None:
-            archive = InMemCache()
-        else:
-            if suffix is None:
-                suffix = "default"
-            path = self.workspace.joinpath(suffix)
-            path.parent.mkdir(parents=True, exist_ok=True)
-            try:
+        normalized_suffix = "default" if (self.workspace and suffix is None) else suffix
+        key = (normalized_suffix, bool(readonly))
+        with self._archive_lock:
+            cached = self._archives_by_key.get(key)
+            if cached is not None:
+                return cached
+
+            if self.workspace is None:
+                archive = InMemCache()
+            else:
+                path = self.workspace.joinpath(normalized_suffix)
+                path.parent.mkdir(parents=True, exist_ok=True)
                 rdict = Rdict(
                     str(path),
                     access_type=[
@@ -525,10 +619,10 @@ class Pipeline:
                 wo.sync = True
                 rdict.set_write_options(write_opt=wo)
                 archive = rdict
-            except Exception as e:
-                raise e
-        self.archives.append((suffix, archive))
-        return archive
+
+            self._archives_by_key[key] = archive
+            self.archives.append((normalized_suffix, archive))
+            return archive
 
 
 def parse_pattern(p):
