@@ -359,6 +359,50 @@ class ReservoirSampler(ReactiveBuilder):
             yield item
 
 
+class RendezvousOrphanPolicy(abc.ABC):
+    """Strategy for handling unmatched rendezvous keys."""
+
+    @abc.abstractmethod
+    def on_partial(
+        self,
+        index: OrderedDict[Hashable, dict[int, Any]],
+        required_streams: int,
+    ) -> int:
+        """Apply policy after a partial update. Returns number of evicted keys."""
+        pass
+
+
+class WaitForRendezvousOrphans(RendezvousOrphanPolicy):
+    """Default rendezvous policy: retain partial keys indefinitely."""
+
+    def on_partial(
+        self,
+        index: OrderedDict[Hashable, dict[int, Any]],
+        required_streams: int,
+    ) -> int:
+        return 0
+
+
+class MaxPendingRendezvousKeys(RendezvousOrphanPolicy):
+    """Evict oldest partial keys once pending-key count exceeds ``max_pending``."""
+
+    def __init__(self, max_pending: int):
+        if max_pending < 1:
+            raise ValueError("max_pending must be >= 1")
+        self.max_pending = max_pending
+
+    def on_partial(
+        self,
+        index: OrderedDict[Hashable, dict[int, Any]],
+        required_streams: int,
+    ) -> int:
+        evicted = 0
+        while len(index) > self.max_pending:
+            index.popitem(last=False)
+            evicted += 1
+        return evicted
+
+
 class RendezvousPublisher(ReactiveBuilder):
     """Joins items from multiple streams by matching keys.
 
@@ -372,33 +416,47 @@ class RendezvousPublisher(ReactiveBuilder):
         provides: str,
         requires: Collection[str],
         keys: Collection[Callable[[Any], Hashable]],
+        orphan_policy: Optional[RendezvousOrphanPolicy] = None,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
-        # index maps key -> dict of {stream_index: value}
-        # Using dict instead of list prevents duplicates from same stream
-        self.index: dict[Hashable, dict[int, Any]] = defaultdict(dict)
+        # index maps key -> dict of {stream_index: value}. Ordered to support
+        # deterministic eviction strategies.
+        self.index: OrderedDict[Hashable, dict[int, Any]] = OrderedDict()
         self.keys = keys
+        self.orphan_policy = (
+            WaitForRendezvousOrphans() if orphan_policy is None else orphan_policy
+        )
 
     def build(self, context: Context, item: Tuple[int, Any]):
         i, (v, *_) = item
         key_func = self.keys[i]
         k = key_func(v)
+        slot = self.index.setdefault(k, {})
 
         # Check for duplicate key from same stream
-        if i in self.index[k]:
+        if i in slot:
             logger.warning(
                 f"Rendezvous: duplicate key '{k}' from stream {i}, "
                 f"overwriting previous value"
             )
 
-        self.index[k][i] = v
+        slot[i] = v
 
-        if len(self.index[k]) == len(self.keys):
+        if len(slot) == len(self.keys):
             # All streams have contributed - emit the joined result
-            result = tuple(self.index[k][idx] for idx in range(len(self.keys)))
+            result = tuple(slot[idx] for idx in range(len(self.keys)))
             del self.index[k]
             yield result
+            return
+
+        evicted = self.orphan_policy.on_partial(self.index, len(self.keys))
+        if evicted:
+            logger.warning(
+                "Rendezvous: evicted %d pending key(s) due to orphan policy %s",
+                evicted,
+                self.orphan_policy.__class__.__name__,
+            )
 
     def clear_orphaned_keys(self) -> int:
         """Remove keys that will never complete. Returns count of removed keys.
@@ -574,15 +632,31 @@ class LoadBalancerCollector(ReactiveBuilder):
         self,
         provides: str,
         requires: Collection[str],
+        gap_policy: Optional["SequenceGapPolicy"] = None,
         **kwargs,
     ) -> None:
         super().__init__(provides, requires, persist=False, **kwargs)
         self.buffer: dict[int, List[Any]] = {}
         self._next_expected = 0
+        self.gap_policy = WaitForSequenceGaps() if gap_policy is None else gap_policy
+        self.skipped_sequences = 0
 
     def build(self, context: Context, item: Tuple[int, List[Any]]):
         seq, results = item
         self.buffer[seq] = list(results)
+        resolved = self.gap_policy.resolve_next_expected(self.buffer, self._next_expected)
+        if resolved < self._next_expected:
+            raise ValueError(
+                "gap policy returned a next_expected smaller than current cursor"
+            )
+        if resolved > self._next_expected:
+            self.skipped_sequences += resolved - self._next_expected
+            logger.warning(
+                "LoadBalancerCollector skipped %d sequence(s) due to gap policy %s",
+                resolved - self._next_expected,
+                self.gap_policy.__class__.__name__,
+            )
+        self._next_expected = resolved
 
         while self._next_expected in self.buffer:
             ready = self.buffer.pop(self._next_expected)
@@ -595,6 +669,52 @@ class LoadBalancerCollector(ReactiveBuilder):
 
     def get_next_expected_seq(self) -> int:
         return self._next_expected
+
+
+class SequenceGapPolicy(abc.ABC):
+    """Strategy for handling missing sequences in FIFO collectors."""
+
+    @abc.abstractmethod
+    def resolve_next_expected(
+        self,
+        buffer: dict[int, List[Any]],
+        next_expected: int,
+    ) -> int:
+        """Return the cursor to use before draining ready buffered sequences."""
+        pass
+
+
+class WaitForSequenceGaps(SequenceGapPolicy):
+    """Default gap policy: wait indefinitely for missing sequence numbers."""
+
+    def resolve_next_expected(
+        self,
+        buffer: dict[int, List[Any]],
+        next_expected: int,
+    ) -> int:
+        return next_expected
+
+
+class SkipAheadOnBacklog(SequenceGapPolicy):
+    """Skip missing sequence gaps when buffered backlog reaches ``max_buffered``."""
+
+    def __init__(self, max_buffered: int):
+        if max_buffered < 1:
+            raise ValueError("max_buffered must be >= 1")
+        self.max_buffered = max_buffered
+
+    def resolve_next_expected(
+        self,
+        buffer: dict[int, List[Any]],
+        next_expected: int,
+    ) -> int:
+        if next_expected in buffer:
+            return next_expected
+        if len(buffer) < self.max_buffered:
+            return next_expected
+        if not buffer:
+            return next_expected
+        return min(buffer)
 
 
 def make_load_balancer(

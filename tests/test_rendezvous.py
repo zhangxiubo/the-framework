@@ -11,6 +11,7 @@ from framework.core import AbstractProcessor, Event, Pipeline
 from framework.reactive import (
     ReactiveBuilder,
     ReactiveEvent,
+    MaxPendingRendezvousKeys,
     RendezvousPublisher,
     RendezvousReceiver,
     make_rendezvous,
@@ -599,6 +600,36 @@ class TestRendezvousEdgeCases:
 
         assert len(results) == 1
         assert results[0] == ("", 0)
+
+    def test_rendezvous_orphan_policy_evicts_oldest_pending_keys(self):
+        from framework.core import Context
+
+        publisher = RendezvousPublisher(
+            provides="joined",
+            requires=["internal"],
+            keys=[lambda x: x["id"], lambda x: x["id"]],
+            orphan_policy=MaxPendingRendezvousKeys(max_pending=2),
+        )
+
+        pipeline = Pipeline([publisher])
+        ctx = Context(pipeline)
+
+        # Fill pending with three unmatched keys from stream 0.
+        list(publisher.build(ctx, (0, ({"id": "k1", "v": "a1"},))))
+        list(publisher.build(ctx, (0, ({"id": "k2", "v": "a2"},))))
+        list(publisher.build(ctx, (0, ({"id": "k3", "v": "a3"},))))
+
+        # Policy should have evicted the oldest key (k1).
+        assert set(publisher.index.keys()) == {"k2", "k3"}
+
+        # k2 is still pending and should complete.
+        joined = list(publisher.build(ctx, (1, ({"id": "k2", "v": "b2"},))))
+        assert len(joined) == 1
+        assert joined[0][0]["v"] == "a2"
+        assert joined[0][1]["v"] == "b2"
+
+        # k1 was already evicted, so a late partner from stream 1 cannot complete it.
+        assert list(publisher.build(ctx, (1, ({"id": "k1", "v": "b1"},)))) == []
 
 
 class TestRendezvousPublisherIndexUnpacking:

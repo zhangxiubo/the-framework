@@ -16,6 +16,7 @@ from framework.reactive import (
     LoadBalancerRouter,
     LoadBalancerWorkerWrapper,
     LoadBalancerCollector,
+    SkipAheadOnBacklog,
     make_load_balancer,
 )
 
@@ -460,6 +461,25 @@ class TestLoadBalancerCollectorBehavior:
         results = list(collector.build(ctx, (0, ["a", "b", "c"])))
 
         assert results == ["a", "b", "c"]
+
+    def test_collector_gap_policy_can_skip_missing_sequences(self):
+        from framework.core import Context
+
+        collector = LoadBalancerCollector(
+            provides="output",
+            requires=["results"],
+            gap_policy=SkipAheadOnBacklog(max_buffered=3),
+        )
+
+        pipeline = Pipeline([collector])
+        ctx = Context(pipeline)
+
+        # Missing seqs 0-4; once backlog reaches threshold, policy skips ahead to 5.
+        assert list(collector.build(ctx, (5, ["r5"]))) == []
+        assert list(collector.build(ctx, (6, ["r6"]))) == []
+        assert list(collector.build(ctx, (7, ["r7"]))) == ["r5", "r6", "r7"]
+        assert collector.get_next_expected_seq() == 8
+        assert collector.skipped_sequences == 5
 
 
 class TestLoadBalancerFIFOOrdering:
