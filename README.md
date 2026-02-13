@@ -1,33 +1,22 @@
 # Framework
 
-Framework is a Python event-processing runtime with deterministic replay and a "reactive" builder layer. It focuses on three things:
+`framework` is a Python event-processing runtime with a reactive builder layer.
 
-1. **Declarative routing.** Processors declare their interests via `match` patterns and the pipeline infers routing automatically.
-2. **Deterministic execution.** Single-threaded inboxes per processor, cache replays, and phase markers keep event ordering predictable.
-3. **Composable builders.** Reactive builders describe what they *provide* and what they *require*; the runtime handles discovery, fan-out, and caching of intermediate artifacts.
+It is built around:
 
-The source lives under [`src/framework`](src/framework). The most important modules are:
+1. Event routing inferred from `match` patterns in processors.
+2. Per-processor mailboxes (single in-flight task per processor).
+3. Phase-based execution (`__PHASE__`) and explicit shutdown (`__POISON__`).
+4. Replay/caching utilities with optional RocksDB persistence.
 
-| Module | Description |
-|--------|-------------|
-| [`framework.core`](src/framework/core.py) | Runtime primitives: `Event`, `AbstractProcessor`, `Pipeline`, context utilities, retry/caching helpers, and persistence archives. |
-| [`framework.reactive`](src/framework/reactive.py) | Higher-level builders (`ReactiveBuilder`, `StreamGrouper`, `Collector`, samplers, etc.) built on top of the core event loop. |
+Source code lives in [`src/framework`](src/framework).
 
-## Key concepts
+## Modules
 
-- **Event** – plain object with a `name` and arbitrary attributes. Events form the units of work flowing through the system.
-- **AbstractProcessor** – subclass this, implement `process(self, context, event)`, and use `match` statements to describe the events you care about. Interests are inferred automatically from your patterns.
-- **Pipeline** – orchestrates dispatch. Each processor keeps an inbox with limited concurrency so stateful processors can mutate internal data safely.
-- **Context** – helper passed to processors. Use `context.submit()` to emit follow-up events; the context records what you emitted so caching/replay can reproduce the exact sequence later.
-- **ReactiveBuilder** – specialization that wires dependencies using `provides`/`requires`. Builders react to `ReactiveEvent` instances: `resolve` asks for a target, `built` announces that a target is available.
-
-## Features
-
-- AST-driven interest inference: `match` statements are parsed once so you do not maintain manual topic lists.
-- Deterministic job accounting with cooperative phases (`__PHASE__` events) for multi-stage workflows.
-- Interrupt-aware executors: SIGINT triggers a graceful shutdown via `InterruptHandler`.
-- Pluggable persistence: archives default to in-memory caches, but a workspace path enables RocksDB-backed stores for long-lived caching.
-- Reactive helpers: stream grouping, collectors, and samplers that operate entirely through events (no shared memory required).
+| Module | Purpose |
+| --- | --- |
+| [`framework.core`](src/framework/core.py) | `Event`, `Context`, `AbstractProcessor`, `Pipeline`, `Inbox`, and core decorators/utilities (`caching`, `retry`, `timeit`, interest inference helpers). |
+| [`framework.reactive`](src/framework/reactive.py) | `ReactiveBuilder`, `ReactiveEvent`, stream helpers, rendezvous utilities, and load-balancer utilities. |
 
 ## Installation
 
@@ -35,70 +24,152 @@ The source lives under [`src/framework`](src/framework). The most important modu
 pip install .
 ```
 
-The project targets Python 3.11+. Dependencies are declared in [`pyproject.toml`](pyproject.toml). A [`uv.lock`](uv.lock) is included if you prefer `uv` for reproducible environments.
+With `uv` for local development:
 
-## Quickstart
+```bash
+uv sync --group dev
+```
 
-### Core pipeline
+## Core runtime
+
+### Event and processor model
+
+- `Event(name=..., **attrs)` is a lightweight message object.
+- Subclass `AbstractProcessor` and implement `process(self, context, event)`.
+- `Context.submit(event)` emits downstream events.
+- Processor interests are inferred from the `match` statement in `process`.
+
+### Routing behavior
+
+- By default (`strict_interest_inference=False`), processors with unrecognized/no `match` interests may still receive events through a generic `(None, None)` route.
+- With `strict_interest_inference=True`, only inferred interests are routed.
+- Routing includes event class MRO names, so processors matching `Event(...)` can receive subclass instances.
+
+### Dispatch and ordering
+
+- Each processor has an `Inbox`; only one task per processor runs at a time.
+- Multiple processors can run concurrently in a shared `ThreadPoolExecutor` (`max_workers`).
+- Ready processors are ordered by `priority` in a `PriorityQueue` (lower numeric priority executes first).
+
+### Pipeline lifecycle
+
+`Pipeline.run()` does the following:
+
+1. Starts dispatcher/executor threads.
+2. Repeatedly emits `__PHASE__` and waits for quiescence.
+3. Emits `__POISON__` for termination hooks.
+4. Closes archives and shuts down workers.
+
+`Pipeline.submit(event)` returns the number of recipient processors.
+
+### Caching and persistence
+
+- `@caching` (from `framework.core`) caches emitted events by input-event digest.
+- Default archive backend is in-memory (`InMemCache`).
+- Passing `workspace=Path(...)` to `Pipeline` enables RocksDB-backed archives via `pipeline.archive(...)`.
+
+## Quickstart (core)
 
 ```python
 from framework.core import AbstractProcessor, Context, Event, Pipeline
 
+
 class Greeter(AbstractProcessor):
-    def process(self, context: Context, event: Event) -> None:
+    def process(self, context: Context, event: Event):
         match event:
             case Event(name="start", who=who):
                 context.submit(Event(name="greet", who=who))
             case Event(name="greet", who=who):
-                print(f"Hello, {who}!")
+                print(f"hello {who}")
 
-pipeline = Pipeline([Greeter()])
+
+pipeline = Pipeline([Greeter()], strict_interest_inference=True)
 pipeline.submit(Event(name="start", who="world"))
 pipeline.run()
 ```
 
-### Reactive builder
+## Reactive layer
+
+`ReactiveBuilder` extends `AbstractProcessor` with dependency-driven build flows.
+
+- `provides`: target this builder emits.
+- `requires`: upstream targets this builder depends on.
+- `ReactiveEvent(name="resolve", target=...)`: request artifacts for a target.
+- `ReactiveEvent(name="built", target=..., artifact=...)`: announce produced artifact.
+- `persist=True` stores build outputs in pipeline archives; future resolves replay cache.
+- Requirement names prefixed with `*` are expanded from tuple artifacts into positional args for `build`.
+
+## Quickstart (reactive)
 
 ```python
+from framework.core import AbstractProcessor, Pipeline
 from framework.reactive import ReactiveBuilder, ReactiveEvent
-from framework.core import Pipeline
 
-class Words(ReactiveBuilder):
+
+class Numbers(ReactiveBuilder):
     def __init__(self):
-        super().__init__(provides="words", requires=[], persist=False)
+        super().__init__(provides="numbers", requires=[], persist=False)
 
     def build(self, context):
-        yield from ["alpha", "beta", "gamma"]
+        yield from [1, 2, 3]
 
-pipeline = Pipeline([Words()])
-pipeline.submit(ReactiveEvent(name="resolve", target="words"))
+
+class Doubles(ReactiveBuilder):
+    def __init__(self):
+        super().__init__(provides="doubles", requires=["numbers"], persist=False)
+
+    def build(self, context, x):
+        yield x * 2
+
+
+class Sink(AbstractProcessor):
+    def process(self, context, event):
+        match event:
+            case ReactiveEvent(name="built", target="doubles", artifact=value):
+                print(value)
+
+
+pipeline = Pipeline([Numbers(), Doubles(), Sink()])
+pipeline.submit(ReactiveEvent(name="resolve", target="doubles"))
 pipeline.run()
 ```
 
-The builder receives a `resolve` request, materializes its artifacts inside `build`, and publishes each artifact as a `ReactiveEvent(name="built", target="words", artifact=value)`.
+## Built-in reactive utilities
 
-## Reactive utilities overview
+- `Collector`: batches incoming artifacts and emits on phase boundaries.
+- `Grouper`: phase-based grouping by key.
+- `StreamGrouper`: emits previous group when key changes, flushes on phase.
+- `StreamSampler`: Bernoulli sampling.
+- `ReservoirSampler`: bounded-size sample emitted on phase.
 
-- `Collector` – buffers artifacts per phase and only forwards if new data arrived since the last phase.
-- `Grouper` – groups inputs by key per phase and emits `(key, group)` tuples when phases advance.
-- `StreamGrouper` – streaming variant that emits whenever the key changes; useful for streaming joins or windowed aggregation.
-- `StreamSampler` / `ReservoirSampler` – probabilistic sampling processors for high-volume streams.
+### Rendezvous
 
-Each helper is a `ReactiveBuilder`, so they inherit the same cache semantics and lifecycle hooks (`on_init`, `on_terminate`, `phase`).
+Use `make_rendezvous(provides, requires, keys)` to join multiple input streams by key.
+
+- Returns `(publisher, receiver_0, receiver_1, ...)`.
+- `RendezvousPublisher` supports orphan policies:
+  - `WaitForRendezvousOrphans` (default)
+  - `MaxPendingRendezvousKeys(max_pending=...)`
+
+### Load balancing
+
+Use `make_load_balancer(...)` to fan out work across worker builders.
+
+- `preserve_fifo=True` (default): reassembles worker results in input order via `LoadBalancerCollector`.
+- `preserve_fifo=False`: emits worker outputs immediately.
+- Sequence gap policies:
+  - `WaitForSequenceGaps` (default)
+  - `SkipAheadOnBacklog(max_buffered=...)`
+- `parallelize(...)` is a backward-compatible alias for `make_load_balancer(...)`.
 
 ## Running tests
 
-Use the micromamba-managed environment provided in this repository:
-
 ```bash
-micromamba run -p ./.venv pytest
+uv run pytest -q
 ```
 
-This exercises both the core runtime and the reactive builders.
+## Development notes
 
-## Development tips
-
-- When adding processors, prefer `match` instead of manual `if` chains so the pipeline can infer your interests.
-- Use the `@caching` decorator for expensive or non-idempotent processors. It records the events you emitted and replays them when the same input arrives.
-- The `Pipeline` emits `__PHASE__` events between waves of work. Hook into them for periodic maintenance or to flush streaming state safely.
-
+- Prefer `match` in `process()` so routing can be inferred.
+- Keep processor state local to the processor; inbox scheduling guarantees single-task execution per processor.
+- Use `strict_interest_inference=True` when you want only explicitly inferred routes.
