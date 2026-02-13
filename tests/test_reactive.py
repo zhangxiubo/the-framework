@@ -1,15 +1,8 @@
 import threading
 from typing import MutableMapping
 
-
-# Ensure src is importable regardless of packaging
-import sys
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parents[1] / "src"))
-
-from framework.core import AbstractProcessor, Event, Pipeline  # noqa: E402
-from framework.reactive import (  # noqa: E402
+from framework.core import AbstractProcessor, Event, Pipeline
+from framework.reactive import (
     ReactiveBuilder,
     ReactiveEvent,
     StreamGrouper,
@@ -21,7 +14,7 @@ def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
     q = pipeline.q
 
     def runner():
-        pipeline.execute_events(q)
+        pipeline.execute_events()
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()
@@ -35,7 +28,6 @@ def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
 
 
 def test_reactive_source_publishes_on_resolve():
-    # Intended: if requires == [], a resolve should trigger publish/build
     collected = []
 
     class Sink(AbstractProcessor):
@@ -55,8 +47,7 @@ def test_reactive_source_publishes_on_resolve():
     pipe.submit(ReactiveEvent(name="resolve", target="A"))
     run_dispatcher_once(pipe)
 
-    # Intended assertion: should have published 1,2,3
-    assert collected == [1, 2, 3]  # Expected to fail with current code
+    assert collected == [1, 2, 3]
 
 
 def test_reactive_new_handler_runs_once():
@@ -80,8 +71,7 @@ def test_reactive_new_handler_runs_once():
     pipe.submit(ReactiveEvent(name="resolve", target="B"))
     run_dispatcher_once(pipe)
 
-    # Intended: new() runs once
-    assert calls["new"] == 1  # Expected to fail due to handler removal bug
+    assert calls["new"] == 1
 
 
 def test_stream_grouper_emits_previous_group_on_key_change():
@@ -127,10 +117,9 @@ def test_stream_grouper_flushes_trailing_group_on_phase():
     pipe.submit(Event(name="__PHASE__", phase=1))
     run_dispatcher_once(pipe)
 
-    # Intended: trailing group (3, [(31,), (32,)]) emitted
     assert seen == [
         (3, [(31,), (32,)])
-    ]  # Expected to fail; phase() yields instead of submitting
+    ]
 
 
 def test_collector_emits_on_phase_when_changed():
@@ -303,7 +292,7 @@ def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
 
     assert seen == []
 
-    # later, a resolve for Y should replay c    ached artifacts via reply()
+    # Later, a resolve for Y should replay cached artifacts via reply().
     pipe.submit(ReactiveEvent(name="resolve", target="Y"))
     run_dispatcher_once(pipe)
 
@@ -326,5 +315,5 @@ def test_starred_requires_forward_both_raw_and_expanded_arguments():
     pipe.submit(ReactiveEvent(name="resolve", target="Y"))
     run_dispatcher_once(pipe)
 
-    # Expect the tuple and its expanded entries; currently only the tuple arrives.
-    assert captured == [((7, 9), 7, 9)]  # Expected to fail
+    # Expect both the tuple and its expanded entries.
+    assert captured == [((7, 9), 7, 9)]

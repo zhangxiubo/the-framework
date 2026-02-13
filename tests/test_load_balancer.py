@@ -2,10 +2,6 @@
 
 import threading
 import time
-import sys
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parents[1] / "src"))
 
 import pytest
 from framework.core import AbstractProcessor, Event, Pipeline
@@ -26,7 +22,7 @@ def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
     q = pipeline.q
 
     def runner():
-        pipeline.execute_events(q)
+        pipeline.execute_events()
 
     t = threading.Thread(target=runner, daemon=True)
     t.start()

@@ -4,11 +4,7 @@ These tests verify the deterministic content-based sampling which ensures
 replay consistency when items arrive in different orders.
 """
 
-import sys
 from collections import Counter
-from pathlib import Path
-
-sys.path.append(str(Path(__file__).parents[1] / "src"))
 
 from framework.core import Context, Pipeline
 from framework.reactive import ReservoirSampler

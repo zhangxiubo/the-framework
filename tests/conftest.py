@@ -1,13 +1,8 @@
 """Shared pytest fixtures for framework tests."""
 
 import threading
-import sys
-from pathlib import Path
 
 import pytest
-
-# Ensure src is importable regardless of packaging
-sys.path.insert(0, str(Path(__file__).parents[1] / "src"))
 
 
 @pytest.fixture
