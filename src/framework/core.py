@@ -412,9 +412,13 @@ class Pipeline:
         try:
             self.run_phases()
         except KeyboardInterrupt:
-            # Unblock waiters then continue shutdown.
-            self.abort_waiters()
-            logger.info("pipeline interrupted; proceeding to shutdown")
+            logger.info("pipeline interrupted; attempting graceful shutdown")
+            try:
+                self.run_poison_phase()
+            except KeyboardInterrupt:
+                # A second interrupt during shutdown forces an immediate abort path.
+                self.abort_waiters()
+                logger.info("pipeline interrupted again during shutdown; forcing termination")
         finally:
             # Send stop pulse to dispatcher loop.
             self.freeze_external_submissions()
@@ -487,8 +491,11 @@ class Pipeline:
         # Final drain before poison-pill shutdown event.
         self.pulse_dispatcher()
         self.wait()
-        logger.info("processing done; proceeding to shutdown phase")
+        self.run_poison_phase()
 
+    def run_poison_phase(self) -> None:
+        """Run the termination phase by emitting `__POISON__` and waiting for it."""
+        logger.info("processing done; proceeding to shutdown phase")
         # Freeze all non-runtime submissions before termination.
         self.freeze_external_submissions()
         # Ask processors to finalize/flush via conventional poison event.
@@ -709,9 +716,7 @@ class Pipeline:
                         "pipeline wait aborted due to an internal dispatch error"
                     ) from self.fatal_error
             except KeyboardInterrupt:
-                # Propagate interrupt but avoid deadlocking waiters.
-                self.done = self.jobs
-                self.cond.notify_all()
+                # Propagate interrupt so run() can drive graceful shutdown.
                 raise
 
     @staticmethod
