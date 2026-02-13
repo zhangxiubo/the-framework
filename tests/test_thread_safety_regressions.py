@@ -1,100 +1,12 @@
-import importlib
-import sys
 import threading
 import time
-import types
 from concurrent.futures import ThreadPoolExecutor
 from queue import Empty
 
 import pytest
-
-
-def install_optional_dependency_stubs():
-    try:
-        import deepdiff  # noqa: F401
-    except ModuleNotFoundError:
-        deepdiff = types.ModuleType("deepdiff")
-
-        class DeepHash(dict):
-            def __init__(self, obj):
-                super().__init__()
-                self[obj] = hash(repr(obj))
-
-        deepdiff.DeepHash = DeepHash
-        sys.modules["deepdiff"] = deepdiff
-
-    try:
-        import dill  # noqa: F401
-    except ModuleNotFoundError:
-        dill = types.ModuleType("dill")
-        dill.dumps = lambda x: x
-        dill.loads = lambda x: x
-        sys.modules["dill"] = dill
-
-    try:
-        import rocksdict  # noqa: F401
-        import rocksdict.rocksdict  # noqa: F401
-    except ModuleNotFoundError:
-        rocksdict = types.ModuleType("rocksdict")
-
-        class Rdict(dict):
-            def set_dumps(self, *args, **kwargs):
-                pass
-
-            def set_loads(self, *args, **kwargs):
-                pass
-
-            def set_write_options(self, *args, **kwargs):
-                pass
-
-            def close(self):
-                pass
-
-        class WriteOptions:
-            def __init__(self):
-                self.sync = False
-
-        rocksdict.Rdict = Rdict
-        rocksdict.WriteOptions = WriteOptions
-        sys.modules["rocksdict"] = rocksdict
-
-        rocksdict_sub = types.ModuleType("rocksdict.rocksdict")
-
-        class AccessType:
-            @staticmethod
-            def read_write():
-                return "rw"
-
-            @staticmethod
-            def read_only():
-                return "ro"
-
-        rocksdict_sub.AccessType = AccessType
-        sys.modules["rocksdict.rocksdict"] = rocksdict_sub
-
-
-install_optional_dependency_stubs()
-core = importlib.import_module("framework.core")
-
-AbstractProcessor = core.AbstractProcessor
-Event = core.Event
-Pipeline = core.Pipeline
-
-
-def run_dispatcher_once(pipeline: Pipeline):
-    q = pipeline.q
-
-    def runner():
-        pipeline.execute_events()
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        q.put(True)
-        pipeline.wait()
-    finally:
-        q.put(False)
-        t.join(timeout=5)
+import framework.core as core
+from framework.core import AbstractProcessor, Event, Pipeline
+from tests.helpers import run_dispatcher_once
 
 
 def test_concurrent_first_submit_uses_single_inbox(monkeypatch):

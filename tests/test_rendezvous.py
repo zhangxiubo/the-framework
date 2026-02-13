@@ -1,7 +1,5 @@
 """Unit tests for make_rendezvous and related classes."""
 
-import threading
-
 import pytest
 from framework.core import AbstractProcessor, Event, Pipeline
 from framework.reactive import (
@@ -12,24 +10,7 @@ from framework.reactive import (
     RendezvousReceiver,
     make_rendezvous,
 )
-
-
-def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
-    """Helper to run the pipeline dispatcher for a given number of pulses."""
-    q = pipeline.q
-
-    def runner():
-        pipeline.execute_events()
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        for _ in range(pulses):
-            q.put(True)
-            pipeline.wait()
-    finally:
-        q.put(False)
-        t.join(timeout=5)
+from tests.helpers import run_dispatcher_once
 
 
 class TestMakeRendezvousBasic:

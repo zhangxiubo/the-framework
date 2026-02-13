@@ -1,6 +1,5 @@
 """Unit tests for make_load_balancer and related classes."""
 
-import threading
 import time
 
 import pytest
@@ -15,24 +14,7 @@ from framework.reactive import (
     SkipAheadOnBacklog,
     make_load_balancer,
 )
-
-
-def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
-    """Helper to run the pipeline dispatcher for a given number of pulses."""
-    q = pipeline.q
-
-    def runner():
-        pipeline.execute_events()
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        for _ in range(pulses):
-            q.put(True)
-            pipeline.wait()
-    finally:
-        q.put(False)
-        t.join(timeout=5)
+from tests.helpers import run_dispatcher_once
 
 
 class SimpleDoubler(ReactiveBuilder):

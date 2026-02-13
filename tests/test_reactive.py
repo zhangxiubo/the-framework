@@ -1,4 +1,3 @@
-import threading
 from typing import MutableMapping
 
 from framework.core import AbstractProcessor, Event, Pipeline
@@ -8,23 +7,7 @@ from framework.reactive import (
     StreamGrouper,
     Collector,
 )
-
-
-def run_dispatcher_once(pipeline: Pipeline, pulses: int = 1):
-    q = pipeline.q
-
-    def runner():
-        pipeline.execute_events()
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        for _ in range(pulses):
-            q.put(True)
-            pipeline.wait()
-    finally:
-        q.put(False)
-        t.join(timeout=5)
+from tests.helpers import run_dispatcher_once
 
 
 def test_reactive_source_publishes_on_resolve():

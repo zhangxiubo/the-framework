@@ -23,26 +23,7 @@ from framework.core import (
     caching,
     retry,
 )
-
-
-def run_dispatcher_once(pipeline: Pipeline):
-    """
-    Start a dispatcher thread, pulse once, wait for all work,
-    then stop dispatcher.
-    """
-    q = pipeline.q
-
-    def runner():
-        pipeline.execute_events()
-
-    t = threading.Thread(target=runner, daemon=True)
-    t.start()
-    try:
-        q.put(True)
-        pipeline.wait()
-    finally:
-        q.put(False)
-        t.join(timeout=5)
+from tests.helpers import run_dispatcher_once
 
 
 def test_retry_succeeds_before_max_attempts(caplog):
