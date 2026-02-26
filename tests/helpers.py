@@ -71,8 +71,8 @@ def install_optional_dependency_stubs() -> None:
 
 
 def run_dispatcher_once(pipeline, pulses: int = 1) -> None:
-    """Run dispatcher thread for one or more pulse/wait cycles."""
-    q = pipeline.q
+    """Run dispatcher thread for one or more wait cycles."""
+    from framework.core import _STOP_SENTINEL
 
     def runner():
         pipeline.execute_events()
@@ -81,8 +81,7 @@ def run_dispatcher_once(pipeline, pulses: int = 1) -> None:
     t.start()
     try:
         for _ in range(pulses):
-            q.put(True)
             pipeline.wait()
     finally:
-        q.put(False)
+        pipeline.rdyq.put(_STOP_SENTINEL)
         t.join(timeout=5)

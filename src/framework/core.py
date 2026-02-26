@@ -241,6 +241,10 @@ class ProcessEntry:
     processor: "AbstractProcessor" = field(compare=False)
 
 
+# Sentinel entry used to unblock the dispatcher and signal shutdown.
+_STOP_SENTINEL = ProcessEntry(priority=0, processor=None)  # type: ignore[arg-type]
+
+
 class Inbox:
     """Single-processor mailbox enforcing one in-flight task per processor.
 
@@ -342,12 +346,6 @@ class Pipeline:
 
         # Ready processors ordered by priority.
         self.rdyq: PriorityQueue[ProcessEntry] = PriorityQueue()
-        # Pulse queue used to trigger dispatcher drain cycles.
-        self.q: SimpleQueue[bool] = SimpleQueue()
-        # Protects pulse de-duplication state below.
-        self.dispatch_pulse_lock = threading.Lock()
-        # True means there is already at least one pending dispatcher pulse.
-        self.dispatch_pulse_enqueued = False
 
         # Lock protecting lazy inbox map creation.
         self.inbox_lock = threading.Lock()
@@ -422,7 +420,7 @@ class Pipeline:
         finally:
             # Send stop pulse to dispatcher loop.
             self.freeze_external_submissions()
-            self.q.put(False)
+            self.rdyq.put(_STOP_SENTINEL)
             dispatcher.join(timeout=5)
             if dispatcher.is_alive():
                 self.set_fatal_error(RuntimeError("dispatcher thread did not terminate within timeout"))
@@ -448,8 +446,6 @@ class Pipeline:
             logger.info("starting phase: %02d", phase)
             started = time.perf_counter()
 
-            # Trigger dispatcher to drain currently queued work.
-            self.pulse_dispatcher()
             # Wait until all currently known jobs complete.
             self.wait()
             logger.info(
@@ -467,7 +463,6 @@ class Pipeline:
                 Event(name="__PHASE__", phase=phase),
                 _internal=True,
             )
-            self.pulse_dispatcher()
             self.wait()
 
             # If no processor listens for __PHASE__, no phase-driven work can continue.
@@ -489,7 +484,6 @@ class Pipeline:
                 break
 
         # Final drain before poison-pill shutdown event.
-        self.pulse_dispatcher()
         self.wait()
         self.run_poison_phase()
 
@@ -500,7 +494,7 @@ class Pipeline:
         self.freeze_external_submissions()
         # Ask processors to finalize/flush via conventional poison event.
         self.submit(Event(name="__POISON__"), _internal=True)
-        self.pulse_dispatcher()
+
         self.wait()
         logger.info("dispatcher terminated")
 
@@ -518,11 +512,8 @@ class Pipeline:
             # Force waiters to unblock immediately.
             self.done = self.jobs
             self.cond.notify_all()
-        with self.dispatch_pulse_lock:
-            # Reset pulse state so shutdown pulses cannot be suppressed.
-            self.dispatch_pulse_enqueued = False
-        # Stop dispatcher loop as soon as possible.
-        self.q.put(False)
+        # Unblock dispatcher so it can exit.
+        self.rdyq.put(_STOP_SENTINEL)
 
     def raise_if_failed(self) -> None:
         """Raise a deterministic runtime error if the pipeline entered fatal state."""
@@ -588,63 +579,23 @@ class Pipeline:
         for processor in recipients:
             self.get_inbox(processor).put_event(event)
 
-        # Wake dispatcher to consume newly ready processors.
-        self.pulse_dispatcher()
         return len(recipients)
 
-    def pulse_dispatcher(self) -> None:
-        """Enqueue a scheduler pulse.
-
-        Dispatcher consumes pulses from `self.q` and drains until idle.
-        """
-        with self.dispatch_pulse_lock:
-            if self.dispatch_pulse_enqueued:
-                return
-            self.dispatch_pulse_enqueued = True
-        self.q.put(True)
-
     def execute_events(self, executor: Optional[ThreadPoolExecutor] = None) -> None:
-        """Dispatcher loop consuming pulses and scheduling ready work."""
+        """Dispatcher loop: block on ready queue, dispatch entries, stop on sentinel."""
         if executor is None:
             # Convenience mode for tests/callers not providing an executor.
             with ThreadPoolExecutor(self.max_workers) as owned_executor:
                 self.execute_events(owned_executor)
             return
 
-        # Main dispatcher loop:
-        # True pulse -> drain
-        # False pulse -> stop
         while True:
-            pulse = self.q.get()
-            if not pulse:
+            entry = self.rdyq.get()
+            if entry.processor is None:
                 return
-            with self.dispatch_pulse_lock:
-                self.dispatch_pulse_enqueued = False
-            self.dispatch_until_idle(executor)
-
-    def dispatch_until_idle(self, executor: ThreadPoolExecutor) -> None:
-        """Drain ready queue until no runnable work remains."""
-        while True:
-            self.raise_if_failed()
-            entry = self.next_ready_entry(timeout=0.05)
-            if entry is None:
-                # Stop draining when no queued work and global accounting is idle.
-                if self.is_idle():
-                    return
-
-                # Continue polling for new ready entries while work remains.
-                continue
-
+            if self.fatal_error is not None:
+                return
             self.dispatch_entry(entry, executor)
-
-    def next_ready_entry(self, timeout: Optional[float] = None) -> Optional[ProcessEntry]:
-        """Pop next ready processor entry if available, else None."""
-        try:
-            if timeout is None:
-                return self.rdyq.get_nowait()
-            return self.rdyq.get(timeout=timeout)
-        except Empty:
-            return None
 
     def dispatch_entry(
         self,
