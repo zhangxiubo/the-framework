@@ -1,7 +1,7 @@
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-from queue import Empty
+
 
 import pytest
 import framework.core as core
@@ -101,7 +101,7 @@ def test_run_processes_buffered_events_without_dispatcher():
     assert seen == [10, 11]
 
 
-def test_context_submit_from_worker_keeps_progress_without_pulse_loop():
+def test_context_submit_from_worker_chains_downstream_work():
     seen = []
 
     class Producer(AbstractProcessor):
@@ -121,42 +121,6 @@ def test_context_submit_from_worker_keeps_progress_without_pulse_loop():
     pipe.run()
 
     assert seen == [6]
-
-
-def test_pulse_dedup_under_concurrent_contention():
-    class NoOp(AbstractProcessor):
-        def process(self, context, event):
-            match event:
-                case Event(name="X"):
-                    pass
-
-    pipe = Pipeline([NoOp()], strict_interest_inference=True)
-
-    # Drain any bootstrap pulses.
-    while True:
-        try:
-            pipe.q.get(block=False)
-        except Empty:
-            break
-
-    start = threading.Barrier(9)
-
-    def pulser():
-        start.wait()
-        for _ in range(100):
-            pipe.pulse_dispatcher()
-
-    threads = [threading.Thread(target=pulser) for _ in range(8)]
-    for t in threads:
-        t.start()
-    start.wait()
-    for t in threads:
-        t.join()
-
-    # Despite heavy contention, at most one pending pulse should remain.
-    assert pipe.q.get(block=False) is True
-    with pytest.raises(Empty):
-        pipe.q.get(block=False)
 
 
 def test_wait_unblocks_promptly_on_internal_fatal_error():

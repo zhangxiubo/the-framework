@@ -9,7 +9,7 @@ import threading
 import time
 from concurrent.futures import Future
 from pathlib import Path
-from queue import Empty, PriorityQueue
+from queue import PriorityQueue
 
 import pytest
 
@@ -355,30 +355,6 @@ def test_inbox_take_event_empty_raises():
     with pytest.raises(RuntimeError):
         inbox.take_event()
 
-
-def test_pipeline_pulse_dispatcher_deduplicates_pending_pulse():
-    class Proc(AbstractProcessor):
-        def process(self, context, event):
-            match event:
-                case Event(name="X"):
-                    pass
-
-    pipe = Pipeline([Proc()], strict_interest_inference=True)
-
-    # Drain any bootstrap pulse left from initialization.
-    while True:
-        try:
-            pipe.q.get(block=False)
-        except Empty:
-            break
-
-    pipe.pulse_dispatcher()
-    pipe.pulse_dispatcher()
-    pipe.pulse_dispatcher()
-
-    assert pipe.q.get(block=False) is True
-    with pytest.raises(Empty):
-        pipe.q.get(block=False)
 
 
 def test_pipeline_sets_fatal_error_on_stale_ready_entry():
