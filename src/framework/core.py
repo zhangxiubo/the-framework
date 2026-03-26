@@ -165,10 +165,11 @@ class Context:
         """Submit a downstream event and track it for replay/caching."""
         try:
             self.ensure_submission_is_safe()
-            # Preserve emission order exactly as produced by the processor.
-            self.events.append(event)
             # Return recipient count from pipeline routing.
-            return self.pipeline.submit(event)
+            recipients = self.pipeline.submit(event)
+            # Preserve only accepted emission order for replay/caching.
+            self.events.append(event)
+            return recipients
         except Exception:
             # Keep contextual logging close to producer call site.
             logger.exception("failed to submit event %s", event)
@@ -363,7 +364,12 @@ class Pipeline:
         # Controls whether generic interest fallback is allowed.
         self.strict_interest_inference = strict_interest_inference
         # Thread pool size for concurrent processor execution.
-        self.max_workers = len(processors) if max_workers is None else max_workers
+        if max_workers is None:
+            self.max_workers = max(1, len(processors))
+        else:
+            if max_workers < 1:
+                raise ValueError("max_workers must be >= 1")
+            self.max_workers = max_workers
         # Opaque runtime config for user processors.
         self.config = {} if config is None else config.copy()
 
@@ -742,12 +748,20 @@ class AbstractProcessor(abc.ABC):
     @functools.cache
     def signature(self) -> str:
         """Stable-ish processor identity string used for cache namespacing."""
+        try:
+            source = get_source(self.__class__)
+        except (OSError, TypeError, IOError):
+            source = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
+            logger.warning(
+                "source unavailable for %s; falling back to module-qualified signature",
+                self,
+            )
         return str(
             Path(
                 # Include logical name first for readability in storage paths.
                 self.name,
                 # Include source hash so cache namespace changes with code edits.
-                hashlib.sha256(get_source(self.__class__).encode()).hexdigest(),
+                hashlib.sha256(source.encode()).hexdigest(),
             )
         )
         # #concern: Source-based hashing can be unstable in interactive/runtime-

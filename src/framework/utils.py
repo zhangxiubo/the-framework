@@ -110,9 +110,27 @@ def find_match_stmt(tree: ast.AST) -> Optional[ast.Match]:
 
 
 def infer_interests(func):
-    tree = ast.parse(textwrap.dedent(get_source(func)))
-    match_stmt = find_match_stmt(tree)
-    if match_stmt is None:
+    try:
+        source = get_source(func)
+    except (OSError, TypeError, IOError):
+        logger.warning(
+            "source unavailable for %s; falling back to generic event interest",
+            func,
+        )
+        yield None, None
+        return
+
+    try:
+        tree = ast.parse(textwrap.dedent(source))
+    except SyntaxError:
+        logger.warning(
+            "could not parse source for %s; falling back to generic event interest",
+            func,
+        )
+        yield None, None
+        return
+    match_stmts = find_match_stmts(tree)
+    if not match_stmts:
         logger.warning(
             "The processor %s does not seem to have declared any interest to events",
             func,
@@ -120,16 +138,17 @@ def infer_interests(func):
         yield None, None
         return
 
-    for case in match_stmt.cases:
-        for interest in parse_pattern(case.pattern):
-            if interest == (None, None):
-                logger.warning(
-                    "failed to identify interests in processor %s: there is "
-                    "a match-case clause but we couldn't identify a valid "
-                    "event-name combination.",
-                    func,
-                )
-            yield interest
+    for match_stmt in match_stmts:
+        for case in match_stmt.cases:
+            for interest in parse_pattern(case.pattern):
+                if interest == (None, None):
+                    logger.warning(
+                        "failed to identify interests in processor %s: there is "
+                        "a match-case clause but we couldn't identify a valid "
+                        "event-name combination.",
+                        func,
+                    )
+                yield interest
 
 
 def get_source(obj) -> str:
@@ -138,6 +157,35 @@ def get_source(obj) -> str:
 
         return oinspect.getsource(obj)
     return inspect.getsource(obj)
+
+
+def find_match_stmts(tree: ast.AST) -> list[ast.Match]:
+    if not isinstance(tree, ast.Module):
+        return []
+
+    fn = next(
+        (
+            node
+            for node in tree.body
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+        ),
+        None,
+    )
+    if fn is None:
+        return []
+
+    def walk(node: ast.AST):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+            return
+        if isinstance(node, ast.Match):
+            yield node
+        for child in ast.iter_child_nodes(node):
+            yield from walk(child)
+
+    matches = []
+    for statement in fn.body:
+        matches.extend(walk(statement))
+    return matches
 
 
 def in_jupyter_notebook() -> bool:
@@ -164,7 +212,7 @@ def caching(func=None, *, debug: bool = True):
                 if debug:
                     logger.debug("digest %s", digest)
 
-                archive = context.pipeline.archive(self.name)
+                archive = context.pipeline.archive(self.signature())
                 if digest in archive:
                     if debug:
                         logger.debug("cache hit: %s", digest)

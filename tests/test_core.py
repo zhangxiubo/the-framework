@@ -1,4 +1,5 @@
 import logging
+import importlib.util
 import os
 import selectors
 import signal
@@ -323,6 +324,61 @@ def test_caching_persists_and_replays_with_workspace(tmp_path):
 
     assert cp.calls == 1
     assert outs == [42, 42]
+
+
+def test_caching_invalidates_across_code_changes_with_workspace(tmp_path):
+    outs = []
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="OUT", value=v):
+                    outs.append(v)
+
+    def load_cached_proc(module_name: str, value: int):
+        module_path = tmp_path / f"{module_name}.py"
+        module_path.write_text(
+            textwrap.dedent(
+                f"""
+                from framework.core import AbstractProcessor, Event
+                from framework.utils import caching
+
+                class CachedProc(AbstractProcessor):
+                    def __init__(self):
+                        super().__init__()
+                        self.calls = 0
+
+                    @caching()
+                    def process(self, context, event):
+                        match event:
+                            case Event(name="DO"):
+                                self.calls += 1
+                                context.submit(Event(name="OUT", value={value}))
+                """
+            )
+        )
+        spec = importlib.util.spec_from_file_location(module_name, module_path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        assert spec.loader is not None
+        spec.loader.exec_module(module)
+        return module.CachedProc
+
+    first_proc = load_cached_proc("cached_proc_v1", 1)()
+    pipe1 = Pipeline([first_proc, Sink()], workspace=tmp_path)
+    pipe1.submit(Event(name="DO", payload=1))
+    run_dispatcher_once(pipe1)
+    pipe1.close_archives()
+
+    second_proc = load_cached_proc("cached_proc_v2", 2)()
+    pipe2 = Pipeline([second_proc, Sink()], workspace=tmp_path)
+    pipe2.submit(Event(name="DO", payload=1))
+    run_dispatcher_once(pipe2)
+    pipe2.close_archives()
+
+    assert first_proc.calls == 1
+    assert second_proc.calls == 1
+    assert outs == [1, 2]
 def test_infer_interests_match_or_routing():
     ran = []
 
@@ -341,6 +397,61 @@ def test_infer_interests_match_or_routing():
     p.submit(Event(name="B"))
     run_dispatcher_once(p)
     assert ran == ["A", "B"]
+
+
+def test_infer_interests_handles_multiple_and_nested_match_blocks():
+    seen = []
+
+    class MultiMatchProc(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="A"):
+                    seen.append("A")
+
+            if event.name in {"B", "C"}:
+                match event:
+                    case Event(name="B") | Event(name="C"):
+                        seen.append(event.name)
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            pass
+
+    p = Pipeline([MultiMatchProc(), Sink()], strict_interest_inference=True)
+    p.submit(Event(name="A"))
+    p.submit(Event(name="B"))
+    p.submit(Event(name="C"))
+    run_dispatcher_once(p)
+
+    assert seen == ["A", "B", "C"]
+
+
+def test_dynamic_processor_without_source_uses_generic_interest_and_signature():
+    namespace = {"AbstractProcessor": AbstractProcessor, "Event": Event}
+    exec(
+        """
+class DynamicProc(AbstractProcessor):
+    def __init__(self):
+        super().__init__()
+        self.seen = []
+
+    def process(self, context, event):
+        match event:
+            case Event(name="PING"):
+                self.seen.append(event.name)
+        """,
+        namespace,
+    )
+
+    proc = namespace["DynamicProc"]()
+    assert proc.interests == frozenset({(None, None)})
+    assert proc.signature()
+
+    p = Pipeline([proc])
+    p.submit(Event(name="PING"))
+    run_dispatcher_once(p)
+
+    assert proc.seen == ["PING"]
 
 
 def test_inbox_take_event_empty_raises():
@@ -375,6 +486,18 @@ def test_pipeline_sets_fatal_error_on_stale_ready_entry():
 
     with pytest.raises(RuntimeError, match="internal dispatch error"):
         pipe.wait()
+
+
+def test_pipeline_empty_processors_runs_with_default_worker_count():
+    pipe = Pipeline([])
+
+    assert pipe.max_workers == 1
+    pipe.run()
+
+
+def test_pipeline_rejects_nonpositive_max_workers():
+    with pytest.raises(ValueError, match="max_workers must be >= 1"):
+        Pipeline([], max_workers=0)
 
 
 def test_context_blocks_late_submission_after_task_completion():
@@ -588,6 +711,21 @@ def test_caching_no_workspace_no_replay():
 
     assert proc.calls == 1
     assert outs == [2, 2]
+
+
+def test_context_submit_does_not_record_rejected_events():
+    class Noop(AbstractProcessor):
+        def process(self, context, event):
+            pass
+
+    pipe = Pipeline([Noop()])
+    pipe.accepting_submissions = False
+    ctx = Context(pipe)
+
+    with pytest.raises(RuntimeError):
+        ctx.submit(Event(name="REJECTED"))
+
+    assert ctx.events == []
 
 
 def test_caching_exception_then_replay(tmp_path):
