@@ -153,6 +153,42 @@ class TestParallelizeBasic:
         names2 = {worker.name for worker in components2 if isinstance(worker, SimpleDoubler)}
         assert names1.isdisjoint(names2)
 
+    def test_parallelize_names_include_topology_dimensions(self):
+        components_2 = parallelize(
+            provides="output",
+            requires=["input"],
+            worker_builder=SimpleDoubler,
+            num_workers=2,
+        )
+        components_4 = parallelize(
+            provides="output",
+            requires=["input"],
+            worker_builder=SimpleDoubler,
+            num_workers=4,
+        )
+        components_fifo = parallelize(
+            provides="output",
+            requires=["input"],
+            worker_builder=SimpleDoubler,
+            num_workers=2,
+            preserve_fifo=True,
+        )
+        components_stream = parallelize(
+            provides="output",
+            requires=["input"],
+            worker_builder=SimpleDoubler,
+            num_workers=2,
+            preserve_fifo=False,
+        )
+
+        names_2 = {component.name for component in components_2}
+        names_4 = {component.name for component in components_4}
+        names_fifo = {component.name for component in components_fifo}
+        names_stream = {component.name for component in components_stream}
+
+        assert names_2.isdisjoint(names_4)
+        assert names_fifo.isdisjoint(names_stream)
+
     def test_parallelize_passes_init_kwargs(self):
         class ConfigurableWorker(ReactiveBuilder):
             def __init__(self, multiplier=1, **kwargs):
@@ -390,6 +426,45 @@ class TestLoadBalancerCollectorBehavior:
         run_dispatcher_once(pipeline)
 
         assert collector.next_expected == 8
+
+    def test_collector_does_not_persist_buffer_only_sequences_before_replay(
+        self, tmp_path
+    ):
+        from framework.core import Context
+
+        collector = LoadBalancerCollector(
+            provides="output",
+            requires=["results"],
+            persist=True,
+        )
+
+        pipeline = Pipeline([collector], workspace=tmp_path)
+        ctx = Context(pipeline)
+        collector.on_init(ctx)
+        collector.input_store["results"].append((2, ["r2"]))
+        collector.publish(ctx)
+
+        archive = pipeline.archive(collector.signature())
+        assert list(archive.keys()) == []
+        assert collector.get_pending_count() == 1
+        pipeline.close_archives()
+
+        replay = LoadBalancerCollector(
+            provides="output",
+            requires=["results"],
+            persist=True,
+        )
+        replay_pipeline = Pipeline([replay], workspace=tmp_path)
+        replay_ctx = Context(replay_pipeline)
+        replay.on_init(replay_ctx)
+        assert replay.next_expected == 0
+
+        for item in [(0, ["r0"]), (1, ["r1"]), (2, ["r2"])]:
+            replay.input_store["results"].append(item)
+            replay.publish(replay_ctx)
+
+        assert [event.artifact for event in replay_ctx.events] == ["r0", "r1", "r2"]
+        replay_pipeline.close_archives()
 
 
 class TestParallelizeIntegration:
@@ -918,6 +993,55 @@ class TestParallelizeConstructorSupport:
         workers = [worker for worker in components if isinstance(worker, MixedArgsWorker)]
         assert workers[0].required == "my_value"
         assert workers[0].optional == 20
+
+    def test_parallelize_can_refresh_constructor_derived_state_after_rewire(self):
+        class DerivedStateWorker(ReactiveBuilder):
+            def __init__(self, **kwargs):
+                super().__init__(
+                    provides="unused", requires=[], persist=False, **kwargs
+                )
+                self.arity = len(self.requires)
+
+            def on_parallelize_rewire(self):
+                self.arity = len(self.requires)
+
+            def build(self, context, item):
+                yield (self.arity, item)
+
+        components = parallelize(
+            provides="output",
+            requires=["input"],
+            worker_builder=DerivedStateWorker,
+            num_workers=1,
+        )
+
+        worker = [
+            component for component in components if isinstance(component, DerivedStateWorker)
+        ][0]
+
+        assert worker.arity == 1
+        assert list(worker.build(None, "x")) == [(1, "x")]
+
+    def test_parallelize_fails_loudly_when_fallback_worker_reads_wiring_without_hook(
+        self,
+    ):
+        class DerivedStateWorker(ReactiveBuilder):
+            def __init__(self, **kwargs):
+                super().__init__(
+                    provides="unused", requires=[], persist=False, **kwargs
+                )
+                self.arity = len(self.requires)
+
+            def build(self, context, item):
+                yield (self.arity, item)
+
+        with pytest.raises(RuntimeError, match="on_parallelize_rewire"):
+            parallelize(
+                provides="output",
+                requires=["input"],
+                worker_builder=DerivedStateWorker,
+                num_workers=1,
+            )
 
 
 class TestParallelizeBehavior:

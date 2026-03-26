@@ -193,6 +193,10 @@ class ReactiveBuilder(AbstractProcessor):
         """
         self.get_cache(context).flush_wal(sync=True)
 
+    def on_parallelize_rewire(self):
+        """Hook invoked after ``parallelize`` rewires a worker instance in place."""
+        pass
+
     def get_cache(self, context: Context):
         """Return a persistence-aware archive keyed by processor signature."""
         if self.persist:
@@ -605,7 +609,7 @@ class LoadBalancerCollector(ReactiveBuilder):
             self.next_expected = _next_persisted_sequence(self.get_cache(context))
 
     def publish(self, context: Context):
-        _publish_sequence_stage(self, context)
+        _publish_sequence_stage(self, context, archive_empty=False)
 
     def build(self, context: Context, item: Tuple[int, List[Any]]):
         seq, results = item
@@ -734,10 +738,11 @@ def parallelize(
 
     requires_list = list(requires)
     requires_tag = "+".join(requires_list)
+    topology_tag = f"workers={num_workers}::fifo={int(preserve_fifo)}"
     base = (
-        name
+        f"{name}::{topology_tag}"
         if name is not None
-        else f"parallelize::{provides}::{worker_builder.__name__}::{requires_tag}"
+        else f"parallelize::{provides}::{worker_builder.__name__}::{requires_tag}::{topology_tag}"
     )
 
     sequenced = f"{base}::sequenced"
@@ -823,7 +828,11 @@ def _parallel_worker_publish(self: ReactiveBuilder, context: Context):
         tasks.popleft()
 
 
-def _publish_sequence_stage(stage: ReactiveBuilder, context: Context):
+def _publish_sequence_stage(
+    stage: ReactiveBuilder,
+    context: Context,
+    archive_empty: bool = True,
+):
     """Publish sequence-tagged `(seq, payload)` items using `seq` as the cache key."""
     items = stage.input_store[stage.requires[0]]
     archive = stage.get_cache(context)
@@ -839,7 +848,8 @@ def _publish_sequence_stage(stage: ReactiveBuilder, context: Context):
                 context.submit(
                     ReactiveEvent(name="built", target=stage.provides, artifact=artifact)
                 )
-            archive[seq] = collected
+            if collected or archive_empty:
+                archive[seq] = collected
         items.popleft()
 
 
@@ -856,6 +866,7 @@ def _instantiate_parallel_worker(
     """Create a real ReactiveBuilder instance wired to an internal task topic."""
 
     init_kwargs = dict(worker_init_kwargs)
+    used_fallback = False
     attempts = (
         dict(
             init_kwargs,
@@ -875,9 +886,10 @@ def _instantiate_parallel_worker(
 
     worker: Optional[ReactiveBuilder] = None
     last_error: Optional[TypeError] = None
-    for init_kwargs_candidate in attempts:
+    for attempt_index, init_kwargs_candidate in enumerate(attempts):
         try:
             worker = worker_class(*worker_init_args, **init_kwargs_candidate)
+            used_fallback = attempt_index > 0
             break
         except TypeError as exc:
             last_error = exc
@@ -896,6 +908,18 @@ def _instantiate_parallel_worker(
         name=worker_name,
         priority=priority,
     )
+    worker.on_parallelize_rewire()
+    if (
+        used_fallback
+        and not _has_parallelize_rewire_hook(worker_class)
+        and _constructor_reads_reactive_wiring(worker_class)
+    ):
+        raise RuntimeError(
+            f"{worker_class.__name__} cannot be safely parallelized after constructor "
+            "fallback because its __init__ reads reactive wiring fields. Either accept "
+            "the final provides/requires kwargs directly or implement "
+            "on_parallelize_rewire() to refresh any derived state."
+        )
     worker.publish = types.MethodType(_parallel_worker_publish, worker)
     return worker
 
@@ -944,6 +968,36 @@ def _looks_like_reactive_wiring_error(exc: TypeError) -> bool:
     return any(keyword in message for keyword in reserved) and any(
         marker in message for marker in markers
     )
+
+
+def _constructor_reads_reactive_wiring(worker_class: Type[ReactiveBuilder]) -> bool:
+    """Return True when ``__init__`` references wiring-dependent builder fields."""
+
+    init = worker_class.__init__
+    if init is ReactiveBuilder.__init__:
+        return False
+
+    code = getattr(init, "__code__", None)
+    if code is None:
+        return False
+
+    reactive_wiring_names = {
+        "provides",
+        "requires",
+        "require_specs",
+        "require_index",
+        "input_store",
+        "persist",
+        "name",
+        "priority",
+    }
+    return not reactive_wiring_names.isdisjoint(code.co_names)
+
+
+def _has_parallelize_rewire_hook(worker_class: Type[ReactiveBuilder]) -> bool:
+    """Return True when the worker class overrides ``on_parallelize_rewire``."""
+
+    return worker_class.on_parallelize_rewire is not ReactiveBuilder.on_parallelize_rewire
 
 
 def _next_persisted_sequence(archive) -> int:

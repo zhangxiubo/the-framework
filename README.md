@@ -159,6 +159,11 @@ Use `parallelize(...)` to fan out work across reactive builders.
 - `preserve_fifo=False`: emits worker outputs immediately.
 - Workers that inherit `ReactiveBuilder.__init__` directly are auto-wired with the
   outer `provides`/`requires` values.
+- Workers that derive state from wiring fields during `__init__` should implement
+  `on_parallelize_rewire()` to refresh that state after fallback rewiring; otherwise
+  `parallelize(...)` raises instead of silently keeping stale values.
+- Generated processor names automatically include `num_workers` and `preserve_fifo`
+  so persisted graphs from different topologies do not share cache namespaces.
 - Sequence gap policies:
   - `WaitForSequenceGaps` (default)
   - `SkipAheadOnBacklog(max_buffered=...)`
@@ -166,7 +171,7 @@ Use `parallelize(...)` to fan out work across reactive builders.
   and optionally reassembled into FIFO order.
 - Cache-key deduplication still happens at the shared sequencing stage, matching a
   single `ReactiveBuilder` instance more closely.
-- Reserved `parallelize(...)` kwargs: `persist`, `name`, and `priority`.
+- Reserved `parallelize(...)` kwargs: `persist`, `name` (namespace prefix), and `priority`.
 
 ## Running tests
 
