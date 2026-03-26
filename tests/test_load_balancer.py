@@ -213,6 +213,22 @@ class TestLoadBalancerSequencerBehavior:
         seq, args = results[0]
         assert args == ("value1", "value2")
 
+    def test_sequencer_on_init_restores_next_seq_from_persisted_archive(self, tmp_path):
+        sequencer = LoadBalancerSequencer(
+            provides="sequenced",
+            requires=["input"],
+            persist=True,
+        )
+
+        pipeline = Pipeline([sequencer], workspace=tmp_path)
+        archive = pipeline.archive(sequencer.signature())
+        archive[0] = [("ignored",)]
+        archive[2] = [("ignored",)]
+
+        run_dispatcher_once(pipeline)
+
+        assert sequencer.next_seq == 3
+
 
 class TestLoadBalancerRouterBehavior:
     """Tests for LoadBalancerRouter."""
@@ -356,6 +372,24 @@ class TestLoadBalancerCollectorBehavior:
         assert list(collector.build(ctx, (7, ["r7"]))) == ["r5", "r6", "r7"]
         assert collector.get_next_expected_seq() == 8
         assert collector.skipped_sequences == 5
+
+    def test_collector_on_init_restores_next_expected_from_persisted_archive(
+        self, tmp_path
+    ):
+        collector = LoadBalancerCollector(
+            provides="output",
+            requires=["results"],
+            persist=True,
+        )
+
+        pipeline = Pipeline([collector], workspace=tmp_path)
+        archive = pipeline.archive(collector.signature())
+        archive[5] = ["r5"]
+        archive[7] = ["r7"]
+
+        run_dispatcher_once(pipeline)
+
+        assert collector.next_expected == 8
 
 
 class TestParallelizeIntegration:

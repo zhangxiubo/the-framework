@@ -548,7 +548,7 @@ class LoadBalancerSequencer(ReactiveBuilder):
 
     def on_init(self, context: Context):
         if self.persist:
-            self.next_seq = len(self.get_cache(context))
+            self.next_seq = _next_persisted_sequence(self.get_cache(context))
 
     def build(self, context: Context, *args):
         seq = self.next_seq
@@ -602,7 +602,7 @@ class LoadBalancerCollector(ReactiveBuilder):
 
     def on_init(self, context: Context):
         if self.persist:
-            self.next_expected = len(self.get_cache(context))
+            self.next_expected = _next_persisted_sequence(self.get_cache(context))
 
     def publish(self, context: Context):
         _publish_sequence_stage(self, context)
@@ -944,3 +944,13 @@ def _looks_like_reactive_wiring_error(exc: TypeError) -> bool:
     return any(keyword in message for keyword in reserved) and any(
         marker in message for marker in markers
     )
+
+
+def _next_persisted_sequence(archive) -> int:
+    """Return the next sequence cursor for archives keyed by integer sequence id."""
+
+    keys = list(archive.keys())
+    int_keys = [key for key in keys if isinstance(key, int)]
+    if int_keys:
+        return max(int_keys) + 1
+    return len(keys)
