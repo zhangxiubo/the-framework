@@ -153,14 +153,20 @@ Use `make_rendezvous(provides, requires, keys)` to join multiple input streams b
 
 ### Load balancing
 
-Use `make_load_balancer(...)` to fan out work across worker builders.
+Use `parallelize(...)` to fan out work across reactive builders.
 
 - `preserve_fifo=True` (default): reassembles worker results in input order via `LoadBalancerCollector`.
 - `preserve_fifo=False`: emits worker outputs immediately.
+- Workers that inherit `ReactiveBuilder.__init__` directly are auto-wired with the
+  outer `provides`/`requires` values.
 - Sequence gap policies:
   - `WaitForSequenceGaps` (default)
   - `SkipAheadOnBacklog(max_buffered=...)`
-- `parallelize(...)` is a backward-compatible alias for `make_load_balancer(...)`.
+- Incoming tasks are sequenced once, distributed round-robin across worker instances,
+  and optionally reassembled into FIFO order.
+- Cache-key deduplication still happens at the shared sequencing stage, matching a
+  single `ReactiveBuilder` instance more closely.
+- Reserved `parallelize(...)` kwargs: `persist`, `name`, and `priority`.
 
 ## Running tests
 

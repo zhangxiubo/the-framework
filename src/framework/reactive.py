@@ -9,6 +9,7 @@ import itertools
 import logging
 import random
 import re
+import types
 from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Hashable, Iterable
 from typing import Any, Collection, List, Optional, Tuple, Type
@@ -539,10 +540,15 @@ class LoadBalancerSequencer(ReactiveBuilder):
         self,
         provides: str,
         requires: Collection[str],
+        persist: bool = False,
         **kwargs,
     ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
+        super().__init__(provides, requires, persist=persist, **kwargs)
         self.next_seq = 0
+
+    def on_init(self, context: Context):
+        if self.persist:
+            self.next_seq = len(self.get_cache(context))
 
     def build(self, context: Context, *args):
         seq = self.next_seq
@@ -564,9 +570,10 @@ class LoadBalancerRouter(ReactiveBuilder):
         requires: Collection[str],
         worker_id: int,
         num_workers: int,
+        persist: bool = False,
         **kwargs,
     ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
+        super().__init__(provides, requires, persist=persist, **kwargs)
         self.worker_id = worker_id
         self.num_workers = num_workers
 
@@ -574,55 +581,6 @@ class LoadBalancerRouter(ReactiveBuilder):
         seq, args = item
         if seq % self.num_workers == self.worker_id:
             yield item
-
-
-class LoadBalancerWorkerWrapper(ReactiveBuilder):
-    """Wraps a worker builder and preserves FIFO ordering metadata.
-
-    Input artifact is `(seq, args)` and output artifact is `(seq, results)` where
-    `results` is a list of artifacts produced by the wrapped worker.
-    """
-
-    def __init__(
-        self,
-        provides: str,
-        requires: Collection[str],
-        worker: ReactiveBuilder,
-        **kwargs,
-    ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
-        self.worker = worker
-
-    def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
-        seq, args = item
-        results = list(self.worker.build(context, *args))
-        yield seq, results
-
-
-class LoadBalancerWorkerEmitter(ReactiveBuilder):
-    """Runs a wrapped worker and emits artifacts immediately.
-
-    This is the low-overhead alternative to the FIFO collector path. It disables
-    any cross-worker reassembly/reordering: artifacts are emitted as soon as the
-    worker produces them.
-
-    Input artifact is `(seq, args)`; the sequence number is only used for routing
-    and is not included in output artifacts.
-    """
-
-    def __init__(
-        self,
-        provides: str,
-        requires: Collection[str],
-        worker: ReactiveBuilder,
-        **kwargs,
-    ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
-        self.worker = worker
-
-    def build(self, context: Context, item: Tuple[int, Tuple[Any, ...]]):
-        seq, args = item
-        yield from self.worker.build(context, *args)
 
 
 class LoadBalancerCollector(ReactiveBuilder):
@@ -633,13 +591,21 @@ class LoadBalancerCollector(ReactiveBuilder):
         provides: str,
         requires: Collection[str],
         gap_policy: Optional["SequenceGapPolicy"] = None,
+        persist: bool = False,
         **kwargs,
     ) -> None:
-        super().__init__(provides, requires, persist=False, **kwargs)
+        super().__init__(provides, requires, persist=persist, **kwargs)
         self.buffer: dict[int, List[Any]] = {}
         self.next_expected = 0
         self.gap_policy = WaitForSequenceGaps() if gap_policy is None else gap_policy
         self.skipped_sequences = 0
+
+    def on_init(self, context: Context):
+        if self.persist:
+            self.next_expected = len(self.get_cache(context))
+
+    def publish(self, context: Context):
+        _publish_sequence_stage(self, context)
 
     def build(self, context: Context, item: Tuple[int, List[Any]]):
         seq, results = item
@@ -669,6 +635,26 @@ class LoadBalancerCollector(ReactiveBuilder):
 
     def get_next_expected_seq(self) -> int:
         return self.next_expected
+
+
+class ParallelResultEmitter(ReactiveBuilder):
+    """Forward worker batches immediately without restoring FIFO order."""
+
+    def __init__(
+        self,
+        provides: str,
+        requires: Collection[str],
+        persist: bool = False,
+        **kwargs,
+    ) -> None:
+        super().__init__(provides, requires, persist=persist, **kwargs)
+
+    def publish(self, context: Context):
+        _publish_sequence_stage(self, context)
+
+    def build(self, context: Context, item: Tuple[int, List[Any]]):
+        _seq, results = item
+        yield from results
 
 
 class SequenceGapPolicy(abc.ABC):
@@ -716,41 +702,55 @@ class SkipAheadOnBacklog(SequenceGapPolicy):
             return next_expected
         return min(buffer)
 
-
-def make_load_balancer(
+def parallelize(
     provides: str,
     requires: Collection[str],
-    worker_class: Type[ReactiveBuilder],
+    worker_builder: Type[ReactiveBuilder],
     num_workers: int,
-    worker_init_args: Tuple[Any, ...] = (),
-    worker_init_kwargs: Optional[dict[str, Any]] = None,
     preserve_fifo: bool = True,
-) -> List[ReactiveBuilder]:
-    """Build a load balancer pipeline.
+    worker_init_args: Tuple[Any, ...] = (),
+    **kwargs,
+) -> Tuple[ReactiveBuilder, ...]:
+    """Create a transparent reactive parallelization graph for a builder class.
 
-    When ``preserve_fifo`` is True (default), results are reassembled into the
-    original input order using a collector stage. When False, artifacts are
-    emitted as soon as workers produce them (no reassembly/reordering).
+    ``parallelize`` fans out unique build tasks across real ``ReactiveBuilder``
+    instances. The outer graph preserves the original builder's dependency
+    matching and cache key semantics at the sequencing stage, optionally
+    reordering worker results back into FIFO output order.
 
-    Returns components in this order:
-      - preserve_fifo=True:  sequencer, (router_i, wrapper_i)*, collector
-      - preserve_fifo=False: sequencer, (router_i, emitter_i)*
+    Reserved keyword arguments:
+      - ``persist`` configures the parallelized graph persistence.
+      - ``name`` controls the external emitter/collector cache namespace.
+      - ``priority`` sets the priority for all generated processors.
+
+    Any remaining keyword arguments are forwarded to the worker constructor.
     """
-
     if num_workers < 1:
         raise ValueError("num_workers must be >= 1")
 
-    worker_init_kwargs = {} if worker_init_kwargs is None else dict(worker_init_kwargs)
+    persist = bool(kwargs.pop("persist", False))
+    name = kwargs.pop("name", None)
+    priority = kwargs.pop("priority", 0)
 
     requires_list = list(requires)
     requires_tag = "+".join(requires_list)
-    base = f"load_balancer::{provides}::{worker_class.__name__}::{requires_tag}"
+    base = (
+        name
+        if name is not None
+        else f"parallelize::{provides}::{worker_builder.__name__}::{requires_tag}"
+    )
 
     sequenced = f"{base}::sequenced"
     results = f"{base}::results"
 
     components: List[ReactiveBuilder] = [
-        LoadBalancerSequencer(provides=sequenced, requires=requires_list),
+        LoadBalancerSequencer(
+            provides=sequenced,
+            requires=requires_list,
+            persist=persist,
+            name=f"{base}::sequencer",
+            priority=priority,
+        ),
     ]
 
     for worker_id in range(num_workers):
@@ -761,58 +761,186 @@ def make_load_balancer(
                 requires=[sequenced],
                 worker_id=worker_id,
                 num_workers=num_workers,
+                persist=persist,
+                name=f"{base}::router_{worker_id}",
+                priority=priority,
             )
         )
-
-        worker_name = f"{base}::_worker_{worker_id}"
-        worker = worker_class(
-            *worker_init_args,
-            name=worker_name,
-            **worker_init_kwargs,
+        components.append(
+            _instantiate_parallel_worker(
+                worker_class=worker_builder,
+                worker_name=f"{base}::_worker_{worker_id}",
+                task_topic=routed,
+                results_topic=results,
+                persist=persist,
+                priority=priority,
+                worker_init_args=worker_init_args,
+                worker_init_kwargs=kwargs,
+            )
         )
-        if preserve_fifo:
-            components.append(
-                LoadBalancerWorkerWrapper(
-                    provides=results,
-                    requires=[routed],
-                    worker=worker,
-                )
-            )
-        else:
-            components.append(
-                LoadBalancerWorkerEmitter(
-                    provides=provides,
-                    requires=[routed],
-                    worker=worker,
-                )
-            )
 
     if preserve_fifo:
-        components.append(LoadBalancerCollector(provides=provides, requires=[results]))
-    return components
+        components.append(
+            LoadBalancerCollector(
+                provides=provides,
+                requires=[results],
+                persist=persist,
+                name=base,
+                priority=priority,
+            )
+        )
+    else:
+        components.append(
+            ParallelResultEmitter(
+                provides=provides,
+                requires=[results],
+                persist=persist,
+                name=base,
+                priority=priority,
+            )
+        )
+
+    return tuple(components)
 
 
-def parallelize(
+def _parallel_worker_publish(self: ReactiveBuilder, context: Context):
+    """Publish one sequence-tagged result batch per routed task."""
+    tasks = self.input_store[self.requires[0]]
+    archive = self.get_cache(context)
+
+    while tasks:
+        seq, args = tasks[0]
+        if seq not in archive:
+            with timeit(self.build.__qualname__, logger=logger):
+                artifacts = self.build(context, *args)
+                assert isinstance(artifacts, Iterable)
+                collected = list(artifacts)
+            payload = (seq, collected)
+            context.submit(
+                ReactiveEvent(name="built", target=self.provides, artifact=payload)
+            )
+            archive[seq] = [payload]
+        tasks.popleft()
+
+
+def _publish_sequence_stage(stage: ReactiveBuilder, context: Context):
+    """Publish sequence-tagged `(seq, payload)` items using `seq` as the cache key."""
+    items = stage.input_store[stage.requires[0]]
+    archive = stage.get_cache(context)
+
+    while items:
+        seq, _payload = items[0]
+        if seq not in archive:
+            with timeit(stage.build.__qualname__, logger=logger):
+                artifacts = stage.build(context, items[0])
+                assert isinstance(artifacts, Iterable)
+                collected = list(artifacts)
+            for artifact in collected:
+                context.submit(
+                    ReactiveEvent(name="built", target=stage.provides, artifact=artifact)
+                )
+            archive[seq] = collected
+        items.popleft()
+
+
+def _instantiate_parallel_worker(
+    worker_class: Type[ReactiveBuilder],
+    worker_name: str,
+    task_topic: str,
+    results_topic: str,
+    persist: bool,
+    priority: int,
+    worker_init_args: Tuple[Any, ...],
+    worker_init_kwargs: dict[str, Any],
+) -> ReactiveBuilder:
+    """Create a real ReactiveBuilder instance wired to an internal task topic."""
+
+    init_kwargs = dict(worker_init_kwargs)
+    attempts = (
+        dict(
+            init_kwargs,
+            provides=results_topic,
+            requires=[task_topic],
+            persist=persist,
+            name=worker_name,
+            priority=priority,
+        ),
+        dict(
+            init_kwargs,
+            name=worker_name,
+            priority=priority,
+        ),
+        init_kwargs,
+    )
+
+    worker: Optional[ReactiveBuilder] = None
+    last_error: Optional[TypeError] = None
+    for init_kwargs_candidate in attempts:
+        try:
+            worker = worker_class(*worker_init_args, **init_kwargs_candidate)
+            break
+        except TypeError as exc:
+            last_error = exc
+            if not _looks_like_reactive_wiring_error(exc):
+                raise
+
+    if worker is None:
+        assert last_error is not None
+        raise last_error
+
+    _rewire_reactive_builder(
+        worker,
+        provides=results_topic,
+        requires=[task_topic],
+        persist=persist,
+        name=worker_name,
+        priority=priority,
+    )
+    worker.publish = types.MethodType(_parallel_worker_publish, worker)
+    return worker
+
+
+def _rewire_reactive_builder(
+    worker: ReactiveBuilder,
     provides: str,
     requires: Collection[str],
-    worker_builder: Type[ReactiveBuilder],
-    num_workers: int,
-    preserve_fifo: bool = True,
-    worker_init_args: Tuple[Any, ...] = (),
-    **kwargs,
-) -> Tuple[ReactiveBuilder, ...]:
-    """Backward-compatible alias for make_load_balancer.
+    persist: bool,
+    name: str,
+    priority: int,
+) -> None:
+    """Rebind a worker instance to the internal topics used by ``parallelize``."""
 
-    Set ``preserve_fifo=False`` to disable output reassembly/reordering.
-    Use ``worker_init_args`` for workers requiring positional constructor args.
-    """
-    components = make_load_balancer(
-        provides=provides,
-        requires=requires,
-        worker_class=worker_builder,
-        num_workers=num_workers,
-        worker_init_args=worker_init_args,
-        worker_init_kwargs=kwargs,
-        preserve_fifo=preserve_fifo,
+    require_specs = []
+    normalized = OrderedDict()
+    for requirement in requires:
+        expand = requirement.startswith("*")
+        topic = re.sub(r"^\*", "", requirement)
+        require_specs.append((topic, expand))
+        normalized.setdefault(topic, None)
+
+    worker.provides = provides
+    worker.require_specs = require_specs
+    worker.requires = list(normalized.keys())
+    worker.require_index = {topic: idx for idx, topic in enumerate(worker.requires)}
+    worker.input_store = defaultdict(deque)
+    worker.persist = persist
+    worker.name = name
+    worker.priority = priority
+
+
+def _looks_like_reactive_wiring_error(exc: TypeError) -> bool:
+    """Return True when a constructor TypeError only reflects topic wiring kwargs."""
+
+    message = str(exc)
+    reserved = ("provides", "requires", "persist", "name", "priority")
+    markers = (
+        "unexpected keyword",
+        "unexpected positional",
+        "multiple values",
+        "missing",
+        "required positional argument",
+        "keyword argument",
     )
-    return tuple(components)
+    return any(keyword in message for keyword in reserved) and any(
+        marker in message for marker in markers
+    )
