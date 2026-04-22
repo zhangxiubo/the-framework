@@ -18,6 +18,7 @@ from __future__ import annotations
 import abc
 import functools
 import hashlib
+import itertools
 import logging
 import threading
 import time
@@ -34,6 +35,7 @@ from rocksdict.rocksdict import AccessType
 
 # Re-export selected helpers so callers can import from framework.core directly.
 from .utils import (
+    InterestInferenceError,
     caching,
     class_identifier,
     event_digest,
@@ -41,6 +43,7 @@ from .utils import (
     get_source,
     in_jupyter_notebook,
     infer_interests,
+    normalized_source_digest,
     parse_pattern,
     retry,
     timeit,
@@ -57,6 +60,7 @@ __all__ = [
     "Event",
     "Inbox",
     "InMemCache",
+    "InterestInferenceError",
     "Pipeline",
     "ProcessEntry",
     "caching",
@@ -162,16 +166,18 @@ class Context:
             raise RuntimeError("late/unsafe context.submit: cross-thread submissions are forbidden")
 
     def submit(self, event: Event) -> int:
-        """Submit a downstream event and track it for replay/caching."""
+        """Submit a downstream event and track it for replay/caching.
+
+        Worker-originated submissions are internal for phase accounting
+        (they cascade from pipeline-driven work); only direct external
+        ``Pipeline.submit`` calls from user threads count as external.
+        """
         try:
             self.ensure_submission_is_safe()
-            # Return recipient count from pipeline routing.
-            recipients = self.pipeline.submit(event)
-            # Preserve only accepted emission order for replay/caching.
+            recipients = self.pipeline.submit(event, _internal=True)
             self.events.append(event)
             return recipients
         except Exception:
-            # Keep contextual logging close to producer call site.
             logger.exception("failed to submit event %s", event)
             raise
 
@@ -192,14 +198,12 @@ class Context:
         - Wake dispatcher wait loop via `signal`.
         """
         try:
-            # Extract underlying exception from completed future, if any.
             exc = future.exception()
-            # Ignore shutdown noise from executor teardown path.
-            shutdown_error = isinstance(exc, RuntimeError) and (
-                str(exc) == "cannot schedule new futures after shutdown"
+            # Suppress post-shutdown "cannot schedule new futures" noise; the
+            # pipeline knows authoritatively whether its executor is gone.
+            shutdown_error = (
+                isinstance(exc, RuntimeError) and self.pipeline.is_executor_shut_down()
             )
-            # #concern: String-matching exception text is brittle across Python
-            # versions/executor implementations.
             if exc is not None and not shutdown_error:
                 logger.error(
                     "processor failed: %s on event %s, name: %s",
@@ -228,22 +232,27 @@ class Context:
                 signal.set()
 
 
+# Tie-breaker for ProcessEntry so equal-priority entries dispatch FIFO.
+# (heapq is not stable for equal keys.)
+_PROCESS_ENTRY_SEQ = itertools.count()
+
+
 @dataclass(order=True, frozen=True)
 class ProcessEntry:
-    """Unit stored in ready queue.
+    """Ready-queue entry. Lower ``priority`` dispatches first; ``seq`` breaks ties FIFO."""
 
-    Ordering uses `priority` only. `processor` is excluded from comparisons.
-    """
-
-    # Lower value sorts first in PriorityQueue.
-    # #concern: This is easy to misread as "higher number = higher priority".
-    priority: int
-    # Processor to dispatch when this entry is popped.
-    processor: "AbstractProcessor" = field(compare=False)
+    priority: float
+    seq: int
+    processor: Optional["AbstractProcessor"] = field(compare=False)
 
 
-# Sentinel entry used to unblock the dispatcher and signal shutdown.
-_STOP_SENTINEL = ProcessEntry(priority=0, processor=None)  # type: ignore[arg-type]
+def _make_process_entry(priority: int, processor: "AbstractProcessor") -> ProcessEntry:
+    return ProcessEntry(priority, next(_PROCESS_ENTRY_SEQ), processor)
+
+
+# Sentinel entry used to unblock the dispatcher; priority=-inf so fatal-path
+# STOPs preempt any queued work.
+_STOP_SENTINEL = ProcessEntry(priority=float("-inf"), seq=-1, processor=None)
 
 
 class Inbox:
@@ -258,24 +267,18 @@ class Inbox:
         processor: "AbstractProcessor",
         ready_queue: PriorityQueue[ProcessEntry],
     ) -> None:
-        # Owning processor for this mailbox.
         self.processor = processor
-        # Shared global ready queue where runnable processors are enqueued.
         self.ready_queue = ready_queue
-        # FIFO of inbound events for this processor.
         self.events: SimpleQueue[Event] = SimpleQueue()
-        # Number of queued-but-not-yet-taken events.
+        # `pending` is manually synced with `events` queue depth because
+        # SimpleQueue.qsize is unreliable for this purpose.
         self.pending = 0
-        # Whether processor currently has an active or reserved task.
         self.active = False
-        # Re-entrant lock guarding `pending`/`active` consistency.
         self.lock = threading.RLock()
-        # #concern: `SimpleQueue` length is not introspectable, so `pending`
-        # must remain perfectly synchronized manually.
 
     def signal_ready(self) -> None:
         """Publish a runnable processor entry to the global ready queue."""
-        self.ready_queue.put(ProcessEntry(self.processor.priority, self.processor))
+        self.ready_queue.put(_make_process_entry(self.processor.priority, self.processor))
 
     def put_event(self, event: Event) -> None:
         """Push one event into mailbox and schedule processor if currently idle."""
@@ -323,6 +326,11 @@ class Inbox:
         if should_signal:
             self.signal_ready()
 
+    # `reset_active` is a dispatch-failure-path alias for `mark_task_done`;
+    # the state transition is identical whether a task completed normally or
+    # failed to start because the event couldn't be taken.
+    reset_active = mark_task_done
+
 
 class Pipeline:
     """Global orchestrator that routes events and drives processor execution."""
@@ -334,57 +342,56 @@ class Pipeline:
         workspace: Optional[str | Path] = None,
         max_workers: Optional[int] = None,
         config: Optional[dict[str, Any]] = None,
+        archive_options: Optional[dict[str, Any]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        # Supported keys: ``wal_sync`` (bool, default True). Sync WAL writes
+        # are durable but slower; set False for throughput at the cost of a
+        # post-crash loss window.
+        self.archive_options: dict[str, Any] = (
+            {} if archive_options is None else dict(archive_options)
+        )
+        self.archive_options.setdefault("wal_sync", True)
 
-        # Total scheduled processor executions since pipeline start.
         self.jobs = 0
-        # Total completed processor executions since pipeline start.
         self.done = 0
-        # Condition variable coordinating `wait()` and accounting updates.
+        # `internal_jobs` excludes external `Pipeline.submit(...)` calls so
+        # `run_phases` can distinguish work caused by a phase from concurrent
+        # user-thread submissions.
+        self.internal_jobs = 0
         self.cond = threading.Condition()
 
-        # Ready processors ordered by priority.
         self.rdyq: PriorityQueue[ProcessEntry] = PriorityQueue()
-
-        # Lock protecting lazy inbox map creation.
         self.inbox_lock = threading.Lock()
-        # Lock protecting archive cache map.
         self.archive_lock = threading.Lock()
-        # Processor -> Inbox singleton map.
         self.inboxes: dict[AbstractProcessor, Inbox] = {}
-        # (suffix, readonly) -> archive handle cache.
         self.archives_by_key: dict[tuple[Optional[str], bool], Any] = {}
-        # Terminal internal failure captured by dispatcher/runtime paths.
         self.fatal_error: Optional[BaseException] = None
-        # False once runtime begins shutdown/fatal termination.
         self.accepting_submissions = True
+        self._executor_shut_down = False
+        # Once set, `decrement()` becomes a no-op: fatal/abort paths have
+        # force-balanced `done`/`jobs` and further increments would drift.
+        self._accounting_poisoned = False
 
-        # Controls whether generic interest fallback is allowed.
         self.strict_interest_inference = strict_interest_inference
-        # Thread pool size for concurrent processor execution.
         if max_workers is None:
             self.max_workers = max(1, len(processors))
         else:
             if max_workers < 1:
                 raise ValueError("max_workers must be >= 1")
             self.max_workers = max_workers
-        # Opaque runtime config for user processors.
         self.config = {} if config is None else config.copy()
 
-        # Interest index:
         # (event_class_name | None, event_name | None) -> processor set
         self.processors: defaultdict[tuple[Optional[str], Optional[str]], set[Any]] = defaultdict(set)
         for processor in processors:
             self.register_processor(processor)
 
-        # Optional workspace for persistent archive storage.
         self.workspace = None if workspace is None else Path(workspace)
         if self.workspace is not None:
             self.workspace.mkdir(parents=True, exist_ok=True)
 
-        # Bootstrap lifecycle so processors can initialize internal state.
         self.submit(Event(name="__INIT__"), _internal=True)
 
     def get_inbox(self, processor: "AbstractProcessor") -> Inbox:
@@ -397,8 +404,18 @@ class Pipeline:
             return inbox
 
     def register_processor(self, processor: "AbstractProcessor") -> None:
-        """Register processor under each inferred interest key."""
-        for interest in processor.interests:
+        """Register processor under each inferred interest key.
+
+        In strict mode, re-infer with ``strict=True`` so ambiguous/unrecognized
+        match patterns raise at registration time. We can't rely on
+        ``processor.interests`` here because the processor was constructed
+        before it knew which pipeline it would join.
+        """
+        if self.strict_interest_inference:
+            interests = frozenset(infer_interests(processor.process, strict=True))
+        else:
+            interests = processor.interests
+        for interest in interests:
             logger.debug("registering interest for %s: %s", processor, interest)
             self.processors[interest].add(processor)
 
@@ -431,6 +448,7 @@ class Pipeline:
             if dispatcher.is_alive():
                 self.set_fatal_error(RuntimeError("dispatcher thread did not terminate within timeout"))
             executor.shutdown(wait=True, cancel_futures=True)
+            self._executor_shut_down = True
             self.close_archives()
             self.raise_if_failed()
             logger.info("pipeline run completed")
@@ -460,8 +478,7 @@ class Pipeline:
                 time.perf_counter() - started,
             )
 
-            # Snapshot cumulative jobs once queue is quiescent.
-            baseline_jobs = self.jobs_snapshot()
+            baseline_internal = self.internal_jobs_snapshot()
 
             # Advance and broadcast next phase marker, then drain to quiescence.
             phase += 1
@@ -475,18 +492,14 @@ class Pipeline:
             if phase_recipients == 0:
                 break
 
-            jobs_after_phase = self.jobs_snapshot()
-            phase_only_jobs = baseline_jobs + phase_recipients
-            if jobs_after_phase < phase_only_jobs:
-                # Deterministic fail-fast on accounting corruption.
-                err = RuntimeError(
-                    "job accounting drift detected: jobs_after_phase < baseline + phase_recipients"
-                )
-                self.set_fatal_error(err)
+            internal_after_phase = self.internal_jobs_snapshot()
+            phase_only_internal = baseline_internal + phase_recipients
+            if internal_after_phase < phase_only_internal:
+                self.set_fatal_error(RuntimeError(
+                    "job accounting drift detected: internal_after_phase < baseline + phase_recipients"
+                ))
                 self.raise_if_failed()
-
-            # Continue only if phase processing produced additional work.
-            if jobs_after_phase == phase_only_jobs:
+            if internal_after_phase == phase_only_internal:
                 break
 
         # Final drain before poison-pill shutdown event.
@@ -504,10 +517,19 @@ class Pipeline:
         self.wait()
         logger.info("dispatcher terminated")
 
+    def is_executor_shut_down(self) -> bool:
+        """Whether the worker pool has been torn down by ``run()``."""
+        return self._executor_shut_down
+
     def jobs_snapshot(self) -> int:
         """Read cumulative scheduled-job counter under lock."""
         with self.cond:
             return self.jobs
+
+    def internal_jobs_snapshot(self) -> int:
+        """Read cumulative internal-only scheduled-job counter under lock."""
+        with self.cond:
+            return self.internal_jobs
 
     def set_fatal_error(self, exc: BaseException) -> None:
         """Record terminal runtime failure and wake all blocked loops/waiters."""
@@ -515,6 +537,7 @@ class Pipeline:
             if self.fatal_error is None:
                 self.fatal_error = exc
             self.accepting_submissions = False
+            self._accounting_poisoned = True
             # Force waiters to unblock immediately.
             self.done = self.jobs
             self.cond.notify_all()
@@ -532,6 +555,7 @@ class Pipeline:
         """Force all waiters to unblock by setting done == jobs."""
         with self.cond:
             self.accepting_submissions = False
+            self._accounting_poisoned = True
             self.done = self.jobs
             self.cond.notify_all()
 
@@ -580,8 +604,9 @@ class Pipeline:
         with self.cond:
             if not _internal and not self.accepting_submissions:
                 raise RuntimeError("pipeline is not accepting external submissions")
-            # Reserve one completion slot per recipient task.
             self.jobs += len(recipients)
+            if _internal:
+                self.internal_jobs += len(recipients)
         for processor in recipients:
             self.get_inbox(processor).put_event(event)
 
@@ -617,6 +642,12 @@ class Pipeline:
             event = inbox.take_event()
         except Exception as exc:
             logger.exception("failed to take event for %s", processor)
+            # Release the active flag so the inbox isn't wedged if the
+            # pipeline is somehow resumed after a fatal error.
+            try:
+                inbox.reset_active()
+            except Exception:
+                logger.exception("failed to reset inbox active flag for %s", processor)
             self.set_fatal_error(exc)
             return
 
@@ -650,8 +681,15 @@ class Pipeline:
             self.jobs += by
 
     def decrement(self) -> None:
-        """Increase completed-job counter and notify waiters when balanced."""
+        """Increase completed-job counter and notify waiters when balanced.
+
+        No-ops once accounting has been poisoned by fatal/abort paths — the
+        counters have already been force-balanced, so further increments would
+        only drift ``done`` above ``jobs``.
+        """
         with self.cond:
+            if self._accounting_poisoned:
+                return
             self.done += 1
             if self.done >= self.jobs:
                 self.cond.notify_all()
@@ -718,11 +756,9 @@ class Pipeline:
         archive.set_dumps(dill.dumps)
         archive.set_loads(dill.loads)
 
-        # Force WAL sync for durability.
         write_options = WriteOptions()
-        write_options.sync = True
+        write_options.sync = bool(self.archive_options.get("wal_sync", True))
         archive.set_write_options(write_opt=write_options)
-        # #concern: Synchronous WAL writes can reduce throughput significantly.
         return archive
 
 
@@ -730,11 +766,11 @@ class AbstractProcessor(abc.ABC):
     """Base class for all pipeline processors."""
 
     def __init__(self, name: Optional[str] = None, priority: int = 0) -> None:
-        # Static-ish routing interests inferred from processor `match` AST.
+        # Routing interests inferred from `match` in `process`. The pipeline
+        # re-infers in strict mode if configured, since the processor is
+        # typically constructed before it knows which pipeline it joins.
         self.interests = frozenset(infer_interests(self.process))
-        # Human-readable instance name; defaults to class name.
         self.name = self.__class__.__name__ if name is None else name
-        # Scheduler priority (lower value dispatches first).
         self.priority = priority
 
     @abc.abstractmethod
@@ -745,24 +781,26 @@ class AbstractProcessor(abc.ABC):
         """
         raise NotImplementedError
 
+    #: Override on a subclass to opt out of source-text-based signatures.
+    #: When set, :meth:`signature` uses this instead of hashing class source —
+    #: useful when source is unstable (REPL/Jupyter) or you want explicit
+    #: control.
+    version: Optional[str] = None
+
     @functools.cache
     def signature(self) -> str:
-        """Stable-ish processor identity string used for cache namespacing."""
-        try:
-            source = get_source(self.__class__)
-        except (OSError, TypeError, IOError):
-            source = f"{self.__class__.__module__}.{self.__class__.__qualname__}"
-            logger.warning(
-                "source unavailable for %s; falling back to module-qualified signature",
-                self,
-            )
-        return str(
-            Path(
-                # Include logical name first for readability in storage paths.
-                self.name,
-                # Include source hash so cache namespace changes with code edits.
-                hashlib.sha256(source.encode()).hexdigest(),
-            )
-        )
-        # #concern: Source-based hashing can be unstable in interactive/runtime-
-        # generated classes and may vary across packaging/import contexts.
+        """Stable processor identity string used for cache namespacing."""
+        cls = self.__class__
+        if cls.version is not None:
+            digest_input = f"version:{cls.__module__}.{cls.__qualname__}:{cls.version}"
+            digest = hashlib.sha256(digest_input.encode()).hexdigest()
+        else:
+            digest = normalized_source_digest(cls)
+            if digest is None:
+                logger.warning(
+                    "source unavailable for %s; falling back to module-qualified signature",
+                    self,
+                )
+                digest_input = f"qualname:{cls.__module__}.{cls.__qualname__}"
+                digest = hashlib.sha256(digest_input.encode()).hexdigest()
+        return str(Path(self.name, digest))
