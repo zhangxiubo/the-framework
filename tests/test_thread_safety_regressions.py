@@ -231,6 +231,67 @@ def test_context_submit_from_worker_chains_downstream_work():
     assert seen == [6]
 
 
+def test_context_submit_rejected_after_fatal_error_does_not_enqueue_downstream():
+    started = threading.Event()
+    allow_finish = threading.Event()
+    finished = threading.Event()
+
+    class Producer(AbstractProcessor):
+        def __init__(self):
+            super().__init__()
+            self.error = None
+            self.recorded = None
+
+        def process(self, context, event):
+            match event:
+                case Event(name="GO"):
+                    started.set()
+                    assert allow_finish.wait(timeout=1)
+                    try:
+                        context.submit(Event(name="DOWNSTREAM", value=1))
+                    except RuntimeError as exc:
+                        self.error = exc
+                    self.recorded = list(context.events)
+                    finished.set()
+
+    class Sink(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="DOWNSTREAM"):
+                    raise AssertionError("downstream event should not have been delivered")
+
+    producer = Producer()
+    sink = Sink()
+    pipe = Pipeline([producer, sink], strict_interest_inference=True, max_workers=2)
+
+    executor = ThreadPoolExecutor(max_workers=2)
+    dispatcher = threading.Thread(
+        target=pipe.execute_events,
+        args=(executor,),
+        daemon=True,
+    )
+    dispatcher.start()
+    try:
+        pipe.submit(Event(name="GO"))
+        assert started.wait(timeout=1)
+
+        pipe.set_fatal_error(RuntimeError("synthetic"))
+        allow_finish.set()
+
+        assert finished.wait(timeout=2)
+        dispatcher.join(timeout=2)
+
+        sink_inbox = pipe.get_inbox(sink)
+        assert isinstance(producer.error, RuntimeError)
+        assert "not accepting submissions" in str(producer.error)
+        assert producer.recorded == []
+        assert sink_inbox.pending == 0
+    finally:
+        pipe.rdyq.put(core._STOP_SENTINEL)
+        dispatcher.join(timeout=2)
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def test_decrement_is_noop_after_fatal_error_poisons_accounting():
     """Once fatal/abort paths force-balance done==jobs, subsequent decrement
     calls (from in-flight futures finishing) must not drift done above jobs.
@@ -324,3 +385,20 @@ def test_external_submit_rejected_during_shutdown_without_hang():
     t.join(timeout=3)
     assert not t.is_alive(), "pipeline run should terminate without hanging"
     assert run_error["exc"] is None
+
+
+def test_external_submit_rejected_after_freeze_even_without_recipients():
+    class Listener(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="PING"):
+                    pass
+
+    pipe = Pipeline([Listener()], strict_interest_inference=True)
+    pipe.freeze_external_submissions()
+
+    with pytest.raises(RuntimeError, match="not accepting external submissions"):
+        pipe.submit(Event(name="NO_MATCH"))
+
+    with pytest.raises(RuntimeError, match="not accepting external submissions"):
+        pipe.submit(Event(name="PING"))

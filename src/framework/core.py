@@ -642,18 +642,19 @@ class Pipeline:
 
         Returns number of matched recipients.
         """
-        recipients = self.recipients_for_event(event)
-        if not recipients:
-            return 0
-
         with self.cond:
+            if self._accounting_poisoned:
+                raise RuntimeError("pipeline is not accepting submissions")
             if not _internal and not self.accepting_submissions:
                 raise RuntimeError("pipeline is not accepting external submissions")
+            recipients = self.recipients_for_event(event)
+            if not recipients:
+                return 0
             self.jobs += len(recipients)
             if _internal:
                 self.internal_jobs += len(recipients)
-        for processor in recipients:
-            self.get_inbox(processor).put_event(event)
+            for processor in recipients:
+                self.get_inbox(processor).put_event(event)
 
         return len(recipients)
 
