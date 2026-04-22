@@ -99,9 +99,50 @@ class InMemCache(UserDict):
     backends uniformly.
     """
 
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self._lock = threading.RLock()
+
+    def __contains__(self, key: object) -> bool:
+        with self._lock:
+            return key in self.data
+
+    def __getitem__(self, key: Any) -> Any:
+        with self._lock:
+            return self.data[key]
+
+    def __setitem__(self, key: Any, item: Any) -> None:
+        with self._lock:
+            self.data[key] = item
+
+    def __iter__(self):
+        with self._lock:
+            return iter(tuple(self.data))
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self.data)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        with self._lock:
+            return self.data.get(key, default)
+
+    def keys(self):
+        with self._lock:
+            return tuple(self.data.keys())
+
+    def values(self):
+        with self._lock:
+            return tuple(self.data.values())
+
+    def items(self):
+        with self._lock:
+            return tuple(self.data.items())
+
     def close(self) -> None:
         # Release in-memory entries explicitly for symmetry with persistent stores.
-        self.clear()
+        with self._lock:
+            self.clear()
 
     def flush_wal(self, *args: Any, **kwargs: Any) -> None:
         # No-op compatibility method for RocksDB API parity.
@@ -110,6 +151,10 @@ class InMemCache(UserDict):
     def flush(self, *args: Any, **kwargs: Any) -> None:
         # No-op compatibility method for RocksDB API parity.
         return None
+
+    def clear(self) -> None:
+        with self._lock:
+            self.data.clear()
 
 
 class Context:

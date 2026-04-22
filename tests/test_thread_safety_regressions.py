@@ -84,6 +84,44 @@ def test_concurrent_first_archive_open_returns_single_handle(monkeypatch):
     assert ("shared", False) in pipe.archives_by_key
 
 
+def test_inmem_archive_iteration_survives_concurrent_mutation():
+    pipe = Pipeline([], strict_interest_inference=True)
+    archive = pipe.archive("shared")
+    archive["a"] = ["A"]
+    archive["b"] = ["B"]
+
+    iteration_started = threading.Event()
+    mutated = threading.Event()
+    seen = []
+    errors = []
+
+    def reader():
+        try:
+            for idx, value in enumerate(archive.values()):
+                seen.append(value)
+                if idx == 0:
+                    iteration_started.set()
+                    assert mutated.wait(timeout=1)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(exc)
+
+    def writer():
+        assert iteration_started.wait(timeout=1)
+        archive["c"] = ["C"]
+        mutated.set()
+
+    t1 = threading.Thread(target=reader)
+    t2 = threading.Thread(target=writer)
+    t1.start()
+    t2.start()
+    t1.join(timeout=2)
+    t2.join(timeout=2)
+
+    assert errors == []
+    assert len(seen) == 2
+    assert archive["c"] == ["C"]
+
+
 def test_run_processes_buffered_events_without_dispatcher():
     seen = []
 
