@@ -6,6 +6,8 @@ from framework.reactive import (
     ReactiveBuilder,
     ReactiveEvent,
     MaxPendingRendezvousKeys,
+    OverwriteDuplicates,
+    RejectDuplicates,
     RendezvousPublisher,
     RendezvousReceiver,
     make_rendezvous,
@@ -607,6 +609,44 @@ class TestRendezvousEdgeCases:
 
         # k1 was already evicted, so a late partner from stream 1 cannot complete it.
         assert list(publisher.build(ctx, (1, ({"id": "k1", "v": "b1"},)))) == []
+
+
+class TestRendezvousDuplicatePolicy:
+    def test_overwrite_duplicates_is_default(self):
+        from framework.core import Context
+
+        publisher = RendezvousPublisher(
+            provides="joined",
+            requires=["internal"],
+            keys=[lambda x: x["k"], lambda x: x["k"]],
+        )
+        assert isinstance(publisher.duplicate_policy, OverwriteDuplicates)
+
+        pipeline = Pipeline([publisher])
+        ctx = Context(pipeline)
+
+        list(publisher.build(ctx, (0, ({"k": "a", "v": 1},))))
+        list(publisher.build(ctx, (0, ({"k": "a", "v": 2},))))
+        results = list(publisher.build(ctx, (1, ({"k": "a", "v": 3},))))
+        assert len(results) == 1
+        assert results[0][0]["v"] == 2  # overwritten
+
+    def test_reject_duplicates_raises(self):
+        from framework.core import Context
+
+        publisher = RendezvousPublisher(
+            provides="joined",
+            requires=["internal"],
+            keys=[lambda x: x["k"], lambda x: x["k"]],
+            duplicate_policy=RejectDuplicates(),
+        )
+
+        pipeline = Pipeline([publisher])
+        ctx = Context(pipeline)
+
+        list(publisher.build(ctx, (0, ({"k": "a", "v": 1},))))
+        with pytest.raises(ValueError, match="duplicate key"):
+            list(publisher.build(ctx, (0, ({"k": "a", "v": 2},))))
 
 
 class TestRendezvousPublisherIndexUnpacking:

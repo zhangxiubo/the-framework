@@ -282,6 +282,48 @@ def test_reactive_persist_true_reply_replays_from_cache(tmp_path):
     assert seen == [20]
 
 
+def test_dedupe_default_true_skips_build_for_repeated_inputs():
+    calls = []
+
+    class Builder(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(provides="Y", requires=["X"], persist=False)
+
+        def build(self, context, x):
+            calls.append(x)
+            yield x
+
+    pipe = Pipeline([Builder()])
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=7))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=7))
+    pipe.submit(ReactiveEvent(name="resolve", target="Y"))
+    run_dispatcher_once(pipe)
+
+    assert calls == [7]
+
+
+def test_dedupe_false_runs_build_every_time():
+    calls = []
+
+    class Builder(ReactiveBuilder):
+        def __init__(self):
+            super().__init__(
+                provides="Y", requires=["X"], persist=False, dedupe=False
+            )
+
+        def build(self, context, x):
+            calls.append(x)
+            yield x
+
+    pipe = Pipeline([Builder()])
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=7))
+    pipe.submit(ReactiveEvent(name="built", target="X", artifact=7))
+    pipe.submit(ReactiveEvent(name="resolve", target="Y"))
+    run_dispatcher_once(pipe)
+
+    assert calls == [7, 7]
+
+
 def test_starred_requires_forward_both_raw_and_expanded_arguments():
     captured = []
 

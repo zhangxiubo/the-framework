@@ -20,18 +20,12 @@ from tests.helpers import run_dispatcher_once
 class SimpleDoubler(ReactiveBuilder):
     """Test worker that doubles its input."""
 
-    def __init__(self, **kwargs):
-        super().__init__(provides="unused", requires=[], persist=False, **kwargs)
-
     def build(self, context, item):
         yield item * 2
 
 
 class MultiOutputWorker(ReactiveBuilder):
     """Test worker that produces multiple outputs per input."""
-
-    def __init__(self, **kwargs):
-        super().__init__(provides="unused", requires=[], persist=False, **kwargs)
 
     def build(self, context, item):
         yield item
@@ -42,7 +36,7 @@ class StatefulCounter(ReactiveBuilder):
     """Test worker that maintains state (counts calls)."""
 
     def __init__(self, **kwargs):
-        super().__init__(provides="unused", requires=[], persist=False, **kwargs)
+        super().__init__(**kwargs)
         self.call_count = 0
 
     def build(self, context, item):
@@ -86,6 +80,15 @@ class TestParallelizeBasic:
                 requires=["input"],
                 worker_builder=SimpleDoubler,
                 num_workers=0,
+            )
+
+    def test_parallelize_rejects_star_requires(self):
+        with pytest.raises(ValueError, match=r"\*-expanded requires"):
+            parallelize(
+                provides="output",
+                requires=["*input"],
+                worker_builder=SimpleDoubler,
+                num_workers=2,
             )
 
     def test_parallelize_workers_are_independent_instances(self):
@@ -192,9 +195,7 @@ class TestParallelizeBasic:
     def test_parallelize_passes_init_kwargs(self):
         class ConfigurableWorker(ReactiveBuilder):
             def __init__(self, multiplier=1, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
+                super().__init__(**kwargs)
                 self.multiplier = multiplier
 
             def build(self, context, item):
@@ -409,6 +410,28 @@ class TestLoadBalancerCollectorBehavior:
         assert collector.get_next_expected_seq() == 8
         assert collector.skipped_sequences == 5
 
+    def test_collector_on_init_returns_zero_for_archive_with_only_non_int_keys(
+        self, tmp_path
+    ):
+        """Regression: when the archive holds only non-int keys (e.g. leftover
+        from a different schema), the cursor should reset to 0 rather than
+        silently skipping ``len(keys)`` sequences."""
+        collector = LoadBalancerCollector(
+            provides="output",
+            requires=["results"],
+            persist=True,
+        )
+
+        pipeline = Pipeline([collector], workspace=tmp_path)
+        archive = pipeline.archive(collector.signature())
+        archive["non-int-key-a"] = ["x"]
+        archive["non-int-key-b"] = ["y"]
+
+        run_dispatcher_once(pipeline)
+
+        assert collector.next_expected == 0
+
+
     def test_collector_on_init_restores_next_expected_from_persisted_archive(
         self, tmp_path
     ):
@@ -537,11 +560,6 @@ class TestParallelizeIntegration:
         results = []
 
         class FilterWorker(ReactiveBuilder):
-            def __init__(self, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
-
             def build(self, context, item):
                 if item % 2 == 0:
                     yield item
@@ -600,11 +618,6 @@ class TestParallelizeIntegration:
                 yield "b2"
 
         class JoiningWorker(ReactiveBuilder):
-            def __init__(self, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
-
             def build(self, context, item_a, item_b):
                 yield f"{item_a}+{item_b}"
 
@@ -630,9 +643,7 @@ class TestParallelizeEdgeCases:
     def test_worker_with_init_args(self):
         class WorkerWithArgs(ReactiveBuilder):
             def __init__(self, prefix, suffix, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
+                super().__init__(**kwargs)
                 self.prefix = prefix
                 self.suffix = suffix
 
@@ -735,11 +746,6 @@ class TestParallelizeExceptionHandling:
 
     def test_worker_exception_propagates(self):
         class FailingWorker(ReactiveBuilder):
-            def __init__(self, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
-
             def build(self, context, item):
                 if item == "fail":
                     raise ValueError("Intentional failure")
@@ -761,9 +767,7 @@ class TestParallelizeExceptionHandling:
     def test_worker_exception_does_not_affect_other_workers(self):
         class SelectiveFailer(ReactiveBuilder):
             def __init__(self, fail_on=None, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
+                super().__init__(**kwargs)
                 self.fail_on = fail_on
 
             def build(self, context, item):
@@ -948,9 +952,7 @@ class TestParallelizeConstructorSupport:
     def test_parallelize_accepts_positional_args(self):
         class WorkerWithRequiredArgs(ReactiveBuilder):
             def __init__(self, prefix, suffix, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
+                super().__init__(**kwargs)
                 self.prefix = prefix
                 self.suffix = suffix
 
@@ -972,9 +974,7 @@ class TestParallelizeConstructorSupport:
     def test_parallelize_mixed_positional_and_keyword_args(self):
         class MixedArgsWorker(ReactiveBuilder):
             def __init__(self, required_arg, optional=10, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
+                super().__init__(**kwargs)
                 self.required = required_arg
                 self.optional = optional
 
@@ -994,15 +994,15 @@ class TestParallelizeConstructorSupport:
         assert workers[0].required == "my_value"
         assert workers[0].optional == 20
 
-    def test_parallelize_can_refresh_constructor_derived_state_after_rewire(self):
+    def test_parallelize_constructor_sees_final_wiring(self):
+        """Under the tightened contract, __init__ receives the final wiring
+        kwargs directly — no heuristic fallback, so state derived from
+        ``self.requires`` etc. is correct immediately without needing
+        ``on_parallelize_rewire`` as a safety net."""
+
         class DerivedStateWorker(ReactiveBuilder):
             def __init__(self, **kwargs):
-                super().__init__(
-                    provides="unused", requires=[], persist=False, **kwargs
-                )
-                self.arity = len(self.requires)
-
-            def on_parallelize_rewire(self):
+                super().__init__(**kwargs)
                 self.arity = len(self.requires)
 
             def build(self, context, item):
@@ -1019,27 +1019,29 @@ class TestParallelizeConstructorSupport:
             component for component in components if isinstance(component, DerivedStateWorker)
         ][0]
 
+        # The worker's internal `requires` is one internal task topic.
         assert worker.arity == 1
         assert list(worker.build(None, "x")) == [(1, "x")]
 
-    def test_parallelize_fails_loudly_when_fallback_worker_reads_wiring_without_hook(
-        self,
-    ):
-        class DerivedStateWorker(ReactiveBuilder):
+    def test_parallelize_fails_loudly_when_worker_rejects_wiring_kwargs(self):
+        """Workers that swallow kwargs and hardcode provides/requires violate
+        the contract and must fail at instantiation time with an actionable
+        message pointing the user at the contract."""
+
+        class BadWorker(ReactiveBuilder):
             def __init__(self, **kwargs):
                 super().__init__(
                     provides="unused", requires=[], persist=False, **kwargs
                 )
-                self.arity = len(self.requires)
 
             def build(self, context, item):
-                yield (self.arity, item)
+                yield item
 
-        with pytest.raises(RuntimeError, match="on_parallelize_rewire"):
+        with pytest.raises(TypeError, match="does not accept parallelize wiring"):
             parallelize(
                 provides="output",
                 requires=["input"],
-                worker_builder=DerivedStateWorker,
+                worker_builder=BadWorker,
                 num_workers=1,
             )
 
