@@ -179,14 +179,12 @@ Use `make_rendezvous(provides, requires, keys)` to join multiple input streams b
 
 Use `parallelize(...)` to fan out work across reactive builders.
 
-- `preserve_fifo=True` (default): reassembles worker results in input order via `LoadBalancerCollector`.
-- `preserve_fifo=False`: emits worker outputs immediately.
+- Worker outputs are forwarded by `ParallelResultEmitter` as soon as they're produced — there is **no FIFO reassembly across workers**. Downstream stages must be order-independent.
 - **Worker contract**: worker classes must either inherit `ReactiveBuilder.__init__` unchanged, or accept `**kwargs` and forward `provides`/`requires`/`persist`/`name`/`priority` to `super().__init__`. Workers that hardcode wiring fail fast with a `TypeError` pointing at the contract.
 - Workers whose `__init__` derives state from wiring fields (e.g. `self.arity = len(self.requires)`) see the *final* wiring directly; no post-hoc rewiring. If you have state that depends on wiring and is set outside `__init__`, override `on_parallelize_rewire()`.
 - `*`-prefixed requires are rejected at `parallelize(...)` call time — the sequencing stage does not currently forward expansion metadata.
-- Generated processor names automatically include `num_workers` and `preserve_fifo` so persisted graphs from different topologies do not share cache namespaces.
-- Sequence gap policies: `WaitForSequenceGaps` (default), `SkipAheadOnBacklog(max_buffered=...)`.
-- Incoming tasks are sequenced once, distributed round-robin across worker instances, and optionally reassembled into FIFO order.
+- Generated processor names automatically include `num_workers` so persisted graphs from different topologies do not share cache namespaces.
+- Incoming tasks are sequenced once and distributed round-robin across worker instances. Sequence numbers exist only for routing, dedupe, and persistence — not as a downstream ordering contract.
 - Reserved `parallelize(...)` kwargs: `persist`, `name` (namespace prefix), and `priority`.
 
 ## Running tests

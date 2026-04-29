@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import abc
 import logging
 from collections.abc import Iterable
 from typing import Any, Collection, List, Optional, Tuple, Type
@@ -58,104 +57,14 @@ class LoadBalancerRouter(ReactiveBuilder):
             yield item
 
 
-class SequenceGapPolicy(abc.ABC):
-    """Strategy for handling missing sequences in FIFO collectors."""
-
-    @abc.abstractmethod
-    def resolve_next_expected(
-        self,
-        buffer: dict[int, List[Any]],
-        next_expected: int,
-    ) -> int:
-        """Return the cursor to use before draining ready buffered sequences."""
-        pass
-
-
-class WaitForSequenceGaps(SequenceGapPolicy):
-    """Default gap policy: wait indefinitely for missing sequence numbers."""
-
-    def resolve_next_expected(
-        self,
-        buffer: dict[int, List[Any]],
-        next_expected: int,
-    ) -> int:
-        return next_expected
-
-
-class SkipAheadOnBacklog(SequenceGapPolicy):
-    """Skip missing sequence gaps when buffered backlog reaches ``max_buffered``."""
-
-    def __init__(self, max_buffered: int):
-        if max_buffered < 1:
-            raise ValueError("max_buffered must be >= 1")
-        self.max_buffered = max_buffered
-
-    def resolve_next_expected(
-        self,
-        buffer: dict[int, List[Any]],
-        next_expected: int,
-    ) -> int:
-        if next_expected in buffer or len(buffer) < self.max_buffered:
-            return next_expected
-        return min(buffer, default=next_expected)
-
-
-class LoadBalancerCollector(ReactiveBuilder):
-    """Reorders worker results back into FIFO sequence order."""
-
-    def __init__(
-        self,
-        provides: str,
-        requires: Collection[str],
-        gap_policy: Optional[SequenceGapPolicy] = None,
-        persist: bool = False,
-        **kwargs,
-    ) -> None:
-        super().__init__(provides, requires, persist=persist, **kwargs)
-        self.buffer: dict[int, List[Any]] = {}
-        self.next_expected = 0
-        self.gap_policy = WaitForSequenceGaps() if gap_policy is None else gap_policy
-        self.skipped_sequences = 0
-
-    def on_init(self, context: Context):
-        if self.persist:
-            self.next_expected = _next_persisted_sequence(self.get_cache(context))
-
-    def publish(self, context: Context):
-        _publish_by_sequence(self, context, mode="collector")
-
-    def build(self, context: Context, item: Tuple[int, List[Any]]):
-        seq, results = item
-        self.buffer[seq] = list(results)
-        resolved = self.gap_policy.resolve_next_expected(self.buffer, self.next_expected)
-        if resolved < self.next_expected:
-            raise ValueError(
-                "gap policy returned a next_expected smaller than current cursor"
-            )
-        if resolved > self.next_expected:
-            self.skipped_sequences += resolved - self.next_expected
-            logger.warning(
-                "LoadBalancerCollector skipped %d sequence(s) due to gap policy %s",
-                resolved - self.next_expected,
-                self.gap_policy.__class__.__name__,
-            )
-        self.next_expected = resolved
-
-        while self.next_expected in self.buffer:
-            ready = self.buffer.pop(self.next_expected)
-            self.next_expected += 1
-            for artifact in ready:
-                yield artifact
-
-    def get_pending_count(self) -> int:
-        return len(self.buffer)
-
-    def get_next_expected_seq(self) -> int:
-        return self.next_expected
-
-
 class ParallelResultEmitter(ReactiveBuilder):
-    """Forward worker batches immediately without restoring FIFO order."""
+    """Forward worker batches as soon as they're produced.
+
+    There is no FIFO reassembly: artifacts arrive at downstream stages in
+    whichever order the workers complete. Sequence numbers are still
+    used internally for routing, dedupe, and persistence — they are not
+    exposed as a downstream ordering contract.
+    """
 
     def publish(self, context: Context):
         _publish_by_sequence(self, context, mode="emitter")
@@ -170,15 +79,15 @@ def parallelize(
     requires: Collection[str],
     worker_builder: Type[ReactiveBuilder],
     num_workers: int,
-    preserve_fifo: bool = True,
     worker_init_args: Tuple[Any, ...] = (),
     **kwargs,
 ) -> Tuple[ReactiveBuilder, ...]:
     """Create a reactive parallelization graph for a builder class.
 
-    Fans out build tasks across ``num_workers`` real ``ReactiveBuilder`` instances.
-    The sequencing stage preserves single-instance cache-key semantics;
-    ``preserve_fifo=True`` reassembles worker outputs back into input order.
+    Fans out build tasks across ``num_workers`` real ``ReactiveBuilder``
+    instances. Worker outputs are forwarded immediately via
+    :class:`ParallelResultEmitter` — there is no cross-worker ordering
+    guarantee. Downstream stages MUST be order-independent.
 
     Worker contract (enforced at instantiation):
       * ``worker_builder.__init__`` must accept ``**kwargs`` and forward
@@ -209,7 +118,7 @@ def parallelize(
 
     requires_list = list(requires)
     requires_tag = "+".join(requires_list)
-    topology_tag = f"workers={num_workers}::fifo={int(preserve_fifo)}"
+    topology_tag = f"workers={num_workers}"
     base = (
         f"{name}::{topology_tag}"
         if name is not None
@@ -255,26 +164,15 @@ def parallelize(
             )
         )
 
-    if preserve_fifo:
-        components.append(
-            LoadBalancerCollector(
-                provides=provides,
-                requires=[results],
-                persist=persist,
-                name=base,
-                priority=priority,
-            )
+    components.append(
+        ParallelResultEmitter(
+            provides=provides,
+            requires=[results],
+            persist=persist,
+            name=base,
+            priority=priority,
         )
-    else:
-        components.append(
-            ParallelResultEmitter(
-                provides=provides,
-                requires=[results],
-                persist=persist,
-                name=base,
-                priority=priority,
-            )
-        )
+    )
 
     return tuple(components)
 
@@ -287,16 +185,16 @@ def _publish_by_sequence(
 ):
     """Publish input-store items keyed by their ``seq``.
 
-    Shared implementation for three sequence-tagged publish paths:
+    Shared implementation for two sequence-tagged publish paths:
 
     * ``mode="worker"`` — routed task is ``(seq, args)``; ``build`` receives
       ``*args`` and emits a single ``(seq, collected)`` payload. Skip gate:
       ``self.dedupe``. Archive value: ``[payload]``.
-    * ``mode="collector"`` — incoming ``(seq, payload)`` is passed through
-      ``build`` which yields individual artifacts that are submitted one by
-      one. Buffered-only sequences are persisted regardless of emptiness.
-    * ``mode="emitter"`` — like ``collector`` but only archive sequences that
-      produced at least one artifact.
+    * ``mode="emitter"`` — incoming ``(seq, payload)`` is passed through
+      ``build`` which yields the worker's individual artifacts; each is
+      submitted immediately to ``stage.provides``. Every processed seq
+      is archived (even when the worker emitted nothing) so dedupe stays
+      consistent across replays.
     """
     items = stage.input_store[stage.requires[0]]
     archive = stage.get_cache(context)
@@ -327,11 +225,7 @@ def _publish_by_sequence(
                     context.submit(
                         ReactiveEvent(name="built", target=stage.provides, artifact=artifact)
                     )
-                # emitter archives every processed seq; collector only
-                # persists sequences that actually produced downstream
-                # artifacts (buffer-only seqs stay unpersisted).
-                if collected or mode == "emitter":
-                    archive[seq] = collected
+                archive[seq] = collected
         items.popleft()
 
 

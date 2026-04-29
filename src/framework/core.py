@@ -257,6 +257,11 @@ class Context:
                     event.name,
                     exc_info=(type(exc), exc, exc.__traceback__),
                 )
+                # Promote processor failures to fatal pipeline state so
+                # `raise_if_failed()` re-raises and `Pipeline.run()` exits
+                # non-zero. Without this, processor tracebacks reach the log
+                # but the pipeline still returns cleanly.
+                self.pipeline.set_fatal_error(exc)
         except CancelledError:
             # `future.exception()` may raise if task was cancelled.
             logger.info(

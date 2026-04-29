@@ -522,6 +522,29 @@ def test_pipeline_sets_fatal_error_on_stale_ready_entry():
         pipe.wait()
 
 
+def test_pipeline_run_surfaces_processor_exception():
+    """A processor that raises during process() must cause Pipeline.run()
+    to raise. Otherwise wrappers/CI treat exception-only-in-logs runs as
+    success and silently chain past failures.
+    """
+
+    class Boom(AbstractProcessor):
+        def process(self, context, event):
+            match event:
+                case Event(name="X"):
+                    raise RuntimeError("kaboom")
+
+    pipe = Pipeline([Boom()], strict_interest_inference=True)
+    pipe.submit(Event(name="X"))
+
+    with pytest.raises(RuntimeError, match="internal dispatch error") as excinfo:
+        pipe.run()
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, RuntimeError)
+    assert "kaboom" in str(cause)
+
+
 def test_pipeline_empty_processors_runs_with_default_worker_count():
     pipe = Pipeline([])
 

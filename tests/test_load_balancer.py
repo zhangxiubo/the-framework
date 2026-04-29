@@ -1,17 +1,15 @@
 """Unit tests for parallelize() and its supporting routing primitives."""
 
-import random
 import time
 
 import pytest
 from framework.core import AbstractProcessor, Event, Pipeline
 from framework.reactive import (
-    LoadBalancerCollector,
     LoadBalancerRouter,
     LoadBalancerSequencer,
+    ParallelResultEmitter,
     ReactiveBuilder,
     ReactiveEvent,
-    SkipAheadOnBacklog,
     parallelize,
 )
 from tests.helpers import run_dispatcher_once
@@ -57,7 +55,7 @@ class TestParallelizeBasic:
 
         assert len(components) == 8
         assert isinstance(components[0], LoadBalancerSequencer)
-        assert isinstance(components[-1], LoadBalancerCollector)
+        assert isinstance(components[-1], ParallelResultEmitter)
 
         for i in range(3):
             assert isinstance(components[1 + i * 2], LoadBalancerRouter)
@@ -169,28 +167,11 @@ class TestParallelizeBasic:
             worker_builder=SimpleDoubler,
             num_workers=4,
         )
-        components_fifo = parallelize(
-            provides="output",
-            requires=["input"],
-            worker_builder=SimpleDoubler,
-            num_workers=2,
-            preserve_fifo=True,
-        )
-        components_stream = parallelize(
-            provides="output",
-            requires=["input"],
-            worker_builder=SimpleDoubler,
-            num_workers=2,
-            preserve_fifo=False,
-        )
 
         names_2 = {component.name for component in components_2}
         names_4 = {component.name for component in components_4}
-        names_fifo = {component.name for component in components_fifo}
-        names_stream = {component.name for component in components_stream}
 
         assert names_2.isdisjoint(names_4)
-        assert names_fifo.isdisjoint(names_stream)
 
     def test_parallelize_passes_init_kwargs(self):
         class ConfigurableWorker(ReactiveBuilder):
@@ -315,185 +296,13 @@ class TestLoadBalancerRouterBehavior:
         assert counts == [3, 3, 3]
 
 
-class TestLoadBalancerCollectorBehavior:
-    """Tests for LoadBalancerCollector."""
-
-    def test_collector_emits_in_sequence_order(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        results = []
-        results.extend(list(collector.build(ctx, (2, ["r2"]))))
-        results.extend(list(collector.build(ctx, (0, ["r0"]))))
-        results.extend(list(collector.build(ctx, (1, ["r1"]))))
-
-        assert results == ["r0", "r1", "r2"]
-
-    def test_collector_buffers_until_ready(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        r1 = list(collector.build(ctx, (5, ["r5"])))
-        r2 = list(collector.build(ctx, (3, ["r3"])))
-        r3 = list(collector.build(ctx, (4, ["r4"])))
-
-        assert r1 == []
-        assert r2 == []
-        assert r3 == []
-        assert collector.get_pending_count() == 3
-        assert collector.get_next_expected_seq() == 0
-
-    def test_collector_flushes_consecutive_sequences(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        list(collector.build(ctx, (1, ["r1"])))
-        list(collector.build(ctx, (2, ["r2"])))
-        list(collector.build(ctx, (3, ["r3"])))
-
-        results = list(collector.build(ctx, (0, ["r0"])))
-
-        assert results == ["r0", "r1", "r2", "r3"]
-        assert collector.get_pending_count() == 0
-        assert collector.get_next_expected_seq() == 4
-
-    def test_collector_handles_multiple_results_per_sequence(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        results = list(collector.build(ctx, (0, ["a", "b", "c"])))
-        assert results == ["a", "b", "c"]
-
-    def test_collector_gap_policy_can_skip_missing_sequences(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-            gap_policy=SkipAheadOnBacklog(max_buffered=3),
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        assert list(collector.build(ctx, (5, ["r5"]))) == []
-        assert list(collector.build(ctx, (6, ["r6"]))) == []
-        assert list(collector.build(ctx, (7, ["r7"]))) == ["r5", "r6", "r7"]
-        assert collector.get_next_expected_seq() == 8
-        assert collector.skipped_sequences == 5
-
-    def test_collector_on_init_returns_zero_for_archive_with_only_non_int_keys(
-        self, tmp_path
-    ):
-        """Regression: when the archive holds only non-int keys (e.g. leftover
-        from a different schema), the cursor should reset to 0 rather than
-        silently skipping ``len(keys)`` sequences."""
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-            persist=True,
-        )
-
-        pipeline = Pipeline([collector], workspace=tmp_path)
-        archive = pipeline.archive(collector.signature())
-        archive["non-int-key-a"] = ["x"]
-        archive["non-int-key-b"] = ["y"]
-
-        run_dispatcher_once(pipeline)
-
-        assert collector.next_expected == 0
-
-
-    def test_collector_on_init_restores_next_expected_from_persisted_archive(
-        self, tmp_path
-    ):
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-            persist=True,
-        )
-
-        pipeline = Pipeline([collector], workspace=tmp_path)
-        archive = pipeline.archive(collector.signature())
-        archive[5] = ["r5"]
-        archive[7] = ["r7"]
-
-        run_dispatcher_once(pipeline)
-
-        assert collector.next_expected == 8
-
-    def test_collector_does_not_persist_buffer_only_sequences_before_replay(
-        self, tmp_path
-    ):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-            persist=True,
-        )
-
-        pipeline = Pipeline([collector], workspace=tmp_path)
-        ctx = Context(pipeline)
-        collector.on_init(ctx)
-        collector.input_store["results"].append((2, ["r2"]))
-        collector.publish(ctx)
-
-        archive = pipeline.archive(collector.signature())
-        assert list(archive.keys()) == []
-        assert collector.get_pending_count() == 1
-        pipeline.close_archives()
-
-        replay = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-            persist=True,
-        )
-        replay_pipeline = Pipeline([replay], workspace=tmp_path)
-        replay_ctx = Context(replay_pipeline)
-        replay.on_init(replay_ctx)
-        assert replay.next_expected == 0
-
-        for item in [(0, ["r0"]), (1, ["r1"]), (2, ["r2"])]:
-            replay.input_store["results"].append(item)
-            replay.publish(replay_ctx)
-
-        assert [event.artifact for event in replay_ctx.events] == ["r0", "r1", "r2"]
-        replay_pipeline.close_archives()
-
-
 class TestParallelizeIntegration:
-    """Integration tests for the full parallelized graph."""
+    """Integration tests for the full parallelized graph.
 
-    def test_fifo_order_preserved_with_two_workers(self):
+    Order is not preserved across workers — assertions compare by set or
+    sorted view rather than by sequence."""
+
+    def test_two_worker_pipeline_emits_all_artifacts(self):
         results = []
 
         class Sink(AbstractProcessor):
@@ -522,9 +331,9 @@ class TestParallelizeIntegration:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=3)
 
-        assert results == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18]
+        assert sorted(results) == sorted(i * 2 for i in range(10))
 
-    def test_fifo_order_with_multiple_outputs_per_item(self):
+    def test_multi_output_worker_emits_each_artifact(self):
         results = []
 
         class Sink(AbstractProcessor):
@@ -554,7 +363,7 @@ class TestParallelizeIntegration:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=3)
 
-        assert results == [2, 4, 3, 9, 4, 16]
+        assert sorted(results) == sorted([2, 4, 3, 9, 4, 16])
 
     def test_parallelize_with_empty_worker_output(self):
         results = []
@@ -590,7 +399,7 @@ class TestParallelizeIntegration:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=3)
 
-        assert results == [0, 2, 4]
+        assert sorted(results) == [0, 2, 4]
 
     def test_multiple_requires_topics_joins_inputs(self):
         results = []
@@ -634,7 +443,7 @@ class TestParallelizeIntegration:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=4)
 
-        assert results == ["a1+b1", "a2+b2"]
+        assert sorted(results) == sorted(["a1+b1", "a2+b2"])
 
 
 class TestParallelizeEdgeCases:
@@ -661,25 +470,6 @@ class TestParallelizeEdgeCases:
         workers = [worker for worker in components if isinstance(worker, WorkerWithArgs)]
         assert workers[0].prefix == "<<"
         assert workers[0].suffix == ">>"
-
-    def test_large_sequence_gap(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        r1 = list(collector.build(ctx, (0, ["r0"])))
-        r2 = list(collector.build(ctx, (1000, ["r1000"])))
-
-        assert r1 == ["r0"]
-        assert r2 == []
-        assert collector.get_next_expected_seq() == 1
-        assert 1000 in collector.buffer
 
     def test_sequencer_state_persists_across_calls(self):
         from framework.core import Context
@@ -823,6 +613,7 @@ class TestParallelizeStress:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=5)
 
+        # Single worker means in-order even without a FIFO collector.
         expected = [i * 2 for i in range(num_items)]
         assert results == expected
 
@@ -858,7 +649,7 @@ class TestParallelizeStress:
         run_dispatcher_once(pipe, pulses=10)
 
         expected = [i * 2 for i in range(num_items)]
-        assert results == expected
+        assert sorted(results) == expected
 
     def test_many_workers_component_count(self):
         for num_workers in [1, 5, 10, 50]:
@@ -870,34 +661,6 @@ class TestParallelizeStress:
             )
 
             assert len(components) == 1 + num_workers * 2 + 1
-
-    def test_stress_collector_reordering(self):
-        from framework.core import Context
-
-        collector = LoadBalancerCollector(
-            provides="output",
-            requires=["results"],
-        )
-
-        pipeline = Pipeline([collector])
-        ctx = Context(pipeline)
-
-        num_items = 1000
-        seqs = list(range(1, num_items))
-        random.shuffle(seqs)
-
-        results = []
-        for seq in seqs:
-            results.extend(list(collector.build(ctx, (seq, [f"r{seq}"]))))
-
-        assert results == []
-        assert collector.get_pending_count() == num_items - 1
-
-        results.extend(list(collector.build(ctx, (0, ["r0"]))))
-
-        expected = [f"r{i}" for i in range(num_items)]
-        assert results == expected
-        assert collector.get_pending_count() == 0
 
     def test_high_worker_count_distribution(self):
         from framework.core import Context
@@ -1049,7 +812,9 @@ class TestParallelizeConstructorSupport:
 class TestParallelizeBehavior:
     """Behavioral tests specific to the public parallelize() API."""
 
-    def test_parallelize_preserves_fifo_order(self):
+    def test_parallelize_emits_all_artifacts_under_uneven_latency(self):
+        """Even with one slow worker, the emitter forwards every artifact;
+        the order is *not* guaranteed, only the multiset."""
         seen = []
 
         class Sink(AbstractProcessor):
@@ -1077,38 +842,7 @@ class TestParallelizeBehavior:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=4)
 
-        assert seen == [0, 1]
-
-    def test_parallelize_can_disable_fifo_reordering(self):
-        seen = []
-
-        class Sink(AbstractProcessor):
-            def process(self, context, event):
-                match event:
-                    case ReactiveEvent(name="built", target="output", artifact=value):
-                        seen.append(value)
-
-        class SlowWorker(ReactiveBuilder):
-            def build(self, context, item):
-                if item == 0:
-                    time.sleep(0.05)
-                yield item
-
-        components = parallelize(
-            provides="output",
-            requires=["input"],
-            worker_builder=SlowWorker,
-            num_workers=2,
-            preserve_fifo=False,
-        )
-
-        pipe = Pipeline([*components, Sink()])
-        pipe.submit(ReactiveEvent(name="built", target="input", artifact=0))
-        pipe.submit(ReactiveEvent(name="built", target="input", artifact=1))
-        pipe.submit(ReactiveEvent(name="resolve", target="output"))
-        run_dispatcher_once(pipe, pulses=4)
-
-        assert seen == [1, 0]
+        assert sorted(seen) == [0, 1]
 
     def test_parallelize_deduplicates_like_a_single_reactive_builder(self):
         seen = []
@@ -1137,4 +871,4 @@ class TestParallelizeBehavior:
         pipe.submit(ReactiveEvent(name="resolve", target="output"))
         run_dispatcher_once(pipe, pulses=4)
 
-        assert seen == [20, 30]
+        assert sorted(seen) == [20, 30]

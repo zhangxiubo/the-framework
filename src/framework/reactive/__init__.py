@@ -24,20 +24,15 @@ from .rendezvous import (
     make_rendezvous,
 )
 from .parallelize import (
-    LoadBalancerCollector,
     LoadBalancerRouter,
     LoadBalancerSequencer,
     ParallelResultEmitter,
-    SequenceGapPolicy,
-    SkipAheadOnBacklog,
-    WaitForSequenceGaps,
     parallelize,
 )
 
 __all__ = [
     "Collector",
     "Grouper",
-    "LoadBalancerCollector",
     "LoadBalancerRouter",
     "LoadBalancerSequencer",
     "MaxPendingRendezvousKeys",
@@ -51,12 +46,9 @@ __all__ = [
     "RendezvousPublisher",
     "RendezvousReceiver",
     "ReservoirSampler",
-    "SequenceGapPolicy",
-    "SkipAheadOnBacklog",
     "StreamGrouper",
     "StreamSampler",
     "WaitForRendezvousOrphans",
-    "WaitForSequenceGaps",
     "make_rendezvous",
     "parallelize",
     "reactive",
