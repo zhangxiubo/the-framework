@@ -27,7 +27,7 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from pathlib import Path
 from queue import Empty, PriorityQueue, SimpleQueue
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import dill
 from rocksdict import Rdict, WriteOptions
@@ -38,6 +38,7 @@ from .utils import (
     InterestInferenceError,
     caching,
     class_identifier,
+    default_digest,
     event_digest,
     find_match_stmt,
     get_source,
@@ -393,9 +394,15 @@ class Pipeline:
         max_workers: Optional[int] = None,
         config: Optional[dict[str, Any]] = None,
         archive_options: Optional[dict[str, Any]] = None,
+        key_fn: Optional[Callable[[Any], str]] = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
+        # Dedupe/cache key policy. Defaults to a structural content hash
+        # (``default_digest``). Callers with a cheaper, equally-stable key for
+        # their own artifact types inject one here; the framework never needs to
+        # know what those types are.
+        self.key_fn: Callable[[Any], str] = key_fn or default_digest
         # Supported keys: ``wal_sync`` (bool, default True). Sync WAL writes
         # are durable but slower; set False for throughput at the cost of a
         # post-crash loss window.
@@ -774,6 +781,14 @@ class Pipeline:
             if issubclass(cls, Event) and cls is not object
         ]
         return names or [event.__class__.__name__]
+
+    def digest(self, obj) -> str:
+        """Compute the dedupe/cache key for ``obj`` via the configured policy.
+
+        Builders call this (rather than hashing directly) so the key strategy
+        is a single injectable seam — see ``key_fn`` on ``__init__``.
+        """
+        return self.key_fn(obj)
 
     def archive(self, suffix: Optional[str], readonly: bool = False):
         """Get memoized archive handle for `(suffix, readonly)`.

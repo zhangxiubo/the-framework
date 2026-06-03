@@ -261,7 +261,7 @@ def caching(func=None, *, debug: bool = True):
     def decorator(func):
         @functools.wraps(func)
         def wrapper(self, context, event, *args, **kwargs):
-            digest = event_digest(event)
+            digest = context.pipeline.digest([event])
             if debug:
                 logger.debug("digest %s", digest)
 
@@ -293,6 +293,16 @@ def caching(func=None, *, debug: bool = True):
     return decorator if func is None else decorator(func)
 
 
+def default_digest(obj) -> str:
+    """Structural content hash used as the default dedupe/cache key.
+
+    Stable across (de)serialization round-trips (it hashes structure, not
+    serialized bytes), which is why it is the safe default. Callers that have
+    a cheaper, equally-stable key for their artifacts can inject one via
+    ``Pipeline(key_fn=...)``; the framework stays agnostic about artifact types.
+    """
+    return deepdiff.DeepHash(obj)[obj]
+
+
 def event_digest(event) -> str:
-    cache_key = [event]
-    return deepdiff.DeepHash(cache_key)[cache_key]
+    return default_digest([event])

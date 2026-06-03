@@ -10,8 +10,6 @@ from collections import OrderedDict, defaultdict, deque
 from collections.abc import Callable, Iterable
 from typing import Collection, List, Optional
 
-import deepdiff
-
 from ..core import AbstractProcessor, Context, Event, InMemCache, timeit
 
 logger = logging.getLogger(__name__)
@@ -106,7 +104,7 @@ class ReactiveBuilder(AbstractProcessor):
             keys = list(zip(*[self.input_store[require] for require in self.requires]))
 
         for key in keys:
-            skey = deepdiff.DeepHash(key)[key]
+            skey = context.pipeline.digest(key)
             archive = self.get_cache(context)
             if self.dedupe and skey in archive:
                 for require in self.requires:
