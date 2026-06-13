@@ -342,3 +342,46 @@ def test_starred_requires_forward_both_raw_and_expanded_arguments():
 
     # Expect both the tuple and its expanded entries.
     assert captured == [((7, 9), 7, 9)]
+
+
+# --- duplicate persistent-archive namespace guard (llm_judge task #23) ---
+
+import pytest
+
+
+class PersistDup(ReactiveBuilder):
+    """Same class + default name => same signature for every instance."""
+    def __init__(self, provides, *, persist, name=None):
+        super().__init__(provides=provides, requires=[], persist=persist, name=name)
+
+    def build(self, context, *args, **kwargs):
+        yield from []
+
+
+def test_pipeline_rejects_duplicate_persistent_archive_namespace():
+    # Two persist=True builders of one class with the default name share a
+    # signature -> they would alias one archive -> rejected at construction.
+    with pytest.raises(ValueError, match="persistent-archive namespace"):
+        Pipeline([PersistDup("A", persist=True), PersistDup("B", persist=True)])
+
+
+def test_pipeline_allows_distinct_names_for_same_class_persistent_builders():
+    # Distinct names -> distinct signatures -> distinct archives -> allowed.
+    Pipeline([
+        PersistDup("A", persist=True, name="dup_a"),
+        PersistDup("B", persist=True, name="dup_b"),
+    ])
+
+
+def test_pipeline_allows_same_signature_when_not_persistent():
+    # Non-persistent builders use private in-memory caches and claim no shared
+    # archive namespace, so a shared signature is harmless and allowed.
+    Pipeline([PersistDup("A", persist=False), PersistDup("B", persist=False)])
+
+
+def test_abstract_processor_claims_no_archive_namespace_by_default():
+    class Plain(AbstractProcessor):
+        def process(self, context, event):
+            pass
+
+    assert Plain().archive_namespace() is None

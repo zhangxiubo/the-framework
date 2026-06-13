@@ -383,6 +383,46 @@ class Inbox:
     reset_active = mark_task_done
 
 
+def reject_archive_namespace_collisions(
+    processors: "list[AbstractProcessor]",
+) -> None:
+    """Fail fast when two processors claim the same persistent-archive
+    namespace (see :meth:`AbstractProcessor.archive_namespace`).
+
+    A shared namespace aliases one archive between two distinct processors:
+    their cache/dedupe state collides, the last writer wins, and a resume
+    can replay one processor's artifacts under another's identity. The
+    intended contract is that same-class persistent builders take distinct
+    names; this guard turns a silent corruption into a construction-time error.
+    """
+    claimed: defaultdict[str, list["AbstractProcessor"]] = defaultdict(list)
+    for processor in processors:
+        namespace = processor.archive_namespace()
+        if namespace is not None:
+            claimed[namespace].append(processor)
+    collisions = {
+        namespace: sharers
+        for namespace, sharers in claimed.items()
+        if len(sharers) > 1
+    }
+    if not collisions:
+        return
+
+    def describe(processor: "AbstractProcessor") -> str:
+        return f"{type(processor).__name__}(name={processor.name!r})"
+
+    detail = "; ".join(
+        f"{namespace!r} claimed by {[describe(p) for p in sharers]}"
+        for namespace, sharers in sorted(collisions.items())
+    )
+    raise ValueError(
+        "duplicate persistent-archive namespace(s): " + detail + ". "
+        "Same-class persistent builders must take distinct names (pass "
+        "name=...) so their archives and dedupe caches do not alias and "
+        "corrupt resume."
+    )
+
+
 class Pipeline:
     """Global orchestrator that routes events and drives processor execution."""
 
@@ -439,6 +479,8 @@ class Pipeline:
                 raise ValueError("max_workers must be >= 1")
             self.max_workers = max_workers
         self.config = {} if config is None else config.copy()
+
+        reject_archive_namespace_collisions(processors)
 
         # (event_class_name | None, event_name | None) -> processor set
         self.processors: defaultdict[tuple[Optional[str], Optional[str]], set[Any]] = defaultdict(set)
@@ -870,3 +912,15 @@ class AbstractProcessor(abc.ABC):
                 digest_input = f"qualname:{cls.__module__}.{cls.__qualname__}"
                 digest = hashlib.sha256(digest_input.encode()).hexdigest()
         return str(Path(self.name, digest))
+
+    def archive_namespace(self) -> Optional[str]:
+        """The shared persistent-archive namespace this processor claims, or
+        None when it uses no shared persistent archive.
+
+        Processors that persist cache/dedupe state into the pipeline's archive
+        return a stable key here (typically their :meth:`signature`). Two
+        processors that return the same non-None namespace would alias one
+        archive — silently sharing a cache/dedupe space and corrupting resume
+        — so :class:`Pipeline` rejects such a collision at construction.
+        Default: None (most processors keep no shared archive)."""
+        return None

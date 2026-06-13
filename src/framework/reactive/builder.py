@@ -210,6 +210,12 @@ class ReactiveBuilder(AbstractProcessor):
         else:
             return self.get_noop_cache()
 
+    def archive_namespace(self) -> Optional[str]:
+        """A persistent builder claims the pipeline archive keyed by its
+        signature (see :meth:`get_cache`); a non-persistent builder uses a
+        private in-memory cache and claims no shared namespace."""
+        return self.signature() if self.persist else None
+
     @functools.cache
     def get_noop_cache(self):
         """Memoized in-memory cache for non-persistent builders."""
