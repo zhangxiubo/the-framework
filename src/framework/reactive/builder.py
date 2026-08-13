@@ -21,6 +21,24 @@ class ReactiveEvent(Event):
     pass
 
 
+class IncompleteBuild(Exception):
+    """Raised by ``build`` to decline the archive write for the current input.
+
+    The contract: an archive entry means the input was processed
+    *successfully*. A build that could not finish — a retry budget ran out,
+    a sub-run never answered — raises this instead of returning, so the
+    input's key stays absent and a later run over the same archive attempts
+    it again. Successful inputs are untouched: they archive as usual and are
+    never re-built.
+
+    Rows yielded before the raise still flowed downstream this run and are
+    not retracted. Raisers must therefore either yield nothing before
+    raising, or make repeated attempts converge (an inner cache serving the
+    already-completed portion) so the eventual successful build supersedes
+    the partial one.
+    """
+
+
 class ReactiveBuilder(AbstractProcessor):
     """Base class for dependency-aware processors that react to ``ReactiveEvent``s.
 
@@ -118,16 +136,26 @@ class ReactiveBuilder(AbstractProcessor):
                         args.extend(tuple(value))
                     else:
                         args.append(value)
-                artifacts = self.build(context, *args)
-                assert isinstance(artifacts, Iterable)
-                collected = list()
-                for artifact in artifacts:
-                    context.submit(
-                        ReactiveEvent(name="built", target=self.provides, artifact=artifact)
+                try:
+                    artifacts = self.build(context, *args)
+                    assert isinstance(artifacts, Iterable)
+                    collected = list()
+                    for artifact in artifacts:
+                        context.submit(
+                            ReactiveEvent(name="built", target=self.provides, artifact=artifact)
+                        )
+                        collected.append(artifact)
+                except IncompleteBuild as reason:
+                    # No archive write: the key stays absent, so a later run
+                    # re-attempts this input. Rows already submitted flowed.
+                    logger.warning(
+                        "%s: build incomplete, input not archived (%s)",
+                        self.name,
+                        reason,
                     )
-                    collected.append(artifact)
-                if self.dedupe or self.persist:
-                    archive[skey] = collected
+                else:
+                    if self.dedupe or self.persist:
+                        archive[skey] = collected
             for require in self.requires:
                 self.input_store[require].popleft()
 

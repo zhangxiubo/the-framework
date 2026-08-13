@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from typing import Any, Collection, List, Optional, Tuple, Type
 
 from ..core import Context, timeit
-from .builder import ReactiveBuilder, ReactiveEvent
+from .builder import IncompleteBuild, ReactiveBuilder, ReactiveEvent
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class LoadBalancerSequencer(ReactiveBuilder):
 
     def on_init(self, context: Context):
         if self.persist:
-            self.next_seq = _next_persisted_sequence(self.get_cache(context))
+            self.next_seq = next_sequence_cursor(self.get_cache(context))
 
     def build(self, context: Context, *args):
         seq = self.next_seq
@@ -206,13 +206,26 @@ def _publish_by_sequence(
             mode != "worker" and already_cached
         )
         if not should_skip:
-            with timeit(stage.build.__qualname__, logger=logger):
-                if mode == "worker":
-                    artifacts = stage.build(context, *items[0][1])
-                else:
-                    artifacts = stage.build(context, items[0])
-                assert isinstance(artifacts, Iterable)
-                collected = list(artifacts)
+            try:
+                with timeit(stage.build.__qualname__, logger=logger):
+                    if mode == "worker":
+                        artifacts = stage.build(context, *items[0][1])
+                    else:
+                        artifacts = stage.build(context, items[0])
+                    assert isinstance(artifacts, Iterable)
+                    collected = list(artifacts)
+            except IncompleteBuild as reason:
+                # No emission and no archive write for this seq: the worker
+                # and emitter entries both stay absent, so a later run routes
+                # the replayed task back to a worker and re-attempts it.
+                logger.warning(
+                    "%s: build incomplete, seq %s not archived (%s)",
+                    stage.name,
+                    seq,
+                    reason,
+                )
+                items.popleft()
+                continue
             if mode == "worker":
                 payload = (seq, collected)
                 context.submit(
@@ -269,10 +282,20 @@ def _parallel_worker_publish(worker: ReactiveBuilder, context: Context) -> None:
     _publish_by_sequence(worker, context, mode="worker")
 
 
-def _next_persisted_sequence(archive) -> int:
-    """Next sequence cursor from an archive keyed by integer ``seq``.
+def next_sequence_cursor(archive) -> int:
+    """Next sequence cursor, derived from the sequencer's archived payloads.
 
-    Returns 0 when no int keys are present, rather than ``len(keys)``, so
-    archives containing only non-int keys don't silently skip sequences.
+    The sequencer archives through the default ``publish`` path, so its keys
+    are input digests — the sequence numbers live inside the archived
+    ``(seq, args)`` payloads. Deriving the cursor from the payloads resumes
+    it past every previously assigned sequence; deriving it from the keys
+    (as an int scan once did) restarted it at 0 on every resume, so a new
+    input collided with an archived worker/emitter entry and was silently
+    skipped.
     """
-    return max((key for key in archive.keys() if isinstance(key, int)), default=-1) + 1
+    highest = -1
+    for artifacts in archive.values():
+        for sequenced in artifacts:
+            seq, *rest = sequenced
+            highest = max(highest, int(seq))
+    return highest + 1

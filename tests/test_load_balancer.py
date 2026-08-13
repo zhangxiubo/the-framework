@@ -232,20 +232,30 @@ class TestLoadBalancerSequencerBehavior:
         assert args == ("value1", "value2")
 
     def test_sequencer_on_init_restores_next_seq_from_persisted_archive(self, tmp_path):
-        sequencer = LoadBalancerSequencer(
-            provides="sequenced",
-            requires=["input"],
-            persist=True,
-        )
+        """The cursor resumes past every archived assignment. The sequencer
+        publishes through the default path, so its archive is keyed by input
+        digest and the sequence numbers live inside the archived payloads —
+        the cursor is derived from those payloads, never from the keys."""
 
-        pipeline = Pipeline([sequencer], workspace=tmp_path)
-        archive = pipeline.archive(sequencer.signature())
-        archive[0] = [("ignored",)]
-        archive[2] = [("ignored",)]
+        def sequence_inputs(items):
+            sequencer = LoadBalancerSequencer(
+                provides="sequenced",
+                requires=["input"],
+                persist=True,
+            )
+            pipeline = Pipeline([sequencer], workspace=tmp_path)
+            for item in items:
+                pipeline.submit(
+                    ReactiveEvent(name="built", target="input", artifact=item)
+                )
+            pipeline.submit(ReactiveEvent(name="resolve", target="sequenced"))
+            run_dispatcher_once(pipeline, pulses=2)
+            return sequencer
 
-        run_dispatcher_once(pipeline)
+        sequence_inputs(["a", "b", "c"])
+        resumed = sequence_inputs([])
 
-        assert sequencer.next_seq == 3
+        assert resumed.next_seq == 3
 
 
 class TestLoadBalancerRouterBehavior:

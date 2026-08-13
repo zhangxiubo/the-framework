@@ -4,7 +4,7 @@ Top-level re-exports preserve the historical ``from framework.reactive import X`
 surface so callers don't need to care about the module split.
 """
 
-from .builder import ReactiveBuilder, ReactiveEvent, reactive
+from .builder import IncompleteBuild, ReactiveBuilder, ReactiveEvent, reactive
 from .stream import (
     Collector,
     Grouper,
@@ -33,6 +33,7 @@ from .parallelize import (
 __all__ = [
     "Collector",
     "Grouper",
+    "IncompleteBuild",
     "LoadBalancerRouter",
     "LoadBalancerSequencer",
     "MaxPendingRendezvousKeys",
